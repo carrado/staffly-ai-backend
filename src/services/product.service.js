@@ -1,4 +1,4 @@
-import { getProductsByBusiness } from '../models/Product.js';
+import { getProductsByBusiness } from '../models/Products.js';
 import { openai } from '../config/openai.js';
 
 export function searchProducts(businessId, query) {
