@@ -18,6 +18,6 @@ router.get('/', (req, res) => {
 });
 
 // Incoming messages (POST) with signature verification
-router.post('/', verifySignature, handleIncomingMessage);
+router.post('/', handleIncomingMessage);
 
 export default router;

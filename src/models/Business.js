@@ -1,13 +1,6 @@
-import { env } from "../config/env.js";
 
 // In production, replace with a database.
-const businesses = [
-  {
-    waba_id: 1428158388183193,
-    phone_number_id: 976297892242222,
-    access_token: env.metaAccessToken,
-  }
-];
+const businesses = [];
 
 export const addBusiness = (businessData) => {
   const business = { id: `biz_${Date.now()}`, ...businessData };
