@@ -62,7 +62,6 @@ export async function handleIncomingMessage(req, res) {
 
       case 'inquiry': {
         const products = productService.searchProducts(business.id, intent.query || userMessage);
-        logger.info('products:', products.length);
         if (products.length === 0) {
           // Suggest alternatives
           const suggestions = await productService.suggestProducts(business.id, userMessage);
@@ -76,6 +75,7 @@ export async function handleIncomingMessage(req, res) {
           }
         } else {
           const product = products[0];
+          logger.info('products:', product);
           responseText = `Yes ✅ We have ${product.name} (Size ${product.size}) for ₦${product.price}. Would you like to buy?`;
           imageUrl = product.image_url;
         }
