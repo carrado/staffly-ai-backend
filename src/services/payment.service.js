@@ -19,7 +19,7 @@ export function generatePaymentLink(businessId, customerNumber, productName, amo
   };
 }
 
-export async function handlePaymentWebhook(payload) {
+export async function handlePayment(payload) {
   // Mock: assume payment successful
   const { orderId } = payload;
   const order = getOrderById(orderId);

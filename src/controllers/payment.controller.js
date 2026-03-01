@@ -1,4 +1,4 @@
-import { handlePaymentWebhook } from '../services/payment.service.js';
+import { handlePayment } from '../services/payment.service.js';
 import { getOrderById } from '../models/Order.js';
 import * as emailService from '../services/email.service.js';
 import * as whatsapp from '../services/whatsapp.service.js';
@@ -7,7 +7,7 @@ import { getBusinessById } from '../models/Business.js';
 export async function handlePaymentWebhook(req, res) {
   try {
     const payload = req.body; // { orderId, status, ... }
-    const order = await handlePaymentWebhook(payload);
+    const order = await handlePayment(payload);
     if (order && order.status === 'paid') {
       // Send receipt via email
       await emailService.sendReceiptEmail(`${order.customerNumber}@example.com`, order);
