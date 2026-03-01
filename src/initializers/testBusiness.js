@@ -8,6 +8,7 @@ export function loadTestBusiness() {
 
   if (phoneNumberId && wabaId && accessToken) {
     const business = addBusiness({
+      id: 'biz_demo',
       phone_number_id: phoneNumberId,
       waba_id: wabaId,
       access_token: accessToken,
