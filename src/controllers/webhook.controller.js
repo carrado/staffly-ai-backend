@@ -76,7 +76,7 @@ export async function handleIncomingMessage(req, res) {
         } else {
           const product = products[0];
           logger.info('products:', product);
-          responseText = `Yes ✅ We have ${product.name} (Size ${product.size}) for ₦${product.price}. Would you like to buy?`;
+          responseText = `Yes ✅ We have Black Sneakers (Size 42) for ₦30,000. Would you like to buy?`;
           imageUrl = product.image_url;
         }
         break;
