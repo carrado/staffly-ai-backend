@@ -4,7 +4,6 @@ import { logger } from '../utils/logger.js';
 
 export function searchProducts(businessId, query) {
   const products = getProductsByBusiness(businessId);
-  logger.info('Query data:', query);
   logger.info('products data:', products.filter(p => p.name.toLowerCase().includes(query.toLowerCase())));
   return products.filter(p => p.name.toLowerCase().includes(query.toLowerCase()));
 }

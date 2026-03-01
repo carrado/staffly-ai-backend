@@ -62,6 +62,7 @@ export async function handleIncomingMessage(req, res) {
 
       case 'inquiry': {
         const products = productService.searchProducts(business.id, intent.query || userMessage);
+        logger.info('products:', products.length);
         if (products.length === 0) {
           // Suggest alternatives
           const suggestions = await productService.suggestProducts(business.id, userMessage);
