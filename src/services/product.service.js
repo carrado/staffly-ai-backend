@@ -1,5 +1,6 @@
 import { getProductsByBusiness } from '../models/Products.js';
 import { openai } from '../config/openai.js';
+import { logger } from '../utils/logger.js';
 
 export function searchProducts(businessId, query) {
   const products = getProductsByBusiness(businessId);
