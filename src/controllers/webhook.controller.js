@@ -1,15 +1,15 @@
 import { getBusinessByPhoneNumberId } from '../models/Business.js';
-import { getSession, setSession } from '../models/ConversationState.js';
+import { getSession, setSession, setLastProduct, setNegotiation, clearNegotiation } from '../models/ConversationState.js';
 import * as whatsapp from '../services/whatsapp.service.js';
 import * as openaiService from '../services/openai.service.js';
 import * as productService from '../services/product.service.js';
-import * as negotiationService from '../services/negotiation.service.js';
 import * as paymentService from '../services/payment.service.js';
 import * as emailService from '../services/email.service.js';
 import { logger } from '../utils/logger.js';
 
 export async function handleIncomingMessage(req, res) {
   try {
+    // --- 1. Extract basic info ---
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
@@ -26,136 +26,148 @@ export async function handleIncomingMessage(req, res) {
       return res.sendStatus(200);
     }
 
-    // Ensure token is valid (refresh logic can be added)
     const accessToken = business.access_token;
 
+    // --- 2. Extract user message (text or transcribed voice) ---
     let userMessage = '';
     let mediaBuffer = null;
+    let isVoice = false;
 
-    // Handle different message types
     if (message.type === 'text') {
       userMessage = message.text.body;
     } else if (message.type === 'voice') {
+      isVoice = true;
       const mediaId = message.voice.id;
       mediaBuffer = await whatsapp.downloadMedia(mediaId, accessToken);
       userMessage = await openaiService.transcribeAudio(mediaBuffer);
     } else {
-      // Unsupported type
+      // Unsupported type – ignore
       return res.sendStatus(200);
     }
 
-    // Detect intent
-    const intent = await openaiService.detectIntent(userMessage);
-    logger.info(`Intent detected: ${intent.type}`);
-
-    let responseText = '';
-    let imageUrl = null;
-    let audioBuffer = null;
-
-    // Retrieve conversation state
+    // --- 3. Retrieve current session ---
     const session = getSession(business.id, customerNumber);
 
-    switch (intent.type) {
-      case 'greeting':
-        responseText = 'Hello 👋 Welcome! How can I help you today?';
-        break;
+    // --- 4. First AI call: get initial intent and maybe an action ---
+    let aiOutput = await openaiService.processMessage(userMessage, session);
+    logger.info('Initial AI output:', aiOutput);
 
-      case 'inquiry': {
-        const products = productService.searchProducts(business.id, intent.query || userMessage);
-        if (products.length === 0) {
-          // Suggest alternatives
-          const suggestions = await productService.suggestProducts(business.id, userMessage);
-          if (suggestions.length > 0) {
-            responseText = `We don't have "${intent.query}" but you might like:\n`;
-            suggestions.forEach(p => {
-              responseText += `• ${p.name} – ₦${p.price}\n`;
+    let responseText = aiOutput.response;
+    let action = aiOutput.action || { type: 'none' };
+
+    // --- 5. If an action is requested, perform it and then ask AI to write the final response ---
+    if (action.type !== 'none') {
+      // We'll collect data from the action
+      let actionResult = null;
+
+      switch (action.type) {
+        case 'search_products': {
+          const query = action.data.query;
+          const products = productService.searchProducts(business.id, query);
+          if (products.length > 0) {
+            // Store the first match as last product for context
+            setLastProduct(business.id, customerNumber, products[0]);
+            actionResult = { products };
+          } else {
+            actionResult = { products: [] };
+          }
+          break;
+        }
+
+        case 'generate_payment_link': {
+          const productName = action.data.productName;
+          const email = action.data.email; // AI may include email if user provided it
+          const product = productService.getProductByName(business.id, productName);
+          if (product) {
+            const { paymentLink, orderId } = paymentService.generatePaymentLink(
+              business.id,
+              customerNumber,
+              product.name,
+              product.price
+            );
+            // Send invoice email (mock) – you can also send a real PDF
+            await emailService.sendInvoiceEmail(email || `${customerNumber}@example.com`, { product, orderId });
+            actionResult = { paymentLink, orderId };
+          } else {
+            actionResult = { error: 'Product not found' };
+          }
+          break;
+        }
+
+        case 'start_negotiation': {
+          const productName = action.data.productName;
+          const product = productService.getProductByName(business.id, productName);
+          if (product && product.allow_negotiation) {
+            setNegotiation(business.id, customerNumber, {
+              productId: product.id,
+              productName: product.name,
+              originalPrice: product.price,
+              minPrice: product.min_price,
+              currentOffer: null,
+              stage: 'started',
             });
+            actionResult = { product };
           } else {
-            responseText = "Sorry, we don't have that product.";
+            actionResult = { error: 'Product not negotiable or not found' };
           }
-        } else {
-          const product = products[0];
-          logger.info('products:', product);
-          responseText = `Yes ✅ We have ${product.name} (Size ${product.size}) for ₦${product.price}. Would you like to buy?`;
+          break;
         }
-        break;
-      }
 
-      case 'order': {
-        const product = productService.getProductByName(business.id, intent.productName);
-        if (!product) {
-          responseText = "Product not found. Please check the name.";
-          break;
-        }
-        if (product.stock <= 0) {
-          responseText = "Sorry, that product is out of stock.";
-          break;
-        }
-        // Create order and payment link
-        const { paymentLink, orderId } = paymentService.generatePaymentLink(
-          business.id,
-          customerNumber,
-          product.name,
-          product.price
-        );
-        responseText = `Great! Here's your payment link:\n${paymentLink}\nAmount: ₦${product.price}`;
-        // Send invoice email (mock)
-        await emailService.sendInvoiceEmail(`${customerNumber}@example.com`, { product, orderId });
-        break;
-      }
-
-      case 'negotiate': {
-        const product = productService.getProductByName(business.id, intent.productName);
-        if (!product || !product.allow_negotiation) {
-          responseText = "This product is not negotiable.";
-          break;
-        }
-        const offer = intent.offer;
-        if (!offer) {
-          // Start negotiation
-          negotiationService.startNegotiation(business.id, customerNumber, product);
-          responseText = `You can make an offer for ${product.name} (original price ₦${product.price}). What is your offer?`;
-        } else {
-          const negotiation = negotiationService.updateNegotiation(business.id, customerNumber, offer);
-          if (!negotiation) {
-            responseText = "Let's start over. What product would you like to negotiate?";
-            break;
-          }
-          if (negotiationService.isAccepted(product.price, product.min_price, offer)) {
-            responseText = `Deal accepted! Final price: ₦${offer}. Shall I generate a payment link?`;
-            // Optionally auto-create order
+        case 'make_offer': {
+          const offer = action.data.offer;
+          const negotiation = session.negotiation;
+          if (negotiation) {
+            // Update negotiation with the offer
+            setNegotiation(business.id, customerNumber, { ...negotiation, currentOffer: offer, stage: 'offered' });
+            // Provide the updated negotiation to the AI
+            actionResult = { negotiation: { ...negotiation, currentOffer: offer } };
           } else {
-            const counter = negotiationService.calculateCounter(product.price, product.min_price);
-            responseText = `We can offer ₦${counter}. Is that acceptable?`;
+            actionResult = { error: 'No ongoing negotiation' };
           }
+          break;
         }
-        break;
+
+        case 'accept_offer': {
+          const finalPrice = action.data.finalPrice;
+          clearNegotiation(business.id, customerNumber);
+          actionResult = { finalPrice };
+          break;
+        }
+
+        // Add more action types as needed
+        default:
+          logger.warn('Unknown action type:', action.type);
       }
 
-      case 'chat':
-      default:
-        // Let OpenAI respond naturally
-        responseText = await openaiService.generateChatResponse(session.conversationHistory || [], userMessage);
-        // Update conversation history
-        setSession(business.id, customerNumber, {
-          conversationHistory: [
-            ...(session.conversationHistory || []),
-            { role: 'user', content: userMessage },
-            { role: 'assistant', content: responseText },
-          ],
-        });
-        break;
+      // --- 6. Now that we have actionResult, call AI again to craft the final response ---
+      // We pass the original user message, the updated session, and the action result.
+      const finalAiOutput = await openaiService.generateResponseWithActionResult(
+        userMessage,
+        getSession(business.id, customerNumber), // fresh session (updated by actions)
+        actionResult
+      );
+      responseText = finalAiOutput.response;
+      logger.info('Final AI output:', finalAiOutput);
     }
 
-    // Send response (text, image, or audio)
-    if (mediaBuffer && intent.type === 'voice') {
-      // Respond with voice if original was voice
-      audioBuffer = await openaiService.textToSpeech(responseText);
-      // Upload to WhatsApp (simplified: we'd need to upload media first, then send)
-      // For mock, send as text
+    // --- 7. Update conversation history with the final response ---
+    const updatedSession = getSession(business.id, customerNumber);
+    setSession(business.id, customerNumber, {
+      conversationHistory: [
+        ...(updatedSession.conversationHistory || []),
+        { role: 'user', content: userMessage },
+        { role: 'assistant', content: responseText },
+      ],
+      lastProduct: updatedSession.lastProduct,
+      negotiation: updatedSession.negotiation,
+    });
+
+    // --- 8. Send the response back to the user ---
+    if (isVoice) {
+      // For voice messages, respond with audio (simplified: text for now)
+      const audioBuffer = await openaiService.textToSpeech(responseText);
+      // In a real implementation, you would upload the audio and send via WhatsApp
       await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, responseText);
-    } else if (imageUrl) {
-      await whatsapp.sendImageMessage(phoneNumberId, accessToken, customerNumber, imageUrl, responseText);
     } else {
       await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, responseText);
     }
