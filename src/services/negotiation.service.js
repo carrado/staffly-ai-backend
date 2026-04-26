@@ -4,6 +4,7 @@ export function startNegotiation(businessId, customerNumber, product) {
   setSession(businessId, customerNumber, {
     negotiation: {
       productId: product.id,
+      productName: product.name,
       originalPrice: product.price,
       minPrice: product.min_price,
       currentOffer: null,
@@ -15,17 +16,16 @@ export function startNegotiation(businessId, customerNumber, product) {
 export function updateNegotiation(businessId, customerNumber, offer) {
   const session = getSession(businessId, customerNumber);
   if (!session.negotiation) return null;
-  session.negotiation.currentOffer = offer;
-  session.negotiation.stage = 'offered';
-  setSession(businessId, customerNumber, session);
-  return session.negotiation;
+  const updated = { ...session.negotiation, currentOffer: offer, stage: 'offered' };
+  setSession(businessId, customerNumber, { ...session, negotiation: updated });
+  return updated;
 }
 
-export function isAccepted(originalPrice, minPrice, offer) {
+export function isAccepted(minPrice, offer) {
   return offer >= minPrice;
 }
 
 export function calculateCounter(originalPrice, minPrice) {
-  // Simple counter: midpoint between min and original
+  // Midpoint counter-offer
   return Math.floor((originalPrice + minPrice) / 2);
 }

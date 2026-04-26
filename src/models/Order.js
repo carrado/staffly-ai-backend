@@ -1,4 +1,9 @@
-const orders = [];
+/**
+ * Order Model — Multi-Tenant
+ * In production, replace with a DB table that includes business_id as a column.
+ */
+
+const orders = new Map();
 
 export const createOrder = ({ businessId, customerNumber, product, amount, status = 'pending' }) => {
   const order = {
@@ -10,13 +15,17 @@ export const createOrder = ({ businessId, customerNumber, product, amount, statu
     status,
     createdAt: new Date(),
   };
-  orders.push(order);
+  orders.set(order.id, order);
   return order;
 };
 
 export const updateOrderStatus = (orderId, status) => {
-  const order = orders.find(o => o.id === orderId);
+  const order = orders.get(orderId);
   if (order) order.status = status;
+  return order || null;
 };
 
-export const getOrderById = (id) => orders.find(o => o.id === id);
+export const getOrderById = (id) => orders.get(id) || null;
+
+export const getOrdersByBusiness = (businessId) =>
+  Array.from(orders.values()).filter((o) => o.businessId === businessId);

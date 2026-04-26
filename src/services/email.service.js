@@ -1,10 +1,10 @@
 import { logger } from '../utils/logger.js';
 
-export async function sendInvoiceEmail(customerEmail, orderDetails) {
-  logger.info(`Sending invoice to ${customerEmail}:`, orderDetails);
-  // Integrate with nodemailer or SendGrid here
-}
-
-export async function sendReceiptEmail(customerEmail, orderDetails) {
-  logger.info(`Sending receipt to ${customerEmail}:`, orderDetails);
+/**
+ * Send an invoice email after a payment link is generated.
+ * Replace with a real email provider (SendGrid, Nodemailer, etc.)
+ */
+export async function sendInvoiceEmail(to, { product, orderId }) {
+  // TODO: integrate real email provider
+  logger.info(`[EMAIL] Invoice for order ${orderId} → ${to} | Product: ${product.name} | Price: ${product.price}`);
 }

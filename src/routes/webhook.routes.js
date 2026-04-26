@@ -5,7 +5,7 @@ import { env } from '../config/env.js';
 
 const router = Router();
 
-// Webhook verification (GET)
+// Meta webhook verification challenge (GET)
 router.get('/', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -17,7 +17,7 @@ router.get('/', (req, res) => {
   return res.sendStatus(403);
 });
 
-// Incoming messages (POST) with signature verification
-router.post('/', handleIncomingMessage);
+// Incoming WhatsApp messages (POST) — shared across ALL connected businesses
+router.post('/', verifySignature, handleIncomingMessage);
 
 export default router;

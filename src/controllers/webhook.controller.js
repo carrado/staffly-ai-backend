@@ -1,180 +1,616 @@
-import { getBusinessByPhoneNumberId } from '../models/Business.js';
-import { getSession, setSession, setLastProduct, setNegotiation, clearNegotiation } from '../models/ConversationState.js';
-import * as whatsapp from '../services/whatsapp.service.js';
-import * as openaiService from '../services/openai.service.js';
-import * as productService from '../services/product.service.js';
-import * as paymentService from '../services/payment.service.js';
-import * as emailService from '../services/email.service.js';
-import { logger } from '../utils/logger.js';
+/**
+ * Webhook Controller
+ *
+ * Handles incoming WhatsApp text, voice notes, and audio messages.
+ * Routes each message by phone_number_id to the correct business.
+ * Supports:
+ * - product search
+ * - search pagination / show more
+ * - voice note transcription
+ * - attribute checks
+ * - negotiation
+ * - payment link generation
+ */
+
+import { getBusinessByPhoneNumberId } from "../models/Business.js";
+import {
+  getSession,
+  setSession,
+  setLastProduct,
+  setNegotiation,
+  clearNegotiation,
+} from "../models/ConversationState.js";
+import * as whatsapp from "../services/whatsapp.service.js";
+import * as openaiService from "../services/openai.service.js";
+import * as productService from "../services/product.service.js";
+import * as paymentService from "../services/payment.service.js";
+import * as emailService from "../services/email.service.js";
+import { logger } from "../utils/logger.js";
+
+const SEARCH_PAGE_SIZE = 4;
+const SEARCH_LIMIT = 50;
+
+function buildConversationHistory(
+  currentHistory = [],
+  userMessage,
+  assistantMessage,
+) {
+  return [
+    ...currentHistory,
+    { role: "user", content: userMessage },
+    { role: "assistant", content: assistantMessage },
+  ];
+}
+
+function createDefaultActionResult(message) {
+  return { error: message };
+}
+
+function getResolvedProductName(actionData = {}, session = {}) {
+  return actionData.productName || session.lastProduct?.name || null;
+}
+
+function mapProductForAI(product) {
+  return {
+    id: product.id,
+    name: product.name,
+    category: product.category,
+    price: product.price,
+    description: product.description,
+    tags: product.tags || [],
+    useCases: product.useCases || [],
+    attributes: product.attributes || {},
+    allow_negotiation: product.allow_negotiation,
+  };
+}
+
+async function sendOutboundMessage({
+  phoneNumberId,
+  accessToken,
+  customerNumber,
+  responseText,
+  productsToShow = [],
+}) {
+  if (productsToShow.length === 1) {
+    await whatsapp.sendProductCard(
+      phoneNumberId,
+      accessToken,
+      customerNumber,
+      productsToShow[0],
+      responseText,
+    );
+    return;
+  }
+
+  if (productsToShow.length > 1) {
+    await whatsapp.sendProductList(
+      phoneNumberId,
+      accessToken,
+      customerNumber,
+      productsToShow,
+      responseText,
+    );
+    return;
+  }
+
+  await whatsapp.sendTextMessage(
+    phoneNumberId,
+    accessToken,
+    customerNumber,
+    responseText,
+  );
+}
+
+async function extractUserMessage(message, accessToken, business) {
+  try {
+    if (message.type === "text") {
+      return message.text?.body?.trim() || "";
+    }
+
+    if (message.type === "voice" || message.type === "audio") {
+      const mediaId = message.voice?.id || message.audio?.id;
+
+      if (!mediaId) {
+        throw new Error("No media ID found for audio message");
+      }
+
+      const audioData = await whatsapp.downloadMedia(mediaId, accessToken);
+
+      const transcription = await openaiService.transcribeAudio(audioData);
+
+      if (!transcription) {
+        throw new Error("Empty transcription");
+      }
+
+      return transcription.trim();
+    }
+
+    return "";
+  } catch (error) {
+    logger.error("[Voice Error]", error);
+
+    return "__VOICE_ERROR__";
+  }
+}
+
+
+async function executeAction({ action, businessId, customerNumber, session }) {
+  let actionResult = null;
+  let productsToShow = [];
+
+  switch (action.type) {
+    case "search_products": {
+      const query = action.data.query?.trim();
+
+      if (!query) {
+        actionResult = createDefaultActionResult(
+          "I could not tell what to search for. Please mention the product, category, or what you want to use it for.",
+        );
+        break;
+      }
+
+      const found = productService.searchProducts(
+        businessId,
+        query,
+        SEARCH_LIMIT,
+      );
+      const productsToDisplay = found.slice(0, SEARCH_PAGE_SIZE);
+      const remainingCount = Math.max(
+        found.length - productsToDisplay.length,
+        0,
+      );
+
+      if (found.length > 0) {
+        setLastProduct(businessId, customerNumber, found[0]);
+        productsToShow = productsToDisplay;
+      }
+
+      const currentSession = getSession(businessId, customerNumber);
+
+      setSession(businessId, customerNumber, {
+        ...currentSession,
+        lastSearch: {
+          query,
+          productIds: found.map((product) => product.id),
+          offset: productsToDisplay.length,
+        },
+      });
+
+      actionResult = {
+        query,
+        count: found.length,
+        shownCount: productsToDisplay.length,
+        remainingCount,
+        products: productsToDisplay.map(mapProductForAI),
+      };
+
+      break;
+    }
+
+    case "show_more_products": {
+      const currentSession = getSession(businessId, customerNumber);
+      const lastSearch = currentSession.lastSearch;
+
+      if (!lastSearch?.productIds?.length) {
+        actionResult = createDefaultActionResult(
+          "There is no previous product search to continue. Please tell me what you are looking for.",
+        );
+        break;
+      }
+
+      const allProducts = lastSearch.productIds
+        .map((id) => productService.getProductById(id))
+        .filter(Boolean);
+
+      const start = lastSearch.offset || 0;
+      const nextProducts = allProducts.slice(start, start + SEARCH_PAGE_SIZE);
+      const newOffset = start + nextProducts.length;
+      const remainingCount = Math.max(allProducts.length - newOffset, 0);
+
+      productsToShow = nextProducts;
+
+      if (nextProducts.length > 0) {
+        setLastProduct(businessId, customerNumber, nextProducts[0]);
+      }
+
+      setSession(businessId, customerNumber, {
+        ...currentSession,
+        lastSearch: {
+          ...lastSearch,
+          offset: newOffset,
+        },
+      });
+
+      actionResult = {
+        query: lastSearch.query,
+        count: allProducts.length,
+        shownCount: nextProducts.length,
+        remainingCount,
+        products: nextProducts.map(mapProductForAI),
+      };
+
+      break;
+    }
+
+    case "check_attribute": {
+      const { attributeKey, requestedValue } = action.data;
+      const resolvedProductName = getResolvedProductName(action.data, session);
+
+      const product = resolvedProductName
+        ? productService.getProductByName(businessId, resolvedProductName)
+        : session.lastProduct;
+
+      if (!product) {
+        actionResult = createDefaultActionResult(
+          "I could not identify which product you mean. Please mention the product name.",
+        );
+        break;
+      }
+
+      if (!attributeKey) {
+        actionResult = createDefaultActionResult(
+          `I found ${product.name}, but I could not tell which attribute you want to check.`,
+        );
+        productsToShow = [product];
+        setLastProduct(businessId, customerNumber, product);
+        break;
+      }
+
+      setLastProduct(businessId, customerNumber, product);
+
+      const check = productService.checkAttribute(
+        product,
+        attributeKey,
+        requestedValue,
+      );
+
+      actionResult = {
+        product: product.name,
+        attributeKey,
+        requestedValue: requestedValue ?? null,
+        ...check,
+      };
+
+      productsToShow = [product];
+      break;
+    }
+
+    case "generate_payment_link": {
+      const { email, selectedSize, selectedColor } = action.data;
+      const resolvedProductName = getResolvedProductName(action.data, session);
+
+      const product = resolvedProductName
+        ? productService.getProductByName(businessId, resolvedProductName)
+        : null;
+
+      if (!product) {
+        actionResult = createDefaultActionResult(
+          "Product not found. Please tell me exactly which product you want to buy.",
+        );
+        break;
+      }
+
+      setLastProduct(businessId, customerNumber, product);
+
+      const { paymentLink, orderId } = paymentService.generatePaymentLink(
+        businessId,
+        customerNumber,
+        product.name,
+        product.price,
+      );
+
+      await emailService.sendInvoiceEmail(
+        email || `${customerNumber}@staffly.app`,
+        { product, orderId },
+      );
+
+      actionResult = {
+        paymentLink,
+        orderId,
+        product: product.name,
+        price: product.price,
+        selectedSize: selectedSize || null,
+        selectedColor: selectedColor || null,
+      };
+
+      productsToShow = [product];
+      break;
+    }
+
+    case "start_negotiation": {
+      const resolvedProductName = getResolvedProductName(action.data, session);
+
+      const product = resolvedProductName
+        ? productService.getProductByName(businessId, resolvedProductName)
+        : null;
+
+      if (!product) {
+        actionResult = createDefaultActionResult(
+          "I could not tell which product you want to negotiate on. Please mention the product name.",
+        );
+        break;
+      }
+
+      setLastProduct(businessId, customerNumber, product);
+
+      if (!product.allow_negotiation) {
+        actionResult = createDefaultActionResult(
+          `${product.name} is not available for negotiation.`,
+        );
+        productsToShow = [];
+        break;
+      }
+
+      const negotiationState = {
+        productId: product.id,
+        productName: product.name,
+        originalPrice: product.price,
+        minPrice: product.min_price,
+        currentOffer: null,
+        stage: "started",
+      };
+
+      setNegotiation(businessId, customerNumber, negotiationState);
+
+      actionResult = {
+        product: product.name,
+        originalPrice: product.price,
+        minPrice: product.min_price,
+        message: "Negotiation started",
+      };
+
+      productsToShow = [];
+      break;
+    }
+
+    case "make_offer": {
+      const freshSession = getSession(businessId, customerNumber);
+      let negotiation = freshSession.negotiation;
+      let negotiationProduct = null;
+
+      if (!negotiation && freshSession.lastProduct?.name) {
+        const fallbackProduct = productService.getProductByName(
+          businessId,
+          freshSession.lastProduct.name,
+        );
+
+        if (fallbackProduct?.allow_negotiation) {
+          negotiation = {
+            productId: fallbackProduct.id,
+            productName: fallbackProduct.name,
+            originalPrice: fallbackProduct.price,
+            minPrice: fallbackProduct.min_price,
+            currentOffer: null,
+            stage: "started",
+          };
+
+          setNegotiation(businessId, customerNumber, negotiation);
+          negotiationProduct = fallbackProduct;
+        }
+      }
+
+      if (!negotiation) {
+        actionResult = createDefaultActionResult(
+          "There is no active negotiation yet. Tell me which product you want to negotiate on.",
+        );
+        break;
+      }
+
+      const updatedNegotiation = {
+        ...negotiation,
+        currentOffer: action.data.offer,
+        stage: "offered",
+      };
+
+      setNegotiation(businessId, customerNumber, updatedNegotiation);
+
+      if (!negotiationProduct && negotiation.productName) {
+        negotiationProduct = productService.getProductByName(
+          businessId,
+          negotiation.productName,
+        );
+      }
+
+      if (negotiationProduct) {
+        setLastProduct(businessId, customerNumber, negotiationProduct);
+      }
+      
+      productsToShow = [];
+
+      actionResult = {
+        negotiation: updatedNegotiation,
+      };
+
+      break;
+    }
+
+    case "accept_offer": {
+      const freshSession = getSession(businessId, customerNumber);
+      const negotiation = freshSession.negotiation;
+
+      clearNegotiation(businessId, customerNumber);
+
+      let negotiatedProduct = null;
+
+      if (negotiation?.productName) {
+        negotiatedProduct = productService.getProductByName(
+          businessId,
+          negotiation.productName,
+        );
+      }
+
+      if (negotiatedProduct) {
+        setLastProduct(businessId, customerNumber, negotiatedProduct);
+      }
+      
+      productsToShow = [];
+
+      actionResult = {
+        finalPrice: action.data.finalPrice,
+        product: negotiation?.productName || null,
+        message: "Deal accepted! Proceed to payment.",
+      };
+
+      break;
+    }
+
+    case 'list_categories': {
+      const categories = productService.getProductCategories(businessId);
+    
+      if (!categories.length) {
+        actionResult = {
+          message: "No products available yet.",
+          categories: [],
+        };
+        break;
+      }
+    
+      actionResult = {
+        message: "Available product categories",
+        categories,
+        count: categories.length,
+      };
+    
+      productsToShow = []; // no product cards
+    
+      break;
+    }
+
+    case "none":
+    default:
+      actionResult = null;
+      break;
+  }
+
+  return { actionResult, productsToShow };
+}
 
 export async function handleIncomingMessage(req, res) {
-  try {
-    // --- 1. Extract basic info ---
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
+  res.sendStatus(200);
 
-    if (!value?.messages) return res.sendStatus(200);
+  try {
+    const entry = req.body.entry?.[0];
+    const value = entry?.changes?.[0]?.value;
+
+    if (!value?.messages?.length) return;
 
     const message = value.messages[0];
     const customerNumber = message.from;
-    const phoneNumberId = value.metadata.phone_number_id;
+    const phoneNumberId = value.metadata?.phone_number_id;
+
+    if (!customerNumber || !phoneNumberId) {
+      logger.warn("[Webhook] Missing customerNumber or phoneNumberId");
+      return;
+    }
 
     const business = getBusinessByPhoneNumberId(phoneNumberId);
+
     if (!business) {
-      logger.warn('Business not found for phoneNumberId:', phoneNumberId);
-      return res.sendStatus(200);
+      logger.warn(
+        `[Webhook] No business found for phone_number_id: ${phoneNumberId}`,
+      );
+      return;
     }
 
-    const accessToken = business.access_token;
+    const { access_token: accessToken, id: businessId } = business;
 
-    // --- 2. Extract user message (text or transcribed voice) ---
-    let userMessage = '';
-    let mediaBuffer = null;
-    let isVoice = false;
+    const userMessage = await extractUserMessage(message, accessToken, business);
 
-    if (message.type === 'text') {
-      userMessage = message.text.body;
-    } else if (message.type === 'voice') {
-      isVoice = true;
-      const mediaId = message.voice.id;
-      mediaBuffer = await whatsapp.downloadMedia(mediaId, accessToken);
-      userMessage = await openaiService.transcribeAudio(mediaBuffer);
-    } else {
-      // Unsupported type – ignore
-      return res.sendStatus(200);
+    if (userMessage === "__VOICE_ERROR__") {
+      // Generate smart AI fallback message
+      const fallback = await openaiService.generateVoiceErrorMessage(business);
+    
+      await whatsapp.sendTextMessage(
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        fallback
+      );
+    
+      return;
     }
 
-    // --- 3. Retrieve current session ---
-    const session = getSession(business.id, customerNumber);
+    if (!userMessage) {
+      logger.warn(
+        `[${business.name}] Empty or unsupported message from ${customerNumber}`,
+      );
 
-    // --- 4. First AI call: get initial intent and maybe an action ---
-    let aiOutput = await openaiService.processMessage(userMessage, session);
-    logger.info('Initial AI output:', aiOutput);
+      await whatsapp.sendTextMessage(
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        "Sorry, I could not understand that message. Please send text or a clear voice note.",
+      );
+
+      return;
+    }
+
+    const session = getSession(businessId, customerNumber);
+
+    const rawAiOutput = await openaiService.processMessage(
+      userMessage,
+      session,
+      business,
+    );
+
+    const aiOutput = openaiService.normalizeAiOutput(rawAiOutput, session);
+    const action = aiOutput.action;
+
+    logger.info(`[${business.name}] Normalized action: ${action.type}`);
 
     let responseText = aiOutput.response;
-    let action = aiOutput.action || { type: 'none' };
 
-    // --- 5. If an action is requested, perform it and then ask AI to write the final response ---
-    if (action.type !== 'none') {
-      // We'll collect data from the action
-      let actionResult = null;
+    if (action.type !== "none") {
+      const { actionResult, productsToShow } = await executeAction({
+        action,
+        businessId,
+        customerNumber,
+        session,
+      });
 
-      switch (action.type) {
-        case 'search_products': {
-          const query = action.data.query;
-          const products = productService.searchProducts(business.id, query);
-          if (products.length > 0) {
-            // Store the first match as last product for context
-            setLastProduct(business.id, customerNumber, products[0]);
-            actionResult = { products };
-          } else {
-            actionResult = { products: [] };
-          }
-          break;
-        }
+      const freshSession = getSession(businessId, customerNumber);
 
-        case 'generate_payment_link': {
-          const productName = action.data.productName;
-          const email = action.data.email; // AI may include email if user provided it
-          const product = productService.getProductByName(business.id, productName);
-          if (product) {
-            const { paymentLink, orderId } = paymentService.generatePaymentLink(
-              business.id,
-              customerNumber,
-              product.name,
-              product.price
-            );
-            // Send invoice email (mock) – you can also send a real PDF
-            await emailService.sendInvoiceEmail(email || `${customerNumber}@example.com`, { product, orderId });
-            actionResult = { paymentLink, orderId };
-          } else {
-            actionResult = { error: 'Product not found' };
-          }
-          break;
-        }
+      const finalAiOutput =
+        await openaiService.generateResponseWithActionResult(
+          userMessage,
+          freshSession,
+          actionResult,
+          business,
+        );
 
-        case 'start_negotiation': {
-          const productName = action.data.productName;
-          const product = productService.getProductByName(business.id, productName);
-          if (product && product.allow_negotiation) {
-            setNegotiation(business.id, customerNumber, {
-              productId: product.id,
-              productName: product.name,
-              originalPrice: product.price,
-              minPrice: product.min_price,
-              currentOffer: null,
-              stage: 'started',
-            });
-            actionResult = { product };
-          } else {
-            actionResult = { error: 'Product not negotiable or not found' };
-          }
-          break;
-        }
-
-        case 'make_offer': {
-          const offer = action.data.offer;
-          const negotiation = session.negotiation;
-          if (negotiation) {
-            // Update negotiation with the offer
-            setNegotiation(business.id, customerNumber, { ...negotiation, currentOffer: offer, stage: 'offered' });
-            // Provide the updated negotiation to the AI
-            actionResult = { negotiation: { ...negotiation, currentOffer: offer } };
-          } else {
-            actionResult = { error: 'No ongoing negotiation' };
-          }
-          break;
-        }
-
-        case 'accept_offer': {
-          const finalPrice = action.data.finalPrice;
-          clearNegotiation(business.id, customerNumber);
-          actionResult = { finalPrice };
-          break;
-        }
-
-        // Add more action types as needed
-        default:
-          logger.warn('Unknown action type:', action.type);
-      }
-
-      // --- 6. Now that we have actionResult, call AI again to craft the final response ---
-      // We pass the original user message, the updated session, and the action result.
-      const finalAiOutput = await openaiService.generateResponseWithActionResult(
-        userMessage,
-        getSession(business.id, customerNumber), // fresh session (updated by actions)
-        actionResult
-      );
       responseText = finalAiOutput.response;
-      logger.info('Final AI output:', finalAiOutput);
+
+      await sendOutboundMessage({
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        responseText,
+        productsToShow,
+      });
+    } else {
+      await whatsapp.sendTextMessage(
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        responseText,
+      );
     }
 
-    // --- 7. Update conversation history with the final response ---
-    const updatedSession = getSession(business.id, customerNumber);
-    setSession(business.id, customerNumber, {
-      conversationHistory: [
-        ...(updatedSession.conversationHistory || []),
-        { role: 'user', content: userMessage },
-        { role: 'assistant', content: responseText },
-      ],
-      lastProduct: updatedSession.lastProduct,
-      negotiation: updatedSession.negotiation,
+    const currentSession = getSession(businessId, customerNumber);
+
+    setSession(businessId, customerNumber, {
+      conversationHistory: buildConversationHistory(
+        currentSession.conversationHistory || [],
+        userMessage,
+        responseText,
+      ),
+      lastProduct: currentSession.lastProduct,
+      negotiation: currentSession.negotiation,
+      lastSearch: currentSession.lastSearch,
     });
 
-    // --- 8. Send the response back to the user ---
-    if (isVoice) {
-      // For voice messages, respond with audio (simplified: text for now)
-      const audioBuffer = await openaiService.textToSpeech(responseText);
-      // In a real implementation, you would upload the audio and send via WhatsApp
-      await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, responseText);
-    } else {
-      await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, responseText);
-    }
-
-    res.sendStatus(200);
+    logger.info(`[${business.name}] → replied to ${customerNumber}`);
   } catch (error) {
-    logger.error('Webhook error:', error);
-    res.sendStatus(500);
+    logger.error("[Webhook] Unhandled error:", error);
   }
 }

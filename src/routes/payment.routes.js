@@ -3,7 +3,7 @@ import { handlePaymentWebhook } from '../controllers/payment.controller.js';
 
 const router = Router();
 
-// Mock payment gateway webhook
-router.post('/payment-webhook', handlePaymentWebhook);
+// Payment gateway webhook (Paystack / Flutterwave / Stripe callback)
+router.post('/payment/webhook', handlePaymentWebhook);
 
 export default router;
