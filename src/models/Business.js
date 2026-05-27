@@ -28,6 +28,8 @@ export const addBusiness = (data) => {
     phone_number_id: data.phone_number_id,
     waba_id: data.waba_id,
     access_token: data.access_token,  // TODO: encrypt at rest in production
+    velteUserId: data.velteUserId || null,
+    aiConfig: data.aiConfig || {},
     connected_at: new Date(),
     is_test: data.is_test || false,
   };

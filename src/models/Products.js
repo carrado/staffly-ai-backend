@@ -149,6 +149,21 @@ const scoreProductMatch = (product, query) => {
   return score;
 };
 
+export const searchProductsFromList = (products, query, limit = 50) => {
+  const normalizedQuery = normalizeText(query);
+  if (!normalizedQuery) return [];
+
+  return products
+    .map((product) => ({ product, score: scoreProductMatch(product, normalizedQuery) }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.product.name.localeCompare(b.product.name);
+    })
+    .slice(0, limit)
+    .map(({ product }) => product);
+};
+
 export const seedDemoProducts = (businessId) => {
   const demo = [
     {
@@ -458,19 +473,6 @@ export const findProductByName = (businessId, name) => {
 };
 
 export const getProductById = (id) => products.get(id) || null;
-
-export const buildProductContext = (product) => {
-  return [
-    `Name: ${product.name}`,
-    `Category: ${product.category || 'N/A'}`,
-    `Description: ${product.description}`,
-    `Price: ₦${product.price?.toLocaleString()}`,
-    `Stock: ${product.stock}`,
-    `Tags: ${(product.tags || []).join(', ') || 'None'}`,
-    `Use cases: ${(product.useCases || []).join(', ') || 'None'}`,
-    `Attributes: ${formatAttributesForAI(product)}`,
-  ].join('\n');
-};
 
 export const getProductCategories = (businessId) => {
   const products = getProductsByBusiness(businessId);

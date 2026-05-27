@@ -13,8 +13,9 @@
  */
 
 import axios from 'axios';
-import { addBusiness, getBusinessById, updateBusinessToken } from '../models/Business.js';
+import { addBusiness, getBusinessById, getAllBusinesses, removeBusiness } from '../models/Business.js';
 import { seedDemoProducts } from '../models/Products.js';
+import { clearAllSessionsForBusiness } from '../models/ConversationState.js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
 
@@ -103,10 +104,7 @@ export async function disconnectBusiness(req, res) {
     // TODO: revoke Meta token here
     // await axios.delete(`${GRAPH_URL}/me/permissions`, { headers: { Authorization: `Bearer ${business.access_token}` }});
 
-    const { clearAllSessionsForBusiness } = await import('../models/ConversationState.js');
     clearAllSessionsForBusiness(businessId);
-
-    const { removeBusiness } = await import('../models/Business.js');
     removeBusiness(businessId);
 
     logger.info(`Business disconnected: ${businessId}`);
@@ -117,12 +115,7 @@ export async function disconnectBusiness(req, res) {
   }
 }
 
-/**
- * List all connected businesses (admin/internal use only).
- * In production, protect this with auth middleware.
- */
 export async function listBusinesses(req, res) {
-  const { getAllBusinesses } = await import('../models/Business.js');
-  const businesses = getAllBusinesses().map(({ access_token, ...safe }) => safe); // never expose tokens
+  const businesses = getAllBusinesses().map(({ access_token, ...safe }) => safe);
   return res.json({ businesses });
 }

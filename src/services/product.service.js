@@ -1,66 +1,123 @@
 import {
-  getProductsByBusiness,
+  getProductsByBusiness as getInMemoryProducts,
   findProductByName,
+  searchProductsFromList,
   formatAttributesForAI,
-  getProductCategories as getProductCategoriesFromModel,
+  getProductCategories as getInMemoryCategories,
 } from '../models/Products.js';
+import { getBusinessById } from '../models/Business.js';
+import { Product } from '../models/mongoose/Product.js';
 import { openai } from '../config/openai.js';
+
+// ─── Shape conversion ─────────────────────────────────────────────────────────
+
+function toStafflyProduct(p) {
+  // Velte stores attributes as [{ name, value }] pairs.
+  // Group them into { Size: ['S','M','L'], Color: ['Black'] } for compatibility.
+  const attrGroups = {};
+  for (const attr of p.attributes || []) {
+    if (!attrGroups[attr.name]) attrGroups[attr.name] = [];
+    attrGroups[attr.name].push(attr.value);
+  }
+
+  return {
+    id: p._id.toString(),
+    business_id: p.vendorId?.toString() || '',
+    name: p.name,
+    category: p.categoryId || '',
+    description: p.description || '',
+    price: p.discountedPrice || p.price || 0,
+    stock: p.stockQuantity ?? (p.isCurrentlyAvailable !== false ? 999 : 0),
+    allow_negotiation: p.isNegotiable || false,
+    min_price: p.minimumPrice || null,
+    image_url: p.mainImageUrl || '',
+    gallery: p.thumbnailUrls || [],
+    tags: p.tags || [],
+    useCases: [],
+    attributes: attrGroups,
+  };
+}
+
+// ─── Data source ──────────────────────────────────────────────────────────────
+
+async function getProductsForBusiness(businessId) {
+  const business = getBusinessById(businessId);
+  if (!business) return [];
+
+  // Real business: query MongoDB by vendorId
+  if (business.velteUserId) {
+    const docs = await Product.find({ vendorId: business.velteUserId }).lean();
+    return docs.map(toStafflyProduct);
+  }
+
+  // Test / dev business: fall back to in-memory demo products
+  return getInMemoryProducts(businessId);
+}
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 
-export function searchProducts(businessId, query) {
-  const all = getProductsByBusiness(businessId);
-  const q = query.toLowerCase();
-
-  return all.filter((p) => {
-    // Match on name or description
-    if (p.name.toLowerCase().includes(q)) return true;
-    if (p.description.toLowerCase().includes(q)) return true;
-    if (p.category.toLowerCase().includes(q)) return true;
-
-    // Also match on attribute values
-    // e.g. searching "red" finds products with colors: ['Red', ...]
-    // e.g. searching "size 42" finds products with sizes: ['42', ...]
-    const attrMatch = Object.values(p.attributes || {}).some((v) =>
-      Array.isArray(v)
-        ? v.some((item) => String(item).toLowerCase().includes(q))
-        : String(v).toLowerCase().includes(q)
-    );
-    return attrMatch;
-  });
+export async function searchProducts(businessId, query, limit = 50) {
+  const all = await getProductsForBusiness(businessId);
+  return searchProductsFromList(all, query, limit);
 }
 
-export function getProductByName(businessId, name) {
-  const all = getProductsByBusiness(businessId);
-  // Exact match first, then partial
+export async function getProductsByIds(ids) {
+  if (!ids?.length) return [];
+
+  // Try MongoDB first (real products have ObjectId-style ids)
+  try {
+    const docs = await Product.find({ _id: { $in: ids } }).lean();
+    if (docs.length) return docs.map(toStafflyProduct);
+  } catch {
+    // ids may be in-memory string format — fall through
+  }
+
+  // Fallback: look up from in-memory map one by one
+  const { getProductById: getInMemoryById } = await import('../models/Products.js');
+  return ids.map(getInMemoryById).filter(Boolean);
+}
+
+export async function getProductById(id) {
+  // Try MongoDB
+  try {
+    const doc = await Product.findById(id).lean();
+    if (doc) return toStafflyProduct(doc);
+  } catch {
+    // Not a valid ObjectId — in-memory product
+  }
+
+  const { getProductById: getInMemoryById } = await import('../models/Products.js');
+  return getInMemoryById(id) || null;
+}
+
+export async function getProductByName(businessId, name) {
+  const all = await getProductsForBusiness(businessId);
   return (
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ||
-    findProductByName(businessId, name) ||
+    searchProductsFromList(all, name, 1)[0] ||
     null
   );
 }
 
+export async function getProductCategories(businessId) {
+  const business = getBusinessById(businessId);
+  if (!business) return [];
+
+  if (business.velteUserId) {
+    const docs = await Product.find({ vendorId: business.velteUserId }, { categoryId: 1 }).lean();
+    return [...new Set(docs.map((d) => d.categoryId).filter(Boolean))];
+  }
+
+  return getInMemoryCategories(businessId);
+}
+
 // ─── Attribute checking ───────────────────────────────────────────────────────
 
-/**
- * Check whether a specific attribute value is available on a product.
- *
- * Examples:
- *   checkAttribute(product, 'sizes', '42')
- *   → { available: true, value: '42', available_options: ['39','40','41','42','43','44'] }
- *
- *   checkAttribute(product, 'colors', 'green')
- *   → { available: false, value: null, available_options: ['Black', 'White'] }
- *
- *   checkAttribute(product, 'sizes', null)   ← user asking "what sizes do you have?"
- *   → { available: true, available_options: ['39','40','41','42','43','44'] }
- */
 export function checkAttribute(product, attributeKey, requestedValue) {
   const attrs = product.attributes || {};
 
-  // Case-insensitive key lookup
   const matchedKey = Object.keys(attrs).find(
-    (k) => k.toLowerCase() === attributeKey.toLowerCase()
+    (k) => k.toLowerCase() === attributeKey.toLowerCase(),
   );
 
   if (!matchedKey) {
@@ -74,17 +131,12 @@ export function checkAttribute(product, attributeKey, requestedValue) {
   const options = attrs[matchedKey];
   const optionsList = Array.isArray(options) ? options : [String(options)];
 
-  // No specific value requested — just list what's available
   if (!requestedValue) {
-    return {
-      available: true,
-      available_options: optionsList,
-    };
+    return { available: true, available_options: optionsList };
   }
 
-  // Check if the requested value exists
   const match = optionsList.find(
-    (o) => String(o).toLowerCase() === requestedValue.toLowerCase()
+    (o) => String(o).toLowerCase() === requestedValue.toLowerCase(),
   );
 
   return {
@@ -96,10 +148,6 @@ export function checkAttribute(product, attributeKey, requestedValue) {
 
 // ─── Context builder for AI ───────────────────────────────────────────────────
 
-/**
- * Build a complete product summary string for the AI system prompt.
- * Includes all attributes so the AI can answer questions without extra API calls.
- */
 export function buildProductContext(product) {
   return [
     `Name: ${product.name}`,
@@ -114,7 +162,7 @@ export function buildProductContext(product) {
 // ─── AI-powered suggestions ───────────────────────────────────────────────────
 
 export async function suggestProducts(businessId, userDescription) {
-  const all = getProductsByBusiness(businessId);
+  const all = await getProductsForBusiness(businessId);
   if (!all.length) return [];
 
   const productList = all
@@ -133,8 +181,3 @@ export async function suggestProducts(businessId, userDescription) {
   const names = result.suggestions || [];
   return all.filter((p) => names.includes(p.name));
 }
-
-
-export const getProductCategories = (businessId) => {
-  return getProductCategoriesFromModel(businessId);
-};

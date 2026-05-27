@@ -167,7 +167,7 @@ export async function sendProductList(phoneNumberId, accessToken, to, products, 
 
 export async function downloadMedia(mediaId, accessToken) {
   const mediaRes = await axios.get(
-    `https://graph.facebook.com/v20.0/${mediaId}`,
+    `${GRAPH_URL}/${mediaId}`,
     {
       headers: {
         Authorization: `Bearer ${accessToken}`,

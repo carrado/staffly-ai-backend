@@ -44,3 +44,4 @@ coverage/
 *.pid.lock
 
 notes.txt
+*.md

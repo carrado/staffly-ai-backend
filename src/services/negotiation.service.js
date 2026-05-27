@@ -1,16 +1,16 @@
 import { getSession, setSession } from '../models/ConversationState.js';
 
 export function startNegotiation(businessId, customerNumber, product) {
-  setSession(businessId, customerNumber, {
-    negotiation: {
-      productId: product.id,
-      productName: product.name,
-      originalPrice: product.price,
-      minPrice: product.min_price,
-      currentOffer: null,
-      stage: 'started',
-    },
-  });
+  const negotiation = {
+    productId: product.id,
+    productName: product.name,
+    originalPrice: product.price,
+    minPrice: product.min_price,
+    currentOffer: null,
+    stage: 'started',
+  };
+  setSession(businessId, customerNumber, { negotiation });
+  return negotiation;
 }
 
 export function updateNegotiation(businessId, customerNumber, offer) {

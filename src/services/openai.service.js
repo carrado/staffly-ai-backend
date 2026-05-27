@@ -264,8 +264,10 @@ export function normalizeAiOutput(aiOutput, session = {}) {
 
 function buildActionDecisionPrompt(business, session) {
   const contextStr = buildContextString(session);
+  const tone = business.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
 
-  return `You are an AI sales assistant for "${business.name}". You help customers browse products, check sizes/colors/attributes, negotiate prices, and place orders via WhatsApp.
+  return `You are an AI sales assistant for "${business.name}".${toneInstruction} You help customers browse products, check sizes/colors/attributes, negotiate prices, and place orders via WhatsApp.
 
 You MUST return ONLY a valid JSON object in this exact structure:
 {
@@ -338,8 +340,10 @@ ${contextStr}`;
 
 function buildActionResultPrompt(business, session, actionResult) {
   const contextStr = buildContextString(session);
+  const tone = business.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
 
-  return `You are an AI sales assistant for "${business.name}".
+  return `You are an AI sales assistant for "${business.name}".${toneInstruction}
 You just executed an action for a customer. Use the action result below to craft a natural, helpful WhatsApp reply.
 
 Current context:

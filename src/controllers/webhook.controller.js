@@ -17,7 +17,6 @@ import {
   getSession,
   setSession,
   setLastProduct,
-  setNegotiation,
   clearNegotiation,
 } from "../models/ConversationState.js";
 import * as whatsapp from "../services/whatsapp.service.js";
@@ -25,6 +24,7 @@ import * as openaiService from "../services/openai.service.js";
 import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
 import * as emailService from "../services/email.service.js";
+import { startNegotiation, updateNegotiation } from "../services/negotiation.service.js";
 import { logger } from "../utils/logger.js";
 
 const SEARCH_PAGE_SIZE = 4;
@@ -149,7 +149,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         break;
       }
 
-      const found = productService.searchProducts(
+      const found = await productService.searchProducts(
         businessId,
         query,
         SEARCH_LIMIT,
@@ -198,9 +198,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         break;
       }
 
-      const allProducts = lastSearch.productIds
-        .map((id) => productService.getProductById(id))
-        .filter(Boolean);
+      const allProducts = await productService.getProductsByIds(lastSearch.productIds);
 
       const start = lastSearch.offset || 0;
       const nextProducts = allProducts.slice(start, start + SEARCH_PAGE_SIZE);
@@ -237,7 +235,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       const resolvedProductName = getResolvedProductName(action.data, session);
 
       const product = resolvedProductName
-        ? productService.getProductByName(businessId, resolvedProductName)
+        ? await productService.getProductByName(businessId, resolvedProductName)
         : session.lastProduct;
 
       if (!product) {
@@ -280,7 +278,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       const resolvedProductName = getResolvedProductName(action.data, session);
 
       const product = resolvedProductName
-        ? productService.getProductByName(businessId, resolvedProductName)
+        ? await productService.getProductByName(businessId, resolvedProductName)
         : null;
 
       if (!product) {
@@ -321,7 +319,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       const resolvedProductName = getResolvedProductName(action.data, session);
 
       const product = resolvedProductName
-        ? productService.getProductByName(businessId, resolvedProductName)
+        ? await productService.getProductByName(businessId, resolvedProductName)
         : null;
 
       if (!product) {
@@ -337,89 +335,59 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         actionResult = createDefaultActionResult(
           `${product.name} is not available for negotiation.`,
         );
-        productsToShow = [];
         break;
       }
 
-      const negotiationState = {
-        productId: product.id,
-        productName: product.name,
-        originalPrice: product.price,
-        minPrice: product.min_price,
-        currentOffer: null,
-        stage: "started",
-      };
-
-      setNegotiation(businessId, customerNumber, negotiationState);
+      const negotiation = startNegotiation(businessId, customerNumber, product);
 
       actionResult = {
         product: product.name,
-        originalPrice: product.price,
-        minPrice: product.min_price,
+        originalPrice: negotiation.originalPrice,
+        minPrice: negotiation.minPrice,
         message: "Negotiation started",
       };
 
-      productsToShow = [];
       break;
     }
 
     case "make_offer": {
       const freshSession = getSession(businessId, customerNumber);
-      let negotiation = freshSession.negotiation;
+      let activeNegotiation = freshSession.negotiation;
       let negotiationProduct = null;
 
-      if (!negotiation && freshSession.lastProduct?.name) {
-        const fallbackProduct = productService.getProductByName(
+      if (!activeNegotiation && freshSession.lastProduct?.name) {
+        const fallbackProduct = await productService.getProductByName(
           businessId,
           freshSession.lastProduct.name,
         );
 
         if (fallbackProduct?.allow_negotiation) {
-          negotiation = {
-            productId: fallbackProduct.id,
-            productName: fallbackProduct.name,
-            originalPrice: fallbackProduct.price,
-            minPrice: fallbackProduct.min_price,
-            currentOffer: null,
-            stage: "started",
-          };
-
-          setNegotiation(businessId, customerNumber, negotiation);
+          activeNegotiation = startNegotiation(businessId, customerNumber, fallbackProduct);
           negotiationProduct = fallbackProduct;
         }
       }
 
-      if (!negotiation) {
+      if (!activeNegotiation) {
         actionResult = createDefaultActionResult(
           "There is no active negotiation yet. Tell me which product you want to negotiate on.",
         );
         break;
       }
 
-      const updatedNegotiation = {
-        ...negotiation,
-        currentOffer: action.data.offer,
-        stage: "offered",
-      };
+      const updatedNegotiation = updateNegotiation(businessId, customerNumber, action.data.offer);
 
-      setNegotiation(businessId, customerNumber, updatedNegotiation);
-
-      if (!negotiationProduct && negotiation.productName) {
-        negotiationProduct = productService.getProductByName(
+      if (!negotiationProduct && activeNegotiation.productName) {
+        negotiationProduct = await productService.getProductByName(
           businessId,
-          negotiation.productName,
+          activeNegotiation.productName,
         );
       }
 
       if (negotiationProduct) {
         setLastProduct(businessId, customerNumber, negotiationProduct);
       }
-      
-      productsToShow = [];
 
-      actionResult = {
-        negotiation: updatedNegotiation,
-      };
+      actionResult = { negotiation: updatedNegotiation };
 
       break;
     }
@@ -433,7 +401,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       let negotiatedProduct = null;
 
       if (negotiation?.productName) {
-        negotiatedProduct = productService.getProductByName(
+        negotiatedProduct = await productService.getProductByName(
           businessId,
           negotiation.productName,
         );
@@ -455,7 +423,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
     }
 
     case 'list_categories': {
-      const categories = productService.getProductCategories(businessId);
+      const categories = await productService.getProductCategories(businessId);
     
       if (!categories.length) {
         actionResult = {
@@ -547,6 +515,23 @@ export async function handleIncomingMessage(req, res) {
 
     const session = getSession(businessId, customerNumber);
 
+    // Send greeting on first contact or after 1 hour of inactivity
+    const GREETING_COOLDOWN_MS = 60 * 60 * 1000;
+    const isFirstMessage = !session.lastMessageAt;
+    const isReturningAfterCooldown =
+      session.lastMessageAt &&
+      Date.now() - new Date(session.lastMessageAt).getTime() > GREETING_COOLDOWN_MS;
+
+    if ((isFirstMessage || isReturningAfterCooldown) && business.aiConfig?.greetingMessage) {
+      await whatsapp.sendTextMessage(
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        business.aiConfig.greetingMessage,
+      );
+      await new Promise((r) => setTimeout(r, 600));
+    }
+
     const rawAiOutput = await openaiService.processMessage(
       userMessage,
       session,
@@ -607,6 +592,7 @@ export async function handleIncomingMessage(req, res) {
       lastProduct: currentSession.lastProduct,
       negotiation: currentSession.negotiation,
       lastSearch: currentSession.lastSearch,
+      lastMessageAt: new Date(),
     });
 
     logger.info(`[${business.name}] → replied to ${customerNumber}`);

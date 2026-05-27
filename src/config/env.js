@@ -5,6 +5,9 @@ export const env = {
   port: process.env.PORT || 3000,
   nodeEnv: process.env.NODE_ENV || 'development',
 
+  // Database
+  mongodbUri: process.env.MONGODB_URI,
+
   // OpenAI
   openaiApiKey: process.env.OPENAI_API_KEY,
 
@@ -14,6 +17,12 @@ export const env = {
   metaVerifyToken: process.env.META_VERIFY_TOKEN,
   metaRedirectUri: process.env.META_REDIRECT_URI,
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
+
+  // Velte backend (event source)
+  velteWebhookSecret: process.env.VELTE_WEBHOOK_SECRET,
+  velteBaseUrl: process.env.NODE_ENV === 'production'
+    ? 'https://velte-backend.onrender.com'
+    : 'http://localhost:5000',
 
   // ─── Test / Dev business (loaded from .env for local testing) ───────────────
   // These simulate what would come from Embedded Signup for a real user.
