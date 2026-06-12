@@ -101,6 +101,51 @@ export function sendableImageUrl(product) {
   return url;
 }
 
+// Fixed card labels per conversation language. Product descriptions are
+// translated upstream (openai.service translateDescriptionsToPidgin) — this
+// table covers everything composed in code. Button titles must stay within
+// Meta's 20-character limit.
+const CAPTION_STRINGS = {
+  english: {
+    price: (p) => `💰 Price: ₦${p}`,
+    sizes: (v) => `📐 Sizes: ${v}`,
+    colors: (v) => `🎨 Colors: ${v}`,
+    material: (v) => `🧵 Material: ${v}`,
+    gender: (v) => `👤 Gender: ${v}`,
+    chooseOne: 'choose one',
+    chooseAtLeastOne: 'choose at least one',
+    optional: 'optional',
+    readyIn: (m) => `⏱️ Ready in ~${m} mins`,
+    availableNow: '🍽️ Available now',
+    soldOutToday: '🚫 Sold out for today',
+    preOrders: '📅 Pre-orders accepted',
+    inStock: '📦 In stock',
+    stockCount: (n) => `📦 Stock: ${n} available`,
+    negotiable: '✅ Price is negotiable',
+    pickButton: '🛒 Pick this one',
+  },
+  pidgin: {
+    price: (p) => `💰 Price na ₦${p}`,
+    sizes: (v) => `📐 Sizes wey dey: ${v}`,
+    colors: (v) => `🎨 Colors wey dey: ${v}`,
+    material: (v) => `🧵 Material: ${v}`,
+    gender: (v) => `👤 Gender: ${v}`,
+    chooseOne: 'pick one',
+    chooseAtLeastOne: 'pick at least one',
+    optional: 'if you want',
+    readyIn: (m) => `⏱️ E go ready in ~${m} mins`,
+    availableNow: '🍽️ E dey available now',
+    soldOutToday: '🚫 E don finish for today',
+    preOrders: '📅 You fit pre-order am',
+    inStock: '📦 E dey in stock',
+    stockCount: (n) => `📦 Na ${n} remain`,
+    negotiable: '✅ You fit price am small',
+    pickButton: '🛒 Na this one',
+  },
+};
+
+const captionStrings = (language) => CAPTION_STRINGS[language] || CAPTION_STRINGS.english;
+
 /**
  * Build the image caption for a product card.
  * Shows name, price, all attributes, and negotiability.
@@ -108,20 +153,21 @@ export function sendableImageUrl(product) {
  * WhatsApp captions support basic formatting:
  *   *bold*  _italic_  ~strikethrough~
  */
-function buildProductCaption(product) {
+function buildProductCaption(product, language = 'english') {
+  const s = captionStrings(language);
   const attrs = product.attributes || {};
   const lines = [];
 
   // Name + price
   lines.push(`*${product.name}*`);
   lines.push(product.description);
-  lines.push(`💰 Price: ₦${product.price.toLocaleString()}`);
+  lines.push(s.price(product.price.toLocaleString()));
 
   // Known attribute keys with icons
-  if (attrs.sizes?.length)   lines.push(`📐 Sizes: ${attrs.sizes.join(', ')}`);
-  if (attrs.colors?.length)  lines.push(`🎨 Colors: ${attrs.colors.join(', ')}`);
-  if (attrs.material)        lines.push(`🧵 Material: ${attrs.material}`);
-  if (attrs.gender)          lines.push(`👤 Gender: ${attrs.gender}`);
+  if (attrs.sizes?.length)   lines.push(s.sizes(attrs.sizes.join(', ')));
+  if (attrs.colors?.length)  lines.push(s.colors(attrs.colors.join(', ')));
+  if (attrs.material)        lines.push(s.material(attrs.material));
+  if (attrs.gender)          lines.push(s.gender(attrs.gender));
 
   // Any other custom attributes (dimensions, weight, fit, etc.)
   const knownKeys = new Set(['sizes', 'colors', 'material', 'gender']);
@@ -138,23 +184,23 @@ function buildProductCaption(product) {
       .map((o) => (o.additionalPrice > 0 ? `${o.name} +₦${o.additionalPrice.toLocaleString()}` : o.name))
       .join(', ');
     const rule = group.required
-      ? group.multiSelect ? 'choose at least one' : 'choose one'
-      : 'optional';
+      ? group.multiSelect ? s.chooseAtLeastOne : s.chooseOne
+      : s.optional;
     lines.push(`🍴 ${group.name} (${rule}): ${opts}`);
   }
 
   // Availability — food shows prep time and "available today", retail shows
   // stock (999 is the untracked-stock sentinel, shown as just "In stock").
   if (product.is_food) {
-    if (product.prep_time_mins) lines.push(`⏱️ Ready in ~${product.prep_time_mins} mins`);
-    lines.push(product.stock > 0 ? '🍽️ Available now' : '🚫 Sold out for today');
-    if (product.stock <= 0 && product.allow_preorder) lines.push('📅 Pre-orders accepted');
+    if (product.prep_time_mins) lines.push(s.readyIn(product.prep_time_mins));
+    lines.push(product.stock > 0 ? s.availableNow : s.soldOutToday);
+    if (product.stock <= 0 && product.allow_preorder) lines.push(s.preOrders);
   } else if (product.stock === 999) {
-    lines.push('📦 In stock');
+    lines.push(s.inStock);
   } else {
-    lines.push(`📦 Stock: ${product.stock} available`);
+    lines.push(s.stockCount(product.stock));
   }
-  if (product.allow_negotiation) lines.push('✅ Price is negotiable');
+  if (product.allow_negotiation) lines.push(s.negotiable);
 
   return lines.filter(Boolean).join('\n');
 }
@@ -168,8 +214,8 @@ function buildProductCaption(product) {
  *
  * Falls back to text-only if no image URL is set.
  */
-export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '') {
-  const caption = buildProductCaption(product);
+export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '', language = 'english') {
+  const caption = buildProductCaption(product, language);
   const imageUrl = sendableImageUrl(product);
 
   if (imageUrl) {
@@ -203,8 +249,8 @@ const INTERACTIVE_BODY_LIMIT = 1024;
  *
  * Falls back to a plain image/text card if the interactive send fails.
  */
-export async function sendProductButtonCard(phoneNumberId, accessToken, to, product) {
-  const caption = buildProductCaption(product).slice(0, INTERACTIVE_BODY_LIMIT);
+export async function sendProductButtonCard(phoneNumberId, accessToken, to, product, language = 'english') {
+  const caption = buildProductCaption(product, language).slice(0, INTERACTIVE_BODY_LIMIT);
   const imageUrl = sendableImageUrl(product);
 
   const payload = {
@@ -218,7 +264,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
         buttons: [
           {
             type: 'reply',
-            reply: { id: `select_product:${product.id}`, title: '🛒 Pick this one' },
+            reply: { id: `select_product:${product.id}`, title: captionStrings(language).pickButton },
           },
         ],
       },
@@ -241,7 +287,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
     logger.warn(
       `[WhatsApp] Button card failed for product "${product.name}": ${err.response?.data?.error?.message || err.message}`,
     );
-    await sendProductCard(phoneNumberId, accessToken, to, product);
+    await sendProductCard(phoneNumberId, accessToken, to, product, '', language);
   }
 }
 
@@ -254,7 +300,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
  *   2. One interactive image card per result, each with a "Pick this one" button
  *   3. Footer text (e.g. the "show more" hint), after the last card
  */
-export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '', footerText = '') {
+export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '', footerText = '', language = 'english') {
   if (!products.length) return;
 
   // Send the AI's intro text first
@@ -266,7 +312,7 @@ export async function sendProductList(phoneNumberId, accessToken, to, products, 
   // Send each product card with a gap between them
   let sent = 0;
   for (const product of products) {
-    await sendProductButtonCard(phoneNumberId, accessToken, to, product);
+    await sendProductButtonCard(phoneNumberId, accessToken, to, product, language);
     sent += 1;
     logger.info(`[WhatsApp] Card ${sent}/${products.length} sent ("${product.name}")`);
     await new Promise((r) => setTimeout(r, 500)); // 500ms between cards

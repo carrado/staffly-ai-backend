@@ -1,5 +1,9 @@
 import mongoose from 'mongoose';
-import { searchProductsFromList, formatAttributesForAI } from '../models/Products.js';
+import {
+  searchProductsFromList,
+  searchProductsFromListScored,
+  formatAttributesForAI,
+} from '../models/Products.js';
 import { getBusinessById } from '../models/Business.js';
 import { Product } from '../models/mongoose/Product.js';
 import { ModifierOption } from '../models/mongoose/ModifierOption.js';
@@ -212,13 +216,24 @@ async function getProductsForBusiness(businessId) {
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 
+// Semantic catches have no keyword score — the model says the product fits but
+// its copy never names what it is. Treat that as a solid-but-not-exact match.
+const SEMANTIC_MATCH_PERCENT = 75;
+
+/**
+ * Search results carry a `matchPercent` (0–100) on each product — how closely
+ * it matches the query — and are ordered by it, strongest first.
+ */
 export async function searchProducts(businessId, query, limit = 50) {
   const all = await getProductsForBusiness(businessId);
   // Inquiries only ever list items still available — in stock for retail, on
   // today's menu (or pre-orderable) for food. Direct name lookups elsewhere
   // still find unavailable items so the AI can explain they're sold out.
   const available = all.filter((p) => p.is_available);
-  const keywordMatches = searchProductsFromList(available, query, limit);
+  // Copies, not cache objects — matchPercent is query-specific.
+  const keywordMatches = searchProductsFromListScored(available, query, limit).map(
+    ({ product, matchPercent }) => ({ ...product, matchPercent }),
+  );
 
   // Broad "*" browses already list everything; specific searches get a second,
   // semantic pass over whatever the keyword scorer missed.
@@ -240,10 +255,16 @@ export async function searchProducts(businessId, query, limit = 50) {
   // Cached ids are re-resolved against the CURRENT candidate set, so products
   // that sold out (or now match by keyword) drop out naturally.
   const byId = new Map(candidates.map((p) => [p.id, p]));
-  const extras = extraIds.map((id) => byId.get(id)).filter(Boolean);
+  const extras = extraIds
+    .map((id) => byId.get(id))
+    .filter(Boolean)
+    .map((p) => ({ ...p, matchPercent: SEMANTIC_MATCH_PERCENT }));
 
-  // Keyword matches keep their relevance ranking; semantic catches follow.
-  return [...keywordMatches, ...extras].slice(0, limit);
+  // One list ordered by match strength; the sort is stable, so on equal
+  // percentages keyword matches stay ahead of semantic catches.
+  return [...keywordMatches, ...extras]
+    .sort((a, b) => b.matchPercent - a.matchPercent)
+    .slice(0, limit);
 }
 
 export async function getProductsByIds(ids) {

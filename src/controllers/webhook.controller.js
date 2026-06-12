@@ -36,6 +36,7 @@ const BROWSE_PAGE_SIZE = 10;     // numbered text entries per page for a broad "
 const BROWSE_LIMIT = 200;        // broad browse pages through the whole catalog
 const SIMILAR_PAGE_SIZE = 4;     // text-only "similar negotiable" alternatives
 const LOW_STOCK_THRESHOLD = 5;   // used to justify counter-offers ("only N left")
+const STRONG_MATCH_PERCENT = 90; // matchPercent at/above this = what the customer asked for
 
 // Fixed, code-composed strings the customer can see. AI-written replies mirror
 // the customer's language on their own; these cover everything written in code.
@@ -44,6 +45,8 @@ const STRINGS = {
   english: {
     moreItems: (n) =>
       `I still have ${n} more item${n === 1 ? "" : "s"} — reply *show more* to see ${n === 1 ? "it" : "them"}.`,
+    otherItems: (n) =>
+      `I also have ${n} other item${n === 1 ? "" : "s"} you might like — reply *show more* to see ${n === 1 ? "it" : "them"}.`,
     productGone:
       "Sorry, that product is no longer available. Tell me what you're looking for and I'll find something similar.",
     pickedFood: (name, mins) =>
@@ -58,6 +61,8 @@ const STRINGS = {
   pidgin: {
     moreItems: (n) =>
       `I still get ${n} more item${n === 1 ? "" : "s"} — reply *show more* make you see ${n === 1 ? "am" : "them"}.`,
+    otherItems: (n) =>
+      `I still get ${n} other item${n === 1 ? "" : "s"} wey fit catch your eye — reply *show more* make you see ${n === 1 ? "am" : "them"}.`,
     productGone:
       "Sorry o, that product don finish. Tell me wetin you dey find make I show you something wey resemble am.",
     pickedFood: (name, mins) =>
@@ -205,31 +210,47 @@ async function runCheckout({
   };
 }
 
+/**
+ * Card captions print product.description verbatim — for Pidgin sessions,
+ * translate it so the card matches the conversation. The card's fixed labels
+ * and button title are handled by whatsapp.service's own string table.
+ */
+async function localizeProductsForLanguage(products, language) {
+  if (language !== "pidgin" || !products.length) return products;
+  return openaiService.translateDescriptionsToPidgin(products);
+}
+
 async function sendOutboundMessage({
   phoneNumberId,
   accessToken,
   customerNumber,
   responseText,
   productsToShow = [],
+  language = "english",
 }) {
-  if (productsToShow.length === 1) {
+  const products = await localizeProductsForLanguage(productsToShow, language);
+
+  if (products.length === 1) {
     await whatsapp.sendProductCard(
       phoneNumberId,
       accessToken,
       customerNumber,
-      productsToShow[0],
+      products[0],
       responseText,
+      language,
     );
     return;
   }
 
-  if (productsToShow.length > 1) {
+  if (products.length > 1) {
     await whatsapp.sendProductList(
       phoneNumberId,
       accessToken,
       customerNumber,
-      productsToShow,
+      products,
       responseText,
+      "",
+      language,
     );
     return;
   }
@@ -255,7 +276,8 @@ async function handleProductSelection({
   productId,
 }) {
   const product = await productService.getProductById(productId);
-  const strings = t(getSession(businessId, customerNumber).language);
+  const language = getSession(businessId, customerNumber).language;
+  const strings = t(language);
 
   if (!product) {
     await whatsapp.sendTextMessage(
@@ -273,12 +295,15 @@ async function handleProductSelection({
     ? strings.pickedFood(product.name, product.prep_time_mins)
     : strings.pickedRetail(product.name);
 
+  const [localized] = await localizeProductsForLanguage([product], language);
+
   await whatsapp.sendProductCard(
     phoneNumberId,
     accessToken,
     customerNumber,
-    product,
+    localized,
     followUpText,
+    language,
   );
 
   const currentSession = getSession(businessId, customerNumber);
@@ -367,13 +392,31 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         `[Search] "${query}" → ${found.length} match(es) for business ${businessId}`,
       );
 
-      // Only genuine matches are shown — if fewer than a full page match,
-      // list just those.
-      const productsToDisplay = found.slice(0, pageSize);
+      // Results arrive ordered by matchPercent. The strong tier (≥90%) is
+      // what the customer literally asked for; everything below is "close".
+      const strongCount = isBroadBrowse
+        ? found.length
+        : found.filter((p) => (p.matchPercent ?? 100) >= STRONG_MATCH_PERCENT)
+            .length;
+
+      // Page 1 never mixes tiers: with 1–3 strong matches, show ONLY those —
+      // the lower-tier items are announced as "other items you might like"
+      // instead of padding the page. With more strong matches than fit, or
+      // none at all, page normally from the top of the list.
+      const productsToDisplay =
+        !isBroadBrowse && strongCount > 0 && strongCount < pageSize
+          ? found.slice(0, strongCount)
+          : found.slice(0, pageSize);
       const remainingCount = Math.max(
         found.length - productsToDisplay.length,
         0,
       );
+
+      // True when everything left beyond this page is lower-tier — switches
+      // the appended hint from "N more items" to "N other items you might like".
+      const remainingAreSuggestions =
+        !isBroadBrowse && strongCount > 0 && remainingCount > 0 &&
+        strongCount <= productsToDisplay.length;
 
       if (found.length > 0) {
         setLastProduct(businessId, customerNumber, found[0]);
@@ -394,6 +437,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
           query,
           productIds: found.map((product) => product.id),
           offset: productsToDisplay.length,
+          strongCount,
         },
       });
 
@@ -402,6 +446,10 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         count: found.length,
         shownCount: productsToDisplay.length,
         remainingCount,
+        remainingAreSuggestions,
+        // "strong": the shown products are what the customer asked for.
+        // "partial": nothing matched closely — these are the nearest fits.
+        matchTier: isBroadBrowse ? undefined : strongCount > 0 ? "strong" : "partial",
         startNumber: 1,
         displayMode: productsToShow.length ? "cards" : "text",
         products: productsToDisplay.map(mapProductForAI),
@@ -487,6 +535,13 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       const newOffset = start + nextProducts.length;
       const remainingCount = Math.max(allProducts.length - newOffset, 0);
 
+      // Once pagination has moved past the strong tier, what's left is the
+      // lower-match tier — keep the "other items you might like" framing.
+      const strongCount = lastSearch.strongCount ?? 0;
+      const remainingAreSuggestions =
+        !isBroadBrowse && strongCount > 0 && remainingCount > 0 &&
+        newOffset >= strongCount;
+
       if (nextProducts.length > 0) {
         setLastProduct(businessId, customerNumber, nextProducts[0]);
         if (!isBroadBrowse) {
@@ -508,6 +563,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         count: allProducts.length,
         shownCount: nextProducts.length,
         remainingCount,
+        remainingAreSuggestions,
         startNumber: start + 1, // continue the numbered list across pages
         displayMode: productsToShow.length ? "cards" : "text",
         products: nextProducts.map(mapProductForAI),
@@ -639,6 +695,37 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         break;
       }
 
+      // Mid-haggle "you no fit reduce am?" gets classified as start_negotiation
+      // too. Resetting would forget the prices already quoted and let the next
+      // counter jump back UP — a quoted price is a commitment. If a negotiation
+      // for this product already has a standing quote, restate it instead.
+      const existing = getSession(businessId, customerNumber).negotiation;
+      if (
+        existing?.productId === product.id &&
+        Number.isFinite(existing.lastCounter)
+      ) {
+        actionResult = {
+          negotiation:
+            existing.stage === "final"
+              ? {
+                  outcome: "final",
+                  finalPrice: existing.lastCounter,
+                  listPrice: existing.originalPrice,
+                  product: product.name,
+                }
+              : {
+                  outcome: "counter",
+                  counterPrice: existing.lastCounter,
+                  listPrice: existing.originalPrice,
+                  round: existing.rounds,
+                  product: product.name,
+                },
+          product: mapProductForAI(product),
+        };
+        productsToShow = [];
+        break;
+      }
+
       const negotiation = startNegotiation(businessId, customerNumber, product);
 
       // NOTE: never expose minPrice — it stays server-side only.
@@ -692,7 +779,14 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         activeNegotiation = startNegotiation(businessId, customerNumber, product);
       }
 
-      const decision = evaluateOffer(activeNegotiation, action.data.offer);
+      // "26" on a ₦30,000 product means ₦26,000 — rescue shorthand the model
+      // passed through literally before the engine prices it as an insult bid.
+      const offer = openaiService.scaleOfferToContext(
+        action.data.offer,
+        product.price,
+      );
+
+      const decision = evaluateOffer(activeNegotiation, offer);
       setNegotiation(businessId, customerNumber, decision.negotiation);
 
       // Rule F — accepted price: hand off to the existing checkout flow.
@@ -1092,9 +1186,13 @@ export async function handleIncomingMessage(req, res) {
 
     // Safety net: mid-negotiation, a message carrying a money amount IS a bid.
     // If the model still failed to classify it, route it to the engine rather
-    // than letting a stalling "none" reply go out.
+    // than letting a stalling "none" reply go out. The list price anchors
+    // shorthand: "make I run am 26" on a ₦30,000 item reads as ₦26,000.
     if (action.type === "none" && session.negotiation) {
-      const fallbackOffer = openaiService.extractOfferAmount(userMessage);
+      const fallbackOffer = openaiService.extractOfferAmount(
+        userMessage,
+        session.negotiation.originalPrice || session.lastProduct?.price || null,
+      );
       if (fallbackOffer !== null) {
         action = { type: "make_offer", data: { offer: fallbackOffer } };
         logger.info(
@@ -1120,11 +1218,14 @@ export async function handleIncomingMessage(req, res) {
       const freshSession = getSession(businessId, customerNumber);
 
       // The "show more" hint is written in code, never by the model — it must
-      // only ever appear when items genuinely remain.
+      // only ever appear when items genuinely remain. When everything left is
+      // a lower-tier match, frame it as suggestions instead of more results.
       const remainingCount = actionResult?.remainingCount;
       const moreItemsHint =
         typeof remainingCount === "number" && remainingCount > 0
-          ? t(language).moreItems(remainingCount)
+          ? actionResult?.remainingAreSuggestions
+            ? t(language).otherItems(remainingCount)
+            : t(language).moreItems(remainingCount)
           : null;
 
       const sendingCards = asPickableCards && productsToShow.length > 0;
@@ -1133,13 +1234,19 @@ export async function handleIncomingMessage(req, res) {
         // Search results: the cards ARE the response — image, full details,
         // and the "Pick this one" button — no AI intro bubble before them.
         // The hint about more items goes out after the last card.
+        const localizedCards = await localizeProductsForLanguage(
+          productsToShow,
+          language,
+        );
+
         await whatsapp.sendProductList(
           phoneNumberId,
           accessToken,
           customerNumber,
-          productsToShow,
+          localizedCards,
           "",
           moreItemsHint || "",
+          language,
         );
 
         // History note (never sent) so follow-ups like "the second one" or
@@ -1170,6 +1277,7 @@ export async function handleIncomingMessage(req, res) {
           customerNumber,
           responseText,
           productsToShow,
+          language,
         });
       }
     } else if (!greetingWasSent) {

@@ -1,13 +1,16 @@
 import crypto from 'crypto';
 import { env } from '../config/env.js';
+import { logger } from '../utils/logger.js';
 
 export function verifySignature(req, res, next) {
   const signature = req.headers['x-hub-signature-256'];
 
   if (!signature) {
-    return env.nodeEnv === 'production' 
-      ? res.status(401).send('Missing signature') 
-      : next();
+    if (env.nodeEnv === 'production') {
+      logger.warn('[Signature] Rejected: no X-Hub-Signature-256 header');
+      return res.status(401).send('Missing signature');
+    }
+    return next();
   }
 
   // Ensure you have rawBody available from your body-parser config
@@ -22,8 +25,9 @@ export function verifySignature(req, res, next) {
   const digestBuffer = Buffer.from(digest, 'utf8');
   const signatureBuffer = Buffer.from(signature, 'utf8');
 
-  if (digestBuffer.length !== signatureBuffer.length || 
+  if (digestBuffer.length !== signatureBuffer.length ||
       !crypto.timingSafeEqual(digestBuffer, signatureBuffer)) {
+    logger.warn('[Signature] Rejected: signature mismatch — check that META_APP_SECRET matches the Meta app sending this webhook');
     return res.status(401).send('Invalid signature');
   }
 

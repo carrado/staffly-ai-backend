@@ -125,12 +125,17 @@ export function evaluateOffer(negotiation, rawOffer) {
   // 3. Below the floor → cannot accept at their number.
   const belowFloorRounds = (negotiation.belowFloorRounds || 0) + 1;
 
-  // The floor becomes the open, take-it-or-leave-it final price. lastCounter is
-  // set to it so a plain "ok" afterwards checks out at exactly this price.
+  // The floor becomes the open, take-it-or-leave-it final price — capped at
+  // anything we already quoted: a stated price is a commitment and the final
+  // price must NEVER be higher than a number the customer has already seen.
+  // lastCounter is set to it so a plain "ok" afterwards checks out at exactly
+  // this price.
+  const standingQuote = Number.isFinite(negotiation.lastCounter) ? negotiation.lastCounter : null;
+  const finalPrice = standingQuote !== null ? Math.min(floor, standingQuote) : floor;
   const finalDecision = {
     outcome: 'final',
-    finalPrice: floor,
-    negotiation: { ...base, belowFloorRounds, lastCounter: floor, stage: 'final' },
+    finalPrice,
+    negotiation: { ...base, belowFloorRounds, lastCounter: finalPrice, stage: 'final' },
   };
 
   // They've pressed enough without reaching the floor — stop descending.
@@ -145,8 +150,7 @@ export function evaluateOffer(negotiation, rawOffer) {
 
   // Every press earns a real (but shrinking) concession: strictly below our
   // previous counter, below the list price, and never near the floor.
-  const prevCounter = Number.isFinite(negotiation.lastCounter) ? negotiation.lastCounter : null;
-  if (prevCounter !== null) counter = Math.min(counter, prevCounter - PRICE_STEP);
+  if (standingQuote !== null) counter = Math.min(counter, standingQuote - PRICE_STEP);
   counter = Math.min(counter, list - PRICE_STEP);
 
   // No room left above the floor — the descent is over; the floor is final.
