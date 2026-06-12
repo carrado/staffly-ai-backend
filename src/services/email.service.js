@@ -4,7 +4,10 @@ import { logger } from '../utils/logger.js';
  * Send an invoice email after a payment link is generated.
  * Replace with a real email provider (SendGrid, Nodemailer, etc.)
  */
-export async function sendInvoiceEmail(to, { product, orderId }) {
+export async function sendInvoiceEmail(to, { product, orderId, amount }) {
+  // `amount` reflects a negotiated/agreed price when present; otherwise fall
+  // back to the product's list price.
+  const price = amount ?? product.price;
   // TODO: integrate real email provider
-  logger.info(`[EMAIL] Invoice for order ${orderId} → ${to} | Product: ${product.name} | Price: ${product.price}`);
+  logger.info(`[EMAIL] Invoice for order ${orderId} → ${to} | Product: ${product.name} | Price: ${price}`);
 }

@@ -17,18 +17,4 @@ export const env = {
   metaVerifyToken: process.env.META_VERIFY_TOKEN,
   metaRedirectUri: process.env.META_REDIRECT_URI,
   baseUrl: process.env.BASE_URL || 'http://localhost:3000',
-
-  // Velte backend (event source)
-  velteWebhookSecret: process.env.VELTE_WEBHOOK_SECRET,
-  velteBaseUrl: process.env.NODE_ENV === 'production'
-    ? 'https://velte-backend.onrender.com'
-    : 'http://localhost:5000',
-
-  // ─── Test / Dev business (loaded from .env for local testing) ───────────────
-  // These simulate what would come from Embedded Signup for a real user.
-  // Set these in .env to test without going through the full OAuth flow.
-  testPhoneNumberId: process.env.TEST_PHONE_NUMBER_ID,
-  testWabaId: process.env.TEST_WABA_ID,
-  testAccessToken: process.env.TEST_ACCESS_TOKEN,
-  testBusinessName: process.env.TEST_BUSINESS_NAME || 'Demo Store',
 };

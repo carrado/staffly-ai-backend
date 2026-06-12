@@ -10,6 +10,12 @@ import { logger } from '../utils/logger.js';
 
 const GRAPH_URL = 'https://graph.facebook.com/v22.0';
 
+// Axios has NO default timeout — without one, a dead socket hangs the message
+// handler forever. Every Meta call gets a hard cap so failures surface and
+// fall back instead of getting stuck.
+const SEND_TIMEOUT_MS = 15000;
+const MEDIA_TIMEOUT_MS = 30000;
+
 // ─── Basic message senders ────────────────────────────────────────────────────
 
 export async function sendTextMessage(phoneNumberId, accessToken, to, text) {
@@ -26,6 +32,7 @@ export async function sendTextMessage(phoneNumberId, accessToken, to, text) {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
+      timeout: SEND_TIMEOUT_MS,
     }
   );
 }
@@ -44,6 +51,7 @@ export async function sendImageMessage(phoneNumberId, accessToken, to, imageUrl,
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
+      timeout: SEND_TIMEOUT_MS,
     }
   );
 }
@@ -62,11 +70,36 @@ export async function sendAudioMessage(phoneNumberId, accessToken, to, audioUrl)
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
+      timeout: SEND_TIMEOUT_MS,
     }
   );
 }
 
 // ─── Product card helpers ─────────────────────────────────────────────────────
+
+// WhatsApp image messages/headers only accept JPEG and PNG. A link to any
+// other format passes the API call (HTTP 200) but fails delivery
+// asynchronously — the customer receives nothing.
+const UNSUPPORTED_IMAGE_EXT = /\.(webp|gif|svg|avif|bmp|tiff?|heic)(\?|$)/i;
+
+/**
+ * Return the product's image URL if it's usable in a WhatsApp message,
+ * otherwise null (no image, placeholder domain, or a format Meta can't
+ * deliver — those cards go out as text instead).
+ */
+export function sendableImageUrl(product) {
+  const url = product.image_url;
+  if (typeof url !== 'string' || !url.trim() || url.includes('example.com')) {
+    return null;
+  }
+  if (UNSUPPORTED_IMAGE_EXT.test(url)) {
+    logger.warn(
+      `[WhatsApp] Skipping image for "${product.name}" — unsupported format: ${url}`,
+    );
+    return null;
+  }
+  return url;
+}
 
 /**
  * Build the image caption for a product card.
@@ -99,8 +132,28 @@ function buildProductCaption(product) {
     }
   });
 
-  // Stock + negotiability
-  lines.push(`📦 Stock: ${product.stock} available`);
+  // Food modifier groups (choice of protein, toppings, ...)
+  for (const group of product.modifiers || []) {
+    const opts = group.options
+      .map((o) => (o.additionalPrice > 0 ? `${o.name} +₦${o.additionalPrice.toLocaleString()}` : o.name))
+      .join(', ');
+    const rule = group.required
+      ? group.multiSelect ? 'choose at least one' : 'choose one'
+      : 'optional';
+    lines.push(`🍴 ${group.name} (${rule}): ${opts}`);
+  }
+
+  // Availability — food shows prep time and "available today", retail shows
+  // stock (999 is the untracked-stock sentinel, shown as just "In stock").
+  if (product.is_food) {
+    if (product.prep_time_mins) lines.push(`⏱️ Ready in ~${product.prep_time_mins} mins`);
+    lines.push(product.stock > 0 ? '🍽️ Available now' : '🚫 Sold out for today');
+    if (product.stock <= 0 && product.allow_preorder) lines.push('📅 Pre-orders accepted');
+  } else if (product.stock === 999) {
+    lines.push('📦 In stock');
+  } else {
+    lines.push(`📦 Stock: ${product.stock} available`);
+  }
   if (product.allow_negotiation) lines.push('✅ Price is negotiable');
 
   return lines.filter(Boolean).join('\n');
@@ -117,11 +170,11 @@ function buildProductCaption(product) {
  */
 export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '') {
   const caption = buildProductCaption(product);
-  const hasRealImage = product.image_url && !product.image_url.includes('example.com');
+  const imageUrl = sendableImageUrl(product);
 
-  if (hasRealImage) {
+  if (imageUrl) {
     try {
-      await sendImageMessage(phoneNumberId, accessToken, to, product.image_url, caption);
+      await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
     } catch (err) {
       // Image failed — fall back to plain text card
       logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
@@ -139,15 +192,69 @@ export async function sendProductCard(phoneNumberId, accessToken, to, product, f
   }
 }
 
+// Interactive-message limits (Meta API)
+const INTERACTIVE_BODY_LIMIT = 1024;
+
+/**
+ * Send one product as an interactive card: image header (when available),
+ * full details as the body, and a "Pick this one" reply button whose id
+ * encodes the product (`select_product:<id>`) so the webhook can resolve
+ * the tap back to the exact product.
+ *
+ * Falls back to a plain image/text card if the interactive send fails.
+ */
+export async function sendProductButtonCard(phoneNumberId, accessToken, to, product) {
+  const caption = buildProductCaption(product).slice(0, INTERACTIVE_BODY_LIMIT);
+  const imageUrl = sendableImageUrl(product);
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'button',
+      body: { text: caption },
+      action: {
+        buttons: [
+          {
+            type: 'reply',
+            reply: { id: `select_product:${product.id}`, title: '🛒 Pick this one' },
+          },
+        ],
+      },
+    },
+  };
+
+  if (imageUrl) {
+    payload.interactive.header = { type: 'image', image: { link: imageUrl } };
+  }
+
+  try {
+    await axios.post(`${GRAPH_URL}/${phoneNumberId}/messages`, payload, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: SEND_TIMEOUT_MS,
+    });
+  } catch (err) {
+    logger.warn(
+      `[WhatsApp] Button card failed for product "${product.name}": ${err.response?.data?.error?.message || err.message}`,
+    );
+    await sendProductCard(phoneNumberId, accessToken, to, product);
+  }
+}
+
 /**
  * Send multiple product cards.
- * Used when a search returns more than one result.
+ * Used when a search returns one or more results.
  *
  * Sequence:
  *   1. Header text (the AI's intro message)
- *   2. One product card per result
+ *   2. One interactive image card per result, each with a "Pick this one" button
+ *   3. Footer text (e.g. the "show more" hint), after the last card
  */
-export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '') {
+export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '', footerText = '') {
   if (!products.length) return;
 
   // Send the AI's intro text first
@@ -157,9 +264,42 @@ export async function sendProductList(phoneNumberId, accessToken, to, products, 
   }
 
   // Send each product card with a gap between them
+  let sent = 0;
   for (const product of products) {
-    await sendProductCard(phoneNumberId, accessToken, to, product);
+    await sendProductButtonCard(phoneNumberId, accessToken, to, product);
+    sent += 1;
+    logger.info(`[WhatsApp] Card ${sent}/${products.length} sent ("${product.name}")`);
     await new Promise((r) => setTimeout(r, 500)); // 500ms between cards
+  }
+
+  if (footerText) {
+    await sendTextMessage(phoneNumberId, accessToken, to, footerText);
+  }
+}
+
+// ─── Presence / status ───────────────────────────────────────────────────────
+
+export async function markMessageAsRead(phoneNumberId, accessToken, messageId) {
+  try {
+    await axios.post(
+      `${GRAPH_URL}/${phoneNumberId}/messages`,
+      { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
+      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: SEND_TIMEOUT_MS },
+    );
+  } catch {
+    // non-critical — never block the response
+  }
+}
+
+export async function sendTypingIndicator(phoneNumberId, accessToken, to) {
+  try {
+    await axios.post(
+      `${GRAPH_URL}/${phoneNumberId}/messages`,
+      { messaging_product: 'whatsapp', to, type: 'typing' },
+      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: SEND_TIMEOUT_MS },
+    );
+  } catch {
+    // typing indicators not supported on all accounts — fail silently
   }
 }
 
@@ -172,6 +312,7 @@ export async function downloadMedia(mediaId, accessToken) {
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },
+      timeout: SEND_TIMEOUT_MS,
     }
   );
 
@@ -183,6 +324,7 @@ export async function downloadMedia(mediaId, accessToken) {
     headers: {
       Authorization: `Bearer ${accessToken}`,
     },
+    timeout: MEDIA_TIMEOUT_MS,
   });
 
   return {
@@ -203,7 +345,7 @@ export async function registerWebhookForBusiness(wabaId, accessToken) {
     await axios.post(
       `${GRAPH_URL}/${wabaId}/subscribed_apps`,
       {},
-      { headers: { Authorization: `Bearer ${accessToken}` } }
+      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: SEND_TIMEOUT_MS }
     );
     logger.info(`[WhatsApp] Webhook registered for WABA ${wabaId}`);
   } catch (err) {

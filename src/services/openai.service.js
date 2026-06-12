@@ -24,6 +24,8 @@ const VALID_ACTION_TYPES = new Set([
   'start_negotiation',
   'make_offer',
   'accept_offer',
+  'find_similar_negotiable',
+  'send_product_image',
   'generate_payment_link',
   'list_categories',
 ]);
@@ -97,11 +99,42 @@ function parsePossibleNumber(value) {
   }
 
   if (typeof value === "string") {
+    // Nigerian shorthand: "20k" = 20,000 and "1.5m" = 1,500,000 — expand the
+    // suffix BEFORE stripping non-digits, or "20k" would parse as 20.
+    const shorthand = value
+      .trim()
+      .toLowerCase()
+      .match(/^₦?\s*([\d,]+(?:\.\d+)?)\s*(k|m)?$/);
+    if (shorthand) {
+      const amount = Number(shorthand[1].replace(/,/g, ""));
+      const multiplier = shorthand[2] === "k" ? 1000 : shorthand[2] === "m" ? 1e6 : 1;
+      if (Number.isFinite(amount) && amount > 0) return amount * multiplier;
+    }
+
     const numericValue = Number(value.replace(/[^\d.]/g, ""));
-    return Number.isFinite(numericValue) ? numericValue : null;
+    // 0 / empty means "no usable amount", not a free product.
+    return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : null;
   }
 
   return null;
+}
+
+/**
+ * Pull a plausible price offer out of a raw customer message ("abeg I go pay
+ * 20k for am" → 20000). Used as a safety net when the model fails to classify
+ * a bid during an active negotiation. Amounts under ₦100 are ignored — they're
+ * far likelier to be quantities or times than prices.
+ */
+export function extractOfferAmount(text) {
+  const tokens = String(text || "")
+    .toLowerCase()
+    .match(/₦?\s*\d[\d,]*(?:\.\d+)?\s*[km]?/g);
+  if (!tokens) return null;
+
+  const amounts = tokens
+    .map((t) => parsePossibleNumber(t.trim()))
+    .filter((n) => n !== null && n >= 100);
+  return amounts.length ? Math.max(...amounts) : null;
 }
 
 function buildContextString(session) {
@@ -113,15 +146,22 @@ function buildContextString(session) {
   }
 
   if (negotiation) {
+    // IMPORTANT: never include the minimum/floor price here. It is a hidden
+    // figure the customer must never see or be able to infer.
     contextStr += `\n--- Ongoing Negotiation ---\n`;
     contextStr += `Product: ${negotiation.productName}\n`;
-    contextStr += `Original price: ₦${negotiation.originalPrice?.toLocaleString()}\n`;
-    contextStr += `Minimum price: ₦${negotiation.minPrice?.toLocaleString()}\n`;
-    contextStr += `Current offer: ${
+    contextStr += `List price: ₦${negotiation.originalPrice?.toLocaleString()}\n`;
+    contextStr += `Customer's latest offer: ${
       negotiation.currentOffer
         ? `₦${negotiation.currentOffer.toLocaleString()}`
-        : "none"
+        : "none yet"
     }\n`;
+    contextStr += `Last price you offered: ${
+      negotiation.lastCounter
+        ? `₦${negotiation.lastCounter.toLocaleString()}`
+        : "none yet"
+    }\n`;
+    contextStr += `Haggling rounds so far: ${negotiation.rounds || 0}\n`;
     contextStr += `Stage: ${negotiation.stage || "unknown"}\n`;
   }
 
@@ -129,6 +169,8 @@ function buildContextString(session) {
 }
 
 function normalizeBroadSearchQuery(rawQuery) {
+  if (rawQuery?.trim() === '*') return '*';
+
   const query = normalizeText(rawQuery);
   if (!query) return "";
 
@@ -184,6 +226,22 @@ function normalizeActionData(type, rawData = {}, session = {}) {
         finalPrice: parsePossibleNumber(data.finalPrice),
       };
 
+    case "find_similar_negotiable":
+      return {
+        productName:
+          toNullableString(data.productName) ||
+          session.lastProduct?.name ||
+          null,
+      };
+
+    case "send_product_image":
+      return {
+        productName:
+          toNullableString(data.productName) ||
+          session.lastProduct?.name ||
+          null,
+      };
+
     case "generate_payment_link":
       return {
         productName:
@@ -193,6 +251,11 @@ function normalizeActionData(type, rawData = {}, session = {}) {
         email: toNullableString(data.email),
         selectedSize: toNullableString(data.selectedSize),
         selectedColor: toNullableString(data.selectedColor),
+        selectedModifiers: Array.isArray(data.selectedModifiers)
+          ? data.selectedModifiers
+              .map((m) => toNullableString(m))
+              .filter(Boolean)
+          : [],
       };
 
     case "show_more_products":
@@ -207,14 +270,23 @@ function normalizeActionData(type, rawData = {}, session = {}) {
 }
 
 export function normalizeAiOutput(aiOutput, session = {}) {
+  const sessionLanguage = session.language === "pidgin" ? "pidgin" : "english";
+
   const fallback = {
     response: "I'm sorry, I encountered an error. Please try again.",
     action: { type: "none", data: {} },
+    language: sessionLanguage,
   };
 
   if (!aiOutput || typeof aiOutput !== "object") {
     return fallback;
   }
+
+  // The conversation's language sticks until the model clearly detects a switch.
+  const language =
+    aiOutput.language === "pidgin" || aiOutput.language === "english"
+      ? aiOutput.language
+      : sessionLanguage;
 
   const response =
     typeof aiOutput.response === "string" && aiOutput.response.trim()
@@ -227,30 +299,39 @@ export function normalizeAiOutput(aiOutput, session = {}) {
       : { type: "none", data: {} };
 
   const type = VALID_ACTION_TYPES.has(rawAction.type) ? rawAction.type : "none";
-  const data = normalizeActionData(type, rawAction.data, session);
+
+  // The model sometimes flattens data fields onto the action itself
+  // ({"type":"make_offer","offer":20000} instead of {"type":...,"data":{"offer":...}}).
+  // Absorb those so a correct decision is never downgraded over its shape.
+  const { type: _type, data: rawData, ...flattenedFields } = rawAction;
+  const data = normalizeActionData(
+    type,
+    { ...flattenedFields, ...(rawData && typeof rawData === "object" ? rawData : {}) },
+    session,
+  );
 
   if (type === "search_products" && !data.query) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   if (type === "check_attribute" && !data.attributeKey) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   if (type === "start_negotiation" && !data.productName) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   if (type === "make_offer" && data.offer === null) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   if (type === "accept_offer" && data.finalPrice === null) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   if (type === "generate_payment_link" && !data.productName) {
-    return { response, action: { type: "none", data: {} } };
+    return { response, action: { type: "none", data: {} }, language };
   }
 
   return {
@@ -259,6 +340,7 @@ export function normalizeAiOutput(aiOutput, session = {}) {
       type,
       data,
     },
+    language,
   };
 }
 
@@ -272,49 +354,63 @@ function buildActionDecisionPrompt(business, session) {
 You MUST return ONLY a valid JSON object in this exact structure:
 {
   "response": "short natural reply for the customer",
+  "language": "english" | "pidgin",
   "action": {
-    "type": "none" | "search_products" | "check_attribute" | "start_negotiation" | "make_offer" | "accept_offer" | "generate_payment_link",
+    "type": "none" | "search_products" | "show_more_products" | "check_attribute" | "start_negotiation" | "make_offer" | "accept_offer" | "find_similar_negotiable" | "send_product_image" | "generate_payment_link" | "list_categories",
     "data": {}
   }
 }
 
+Language:
+- Detect the language of the customer's LATEST message: set "language" to "pidgin" when they write in Nigerian Pidgin, otherwise "english".
+- Short or ambiguous replies ("ok", "yes", a number) keep the conversation's previous language. Previous language: ${session.language || "english"}.
+- Write "response" in that language. Nigerian Pidgin must sound warm and natural — the way Nigerians actually chat on WhatsApp — never an exaggerated caricature. Keep product names, prices (₦), and links exactly as they are.
+
 Rules:
 - You MUST choose exactly one action.type from the allowed list.
 - Never invent a new action type.
+- CRITICAL: NEVER state, hint at, or imply any minimum price, price floor, "lowest we can go", or how much room there is to discount. That figure is secret. You may only ever mention the list price or a specific price you are offering right now.
+- CRITICAL: NEVER claim, invent, or imply that a product, size, color, price, or stock level exists. The catalog lives in the database. Whenever the customer asks about products, availability, attributes, pricing, or images, you MUST choose the matching product action (search_products, check_attribute, send_product_image, etc.) so real data is fetched — do not answer about products from memory and do not assume the store has something.
 - Prefer a business action over "none" when the customer is asking about products, attributes, pricing, negotiation, or payment.
-- Use "search_products" when the customer wants to browse, find, see, or ask about products or categories.
 - Use "check_attribute" when the customer asks about size, color, material, fit, stock variant, capacity, dimensions, or any specific product attribute.
 - Use "generate_payment_link" when the customer wants to buy, order, pay, checkout, or proceed with purchase.
-- Use "start_negotiation" when the customer asks for discount, better price, last price, reduction, or negotiation.
-- Use "make_offer" when there is an active negotiation and the customer gives a specific price.
-- Use "accept_offer" only when the customer clearly agrees to a negotiated final price.
-- Use "none" only for greetings, thanks, clarification, or casual conversation that requires no business action.
+- Food items may have modifier groups (e.g. choice of protein, toppings) listed as "Modifier" lines in the product context, each option with its extra cost. When the customer has told you their choices, pass the exact option names in data.selectedModifiers. If they order a dish without picking from a required group, still choose generate_payment_link — the system will tell you which choices are missing so you can ask.
+- Use "start_negotiation" when the customer asks for a discount, better price, "last price", reduction, or to negotiate, but has NOT yet named a specific amount.
+- Use "make_offer" when the customer proposes a specific price (e.g. "I fit pay 20k", "can you do 18000?", "20k last"), whether or not a negotiation is already active. Put the amount in "offer" as a plain number in Naira (e.g. "20k" → 20000).
+- NEVER stall on a price offer. Do not write that you will "check", "confirm", "see if e fit work", "get back to them", or consider it — pricing is resolved INSTANTLY by the system. Choose "make_offer" and the system hands you the decision (a counter-price, an acceptance, or a final price) to deliver in the same reply.
+- Use "accept_offer" only when the customer clearly agrees to the price YOU last offered (e.g. "ok", "deal", "that's fine", "I'll take it").
+- Use "find_similar_negotiable" when the customer agrees to see similar or alternative products after you offered to find items they can negotiate on (e.g. they reply "yes", "sure", "show me"), or when they directly ask for similar items they can bargain on.
+- Use "send_product_image" when the customer wants to SEE a product — its picture, photo, image, what it looks like, or to see a product together with its details (e.g. "send me the picture", "can I see it?", "show me a photo and details", "what does it look like?", "any images?"). This is the ONLY way to send a photo.
+- Use "none" only for pure greetings, thanks, or casual conversation with absolutely no product interest.
 - If the customer says "it", "that one", or similar, use the last product from context.
 - Use "show_more_products" when the customer says "show more", "see more", "next", "more products", "can I see more", "can you show me the rest" or wants to continue the previous product search.
-- Use "search_products" when the customer wants to search by product name, description, category, similar words, or what the item is used for.
-- If the customer says "something used in the kitchen", search query should be "kitchen".
-- Use "list_categories" when the user asks:
-  - "Do you have products?"
-  - "What do you sell?"
-  - "What do you have?"
-  - "What is available?"
-  - "What products are in your store?"
+- Use "list_categories" ONLY when the customer explicitly asks for category or department names, e.g. "what categories do you have?", "list your categories", "what departments do you have?".
 
-Very important search rules:
-- search_products is NOT only for exact product names.
-- For broad requests, use broad category search queries.
-- Examples:
-  - "show me fashion items" -> { "query": "fashion" }
-  - "what clothes do you have?" -> { "query": "clothes" }
-  - "do you have bags?" -> { "query": "bags" }
-  - "show me shoes" -> { "query": "shoes" }
-  - "anything for ladies?" -> { "query": "female fashion" }
-  - "what do you have for men?" -> { "query": "male fashion" }
-- If the user asks for a type/category of product, do NOT force an exact product name.
-- Keep the response concise and WhatsApp-friendly.
+CRITICAL — product browsing detection:
+- Use "search_products" for ANY message where the customer wants to SEE or BROWSE products.
+- Use { "query": "*" } to show ALL products for these broad requests (and similar ones):
+  - "What do you have?" / "What do you sell?" / "What is available?"
+  - "Show me your products" / "Show me what you have" / "Show me everything"
+  - "Do you have products?" / "What's in your store?" / "I want to see your items"
+  - "Let me see your products" / "What can I buy?" / "Browse products"
+- Use a specific query for category or type requests:
+  - "show me fashion items" → { "query": "fashion" }
+  - "what clothes do you have?" → { "query": "clothes" }
+  - "do you have bags?" → { "query": "bags" }
+  - "show me shoes" → { "query": "shoes" }
+  - "anything for ladies?" → { "query": "female fashion" }
+  - "what do you have for men?" → { "query": "male fashion" }
+  - "something used in the kitchen" → { "query": "kitchen" }
+- Food businesses work the same way — dishes, meals, and drinks are products:
+  - "what's on the menu?" / "what can I eat?" / "I'm hungry" → { "query": "*" }
+  - "do you have jollof rice?" → { "query": "jollof rice" }
+  - "any soups?" → { "query": "soup" }
+  - "what drinks do you have?" → { "query": "drinks" }
+- search_products applies to product names, categories, descriptions, use cases, and any product-related phrase.
+- Keep responses concise and WhatsApp-friendly.
 
 Action data rules:
-- search_products → { "query": "broad category, product type, or product-related phrase" }
+- search_products → { "query": "* for all products, or a specific category/type/name" }
 - check_attribute → {
     "productName": "product name or null if last product should be used",
     "attributeKey": "sizes | colors | material | stock | dimensions | etc",
@@ -323,14 +419,16 @@ Action data rules:
 - start_negotiation → { "productName": "product name or null if last product should be used" }
 - make_offer → { "offer": 25000 }
 - accept_offer → { "finalPrice": 25000 }
+- find_similar_negotiable → { "productName": "the product they were looking at, or null to use the last product" }
+- send_product_image → { "productName": "product name or null to use the last product" }
 - generate_payment_link → {
     "productName": "exact product name or null if last product should be used",
     "email": "customer email if provided or null",
     "selectedSize": "chosen size if provided or null",
-    "selectedColor": "chosen color if provided or null"
+    "selectedColor": "chosen color if provided or null",
+    "selectedModifiers": ["exact modifier option names the customer chose, e.g. [\"Chicken\", \"Extra Plantain\"], or [] if none"]
   }
 - show_more_products → {}
-- search_products → { "query": "product name, category, description, use case, or related phrase" }
 - list_categories → {}
 - none → {}
 
@@ -353,33 +451,56 @@ Action result:
 ${JSON.stringify(actionResult, null, 2)}
 
 Guidelines:
+- LANGUAGE: ${
+    session.language === "pidgin"
+      ? "The customer chats in Nigerian Pidgin — EVERY sentence of your reply, including any opening and closing line, must be in warm, natural Nigerian Pidgin (the way Nigerians actually chat on WhatsApp, never an exaggerated caricature). Do not slip back into standard English anywhere."
+      : "Mirror the customer's language: if their messages are in Nigerian Pidgin, reply in warm, natural Nigerian Pidgin; otherwise reply in clear, friendly English."
+  } Keep product names, prices (₦), and links exactly as given.
+- HONESTY (most important): Only ever mention products, prices, sizes, colors, images, or stock that ACTUALLY appear in the action result or context above. Never invent, assume, or imply that the store has something. The catalog is the database — if it isn't in the result, it doesn't exist for you.
 - For product search results:
-  - List the products returned in the action result.
-  - Mention name, price, and a short useful detail from description or attributes.
-  - If remainingCount > 0, tell the customer there are more items available beyond the ones shown now.
-  - If remainingCount === 0, do not mention any extra remaining items.
+  - If actionResult.count === 0 (or products is empty): clearly and politely tell the customer you don't currently have any product matching that. Do NOT pretend a match exists or describe an imaginary item. Offer to show available categories or ask them to describe what else they need.
+  - If displayMode is "text" (or absent): list ONLY the products in actionResult.products as a numbered list, one entry per product, numbering from actionResult.startNumber (default 1). Each entry MUST follow EXACTLY this format:
+    1. *Product Name* - Short one-line description. Price: ₦18,000. Available in red, black, white, and blue, with sizes 39, 41, and 42.
+    Build the "Available in ..." sentence from the product's actual attributes (colors, sizes, etc.); omit it when the product has no attributes. Use each product's real description, shortened to one line. Do not add anything else per entry.
+    For food/dish items (isFood true): mention the prep time when present instead of sizes/colors, e.g. "1. *Jollof Rice with Chicken* - Smoky party-style jollof served with grilled chicken. Price: ₦4,500. Ready in ~25 mins." If soldOutForToday is true, end the entry with "(sold out for today)".
+  - NEVER mention remaining items, extra items, or more products, and never invite the customer to reply "show more" — when more items actually exist, the system automatically appends that note for you. List or introduce ONLY what is in actionResult.products.
+  - For any product where inStock is false (or stock is 0), say it is currently out of stock — do not present it as available to buy. For food items where soldOutForToday is true: if allowPreOrder is true, offer it as a pre-order; otherwise say it is sold out for today and suggest they check back tomorrow.
+  - When a customer asks how long their food will take, use the product's prepTimeMins.
   - Keep it short and scannable.
-  - For product search results:
-  - List only the products in actionResult.products.
-  - Mention name, price, and why it matches.
-  - If remainingCount > 0, say: "I still have {remainingCount} more item(s). Reply 'show more' to see them."
-  - If remainingCount === 0, do not mention remaining items.
 - For attribute checks:
   - If available, confirm clearly.
   - If unavailable, say so and list available options if present.
-- For payment links: confirm product, selected options, price, and share the link naturally.
-- For negotiation:
-  - If offer is below minimum, respond politely and guide the customer.
-  - If acceptable, respond naturally and clearly.
+  - Never confirm a size/color/variant that is not in the result.
+- For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
+  - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
+- For payment links: confirm product, selected options, price, and share the link naturally. If the result includes selectedModifiers, confirm those choices as part of the order (the price already includes their extra cost).
+- If the result has "needsModifiers": true, the order was NOT placed and no payment link exists yet. Ask the customer to choose from each group in missingGroups, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"). Do not invent options and do not share any link.
+- For price negotiation (the action result has a "negotiation" object):
+  - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
+  - outcome "started": warmly invite the customer to make an offer. Do NOT name a discounted price yourself.
+  - outcome "counter": you are countering at negotiation.counterPrice. Your reply MUST state that exact price (₦ formatted) as the price you are offering RIGHT NOW — never say you will check, confirm, or get back to the customer; the decision is already made. Present it as YOUR price and justify the number using the REAL qualities of this product from the "product" details — quality, material, features, popularity, and limited availability if product.lowStock is true. Be warm but hold the value; do not cave to the customer's number and do not mention any minimum. Style examples (do NOT copy them word-for-word; write your own in the same spirit): English — "Because of the quality on this one, the best I can do right now is ₦X."; Pidgin — "This one na original o — make we meet for ₦X, you no go regret am."
+  - outcome "accept": the deal is agreed at negotiation.acceptedPrice. Confirm it enthusiastically and move the customer to payment using the link in the result.
+  - outcome "final": negotiation.finalPrice is your FINAL price — the haggling is over. State it clearly and warmly: this is the last price, there is no reduction after this. Do not apologise excessively and do not invite further offers on this product. If it's beyond their budget, offer to show similar items they can negotiate on. Style examples (do NOT copy them word-for-word; write your own in the same spirit, and never write "Oga/Madam" literally — address the customer naturally or not at all): English — "I've stretched as far as I can — ₦X is my final price on this one. Should I package it for you?"; Pidgin — "Last price na ₦X — I no fit go lower pass that one at all. Make I package am for you?"
+- For fixed-price products (action result has "nonNegotiable": true):
+  - Politely explain that the price for this product is fixed and you can't reduce it. Do not haggle.
+  - Then offer to find similar products they CAN negotiate on, and ask if they'd like to see them.
+- For similar product suggestions (action result has "similar": true):
+  - Introduce them as alternatives the customer can negotiate on.
+  - List ONLY the products in actionResult.products: name, price, and one short reason each fits. Plain text only — no images.
+  - Do not mention remaining items or "show more" — the system appends that note automatically when more exist.
+  - If count === 0, say you couldn't find similar negotiable items right now and offer to help another way.
+- If the result has "storeHandoff": true: the customer has already seen everything you can show in chat, but moreProductsCount more products are still available. Warmly and politely let them know the full catalog is on the store's website where they can browse and buy everything, and include storeLink EXACTLY as written — do not alter, shorten, or invent the URL. Do not list or describe any further products, and do not mention "show more".
 - For category listing:
-  - Tell the user the store has products.
-  - Mention categories clearly.
-  - Do NOT list individual product names.
-  - Keep it friendly and conversational.
+  - If there are categories in the result, mention them clearly and conversationally. Do NOT list individual product names.
+  - If the categories list is empty (no products), honestly tell the customer the store has no products available yet — do not invent categories or products.
 - If there is an error, explain it clearly and guide the customer on the next step.
-- Plain text only.
+- Plain text only. NEVER use markdown link syntax like [text](url) — WhatsApp does not render it; always write URLs bare.
 - No JSON.
-- Keep it concise for WhatsApp.`;
+- Keep it concise for WhatsApp.${
+    session.language === "pidgin"
+      ? "\n\nFINAL REMINDER: every single sentence of the reply — opening, list intro, and closing line included — must be in Nigerian Pidgin. No standard-English sentence anywhere."
+      : ""
+  }`;
 }
 
 /**
@@ -496,14 +617,63 @@ export async function transcribeAudio(audioData) {
   return transcription.text;
 }
 
-export async function generateVoiceErrorMessage(business) {
+export async function generateGreeting(type, business, language = 'english') {
+  const tone = business.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const languageInstruction =
+    language === 'pidgin'
+      ? ' The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.'
+      : '';
+
+  // The configured greeting is only ever a fallback for first visits — a
+  // "welcome back" must never reuse it.
+  const fallback =
+    type === 'first_visit'
+      ? business.aiConfig?.greetingMessage?.trim() || `Welcome to ${business.name}! 👋 How can I help you today?`
+      : `Welcome back to ${business.name}! 👋 How can I help you today?`;
+
+  try {
+    const userPrompt =
+      type === 'first_visit'
+        ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly. Plain text only, no JSON, no markdown.`
+        : `Write a very short, warm "welcome back" message for a returning customer who was away for a while. Make it feel personal and inviting. Plain text only, no JSON, no markdown.`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an AI sales assistant for "${business.name}".${toneInstruction}${languageInstruction}`,
+        },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+    });
+
+    return completion.choices?.[0]?.message?.content?.trim() || fallback;
+  } catch (error) {
+    logger.error('generateGreeting failed:', error);
+    return fallback;
+  }
+}
+
+export async function generateVoiceErrorMessage(business, language = "english") {
+  const fallback =
+    language === "pidgin"
+      ? "Sorry o, I no fit process your voice note. Abeg type your message as text 🙏"
+      : "Sorry, I couldn't process your voice note. Please send your message as text 🙏";
+
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
-          content: `You are a helpful AI assistant for "${business.name}".`,
+          content: `You are a helpful AI assistant for "${business.name}".${
+            language === "pidgin"
+              ? " The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin."
+              : ""
+          }`,
         },
         {
           role: "user",
@@ -514,14 +684,11 @@ export async function generateVoiceErrorMessage(business) {
       temperature: 0.5,
     });
 
-    return (
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "Sorry, I couldn't process your voice note. Please send your message as text 🙏"
-    );
+    return completion.choices?.[0]?.message?.content?.trim() || fallback;
   } catch (error) {
     logger.error("Voice fallback AI failed:", error);
 
-    return "Sorry, I couldn't process your voice note. Please send your message as text 🙏";
+    return fallback;
   }
 }
 

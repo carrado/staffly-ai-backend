@@ -14,7 +14,6 @@
 
 import axios from 'axios';
 import { addBusiness, getBusinessById, getAllBusinesses, removeBusiness } from '../models/Business.js';
-import { seedDemoProducts } from '../models/Products.js';
 import { clearAllSessionsForBusiness } from '../models/ConversationState.js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
@@ -77,9 +76,6 @@ export async function handleMetaCallback(req, res) {
       waba_id: wabaId,
       access_token: longToken,
     });
-
-    // Seed some demo products for this new business
-    seedDemoProducts(business.id);
 
     logger.info(`✅ New business connected: ${businessName} (${business.id}) | Phone: ${phoneNumber}`);
 
