@@ -208,10 +208,30 @@ function normalizeActionData(type, rawData = {}, session = {}) {
 
   switch (type) {
     case "search_products": {
-      const rawQuery = toCleanString(data.query);
-      return {
-        query: normalizeBroadSearchQuery(rawQuery),
-      };
+      let query = normalizeBroadSearchQuery(toCleanString(data.query));
+
+      // Budget shorthand ("under 15k", "I get 20k") scales like price offers.
+      const referencePrice = session.lastProduct?.price || null;
+      const maxPrice = scaleOfferToContext(
+        parsePossibleNumber(data.maxPrice),
+        referencePrice,
+      );
+
+      // Safety net for "show me cheaper ones" style refinements: if the model
+      // dropped the category and left only a budget word (or nothing), re-anchor
+      // to whatever the customer was already browsing so we never drift to an
+      // unrelated category. A budget alone must never trigger a blank/"cheap"
+      // catalog-wide search.
+      const BUDGET_ONLY = /^(cheap(er)?|affordable|budget|lower|cheaper ones?|less|reduced?|inexpensive|pocket[- ]?friendly)$/i;
+      if ((!query || BUDGET_ONLY.test(query)) && query !== "*") {
+        const anchor =
+          toCleanString(session.lastSearch?.query) ||
+          toCleanString(session.lastProduct?.category) ||
+          "";
+        if (anchor && anchor !== "*") query = normalizeBroadSearchQuery(anchor);
+      }
+
+      return maxPrice ? { query, maxPrice } : { query };
     }
 
     case "check_attribute":
@@ -304,11 +324,18 @@ export function normalizeAiOutput(aiOutput, session = {}) {
     return fallback;
   }
 
-  // The conversation's language sticks until the model clearly detects a switch.
-  const language =
+  const detected =
     aiOutput.language === "pidgin" || aiOutput.language === "english"
       ? aiOutput.language
-      : sessionLanguage;
+      : null;
+
+  // Language preference is sticky and asymmetric, so it can't fluctuate.
+  // Pidgin speakers freely drop into plain English for a word, a number, or a
+  // quick "ok" — that is NOT a request to switch. So once a customer has shown
+  // they prefer Pidgin, we stay in Pidgin for the rest of the conversation; we
+  // only ever sit in English while Pidgin has not yet appeared.
+  const language =
+    sessionLanguage === "pidgin" || detected === "pidgin" ? "pidgin" : "english";
 
   const response =
     typeof aiOutput.response === "string" && aiOutput.response.trim()
@@ -385,10 +412,12 @@ You MUST return ONLY a valid JSON object in this exact structure:
   }
 }
 
-Language:
-- Detect the language of the customer's LATEST message: set "language" to "pidgin" when they write in Nigerian Pidgin, otherwise "english".
-- Short or ambiguous replies ("ok", "yes", a number) keep the conversation's previous language. Previous language: ${session.language || "english"}.
-- Write "response" in that language. Nigerian Pidgin must sound warm and natural — the way Nigerians actually chat on WhatsApp — never an exaggerated caricature. Keep product names, prices (₦), and links exactly as they are.
+Language (the customer's established preference for THIS conversation is: ${session.language || "english"}):
+- This preference is STICKY and must not flicker turn to turn.
+- If the established preference is "pidgin": the customer prefers Nigerian Pidgin. KEEP "language": "pidgin" and write "response" in warm, natural Nigerian Pidgin — EVEN WHEN their latest message is short, is just a number, or is written in plain English. Pidgin speakers mix English in all the time; that is NOT a request to switch. NEVER flip a Pidgin customer back to formal English.
+- If the established preference is "english": set "language": "pidgin" the moment the customer genuinely writes in Nigerian Pidgin (markers like "dey", "wan", "abeg", "na", "wetin", "fit", "make I", "sef", "abi", "o"). Until then, keep "english".
+- Short or ambiguous replies ("ok", "yes", "how much?", a number) NEVER change the language — keep the established preference exactly.
+- Whatever you set "language" to, "response" MUST be written in that exact language. Nigerian Pidgin must sound warm and natural — the way Nigerians actually chat on WhatsApp — never an exaggerated caricature. Keep product names, prices (₦), and links exactly as they are.
 
 Nigerian Pidgin comprehension (CRITICAL — many customers shop entirely in Pidgin; misreading them loses sales):
 - Price offers come in MANY phrasings. ALL of these are make_offer, never "none":
@@ -446,10 +475,21 @@ CRITICAL — product browsing detection:
   - "any soups?" → { "query": "soup" }
   - "what drinks do you have?" → { "query": "drinks" }
 - search_products applies to product names, categories, descriptions, use cases, and any product-related phrase.
+
+STAY ON TOPIC — cheaper / budget / alternative requests (CRITICAL):
+- When the customer is already discussing a product or category (see "Last Product Discussed" and the previous search context) and then asks for cheaper, more affordable, lower-priced, smaller-budget, or "what can I afford" options, you MUST keep the search in that SAME category or close look-alikes. NEVER drift to an unrelated category (e.g. do not show handbags when the conversation is about shoes).
+  - Build the query from the category/type they were already looking at, NOT from the budget word. "show me cheaper ones" while browsing shoes → { "query": "shoes" }, NOT { "query": "cheaper" }.
+  - The active category lives in the context above (the last product's Category, or the previous search). Reuse it.
+- When the customer names a spending limit, pass it as maxPrice (resolve shorthand: "under 15k" → 15000, "I get 20k" → 20000, "around 10000" → 10000). Keep the category in query and put the limit in maxPrice:
+  - "any shoes under 15k?" → { "query": "shoes", "maxPrice": 15000 }
+  - (while browsing shoes) "anything cheaper, like 10k?" → { "query": "shoes", "maxPrice": 10000 }
+  - "what bag fits 8000?" → { "query": "bags", "maxPrice": 8000 }
+- If they want items they can BARGAIN/negotiate on (not just cheaper ones), use find_similar_negotiable instead — it already stays within the same category and look-alikes.
+- Only switch categories when the customer themselves clearly names a different product type or category.
 - Keep responses concise and WhatsApp-friendly.
 
 Action data rules:
-- search_products → { "query": "* for all products, or a specific category/type/name" }
+- search_products → { "query": "* for all products, or a specific category/type/name", "maxPrice": <optional budget in Naira, only when the customer states a spending limit> }
 - check_attribute → {
     "productName": "product name or null if last product should be used",
     "attributeKey": "sizes | colors | material | stock | dimensions | etc",
@@ -490,10 +530,10 @@ Action result:
 ${JSON.stringify(actionResult, null, 2)}
 
 Guidelines:
-- LANGUAGE: ${
+- LANGUAGE (already decided for this conversation — obey it exactly, do not re-judge from the latest message): ${
     session.language === "pidgin"
-      ? "The customer chats in Nigerian Pidgin — EVERY sentence of your reply, including any opening and closing line, must be in warm, natural Nigerian Pidgin (the way Nigerians actually chat on WhatsApp, never an exaggerated caricature). Do not slip back into standard English anywhere."
-      : "Mirror the customer's language: if their messages are in Nigerian Pidgin, reply in warm, natural Nigerian Pidgin; otherwise reply in clear, friendly English."
+      ? "The customer prefers Nigerian Pidgin — EVERY sentence of your reply, including any opening and closing line, must be in warm, natural Nigerian Pidgin (the way Nigerians actually chat on WhatsApp, never an exaggerated caricature). Do not slip back into standard English anywhere, even if their last message was in plain English."
+      : "Reply in clear, friendly English."
   } Keep product names, prices (₦), and links exactly as given.
 - HONESTY (most important): Only ever mention products, prices, sizes, colors, images, or stock that ACTUALLY appear in the action result or context above. Never invent, assume, or imply that the store has something. The catalog is the database — if it isn't in the result, it doesn't exist for you.
 - For product search results:
@@ -507,6 +547,7 @@ Guidelines:
     Build the "Available in ..." sentence from the product's actual attributes (colors, sizes, etc.); omit it when the product has no attributes. Use each product's real description, shortened to one line. Do not add anything else per entry.
     For food/dish items (isFood true): mention the prep time when present instead of sizes/colors, e.g. "1. *Jollof Rice with Chicken* - Smoky party-style jollof served with grilled chicken. Price: ₦4,500. Ready in ~25 mins." If soldOutForToday is true, end the entry with "(sold out for today)".
   - NEVER mention remaining items, extra items, or more products, and never invite the customer to reply "show more" — when more items actually exist, the system automatically appends that note for you. List or introduce ONLY what is in actionResult.products.
+  - When actionResult.budget is present, the customer set a spending limit and these results are filtered to it. Present them as options within their budget. If actionResult.noneWithinBudget is true, gently say you don't have an item in THAT category under ₦<budget> right now — mention the cheapest one starts around ₦<cheapestInCategory> if given — and ask if they can stretch a little or want you to keep looking in the same category. Never jump to an unrelated category to fill the gap.
   - For any product where inStock is false (or stock is 0), say it is currently out of stock — do not present it as available to buy. For food items where soldOutForToday is true: if allowPreOrder is true, offer it as a pre-order; otherwise say it is sold out for today and suggest they check back tomorrow.
   - When a customer asks how long their food will take, use the product's prepTimeMins.
   - Keep it short and scannable.
@@ -731,6 +772,48 @@ export async function transcribeAudio(audioData) {
   return transcription.text;
 }
 
+// Nigeria (WAT, UTC+1) is the customer base — anchor "good morning/afternoon/
+// evening" to local time rather than the server clock.
+function getTimeOfDay() {
+  const hour = Number(
+    new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric',
+      hour12: false,
+      timeZone: 'Africa/Lagos',
+    }).format(new Date()),
+  );
+  if (hour < 12) return 'morning';
+  if (hour < 17) return 'afternoon';
+  return 'evening';
+}
+
+// gpt-4o-mini tends to format greetings like a formal letter — a "Dear
+// [Customer's Name]," salutation, bracketed fill-in fields, and a "Warm
+// regards, The X Team" sign-off. We never have the buyer's name and this is a
+// live WhatsApp chat, so strip any of that the prompt didn't prevent.
+function sanitizeGreeting(text) {
+  if (!text) return '';
+  return text
+    // [Customer's Name], {name}, {{ store }} and similar placeholders
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/\{\{?[^}]*\}?\}/g, '')
+    // a leading "Dear ...," salutation line
+    .replace(/^\s*dear\b[^\n,]*,?[ \t]*\n?/i, '')
+    // a letter-style closing ("Warm regards," / "Best," …) and everything after
+    .replace(
+      /\n+[ \t]*(warm regards|kind regards|best regards|regards|sincerely|cheers|best wishes|warmly|yours truly|best)\b[\s\S]*$/i,
+      '',
+    )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// We never know the customer's name, and these go out as a WhatsApp bubble, not
+// an email — shared by every short system-composed message (greetings, payment
+// follow-ups) to stop gpt-4o-mini formatting them like a formal letter.
+const SHORT_MESSAGE_CONSTRAINTS =
+  ' Write it as ONE short, friendly WhatsApp line (two at most). Do NOT address the customer by name or use any placeholder such as [Customer\'s Name] or [Name] — you do not know their name. Do NOT add a sign-off, signature, or team name (no "Warm regards", no "The Team"). No subject line, no letter formatting.';
+
 export async function generateGreeting(type, business, language = 'english') {
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
@@ -739,18 +822,23 @@ export async function generateGreeting(type, business, language = 'english') {
       ? ' The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.'
       : '';
 
-  // The configured greeting is only ever a fallback for first visits — a
-  // "welcome back" must never reuse it.
+  const formatConstraints = SHORT_MESSAGE_CONSTRAINTS;
+
+  const timeOfDay = getTimeOfDay();
+
+  // The configured greeting is only ever shown verbatim for a genuine first
+  // visit. A returning customer (records already exist) gets a well-articulated,
+  // time-aware "welcome back" — it must never reuse the configured greeting.
   const fallback =
     type === 'first_visit'
       ? business.aiConfig?.greetingMessage?.trim() || `Welcome to ${business.name}! 👋 How can I help you today?`
-      : `Welcome back to ${business.name}! 👋 How can I help you today?`;
+      : `Good ${timeOfDay}! Welcome back to ${business.name} 👋 How can I help you today?`;
 
   try {
     const userPrompt =
       type === 'first_visit'
-        ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly. Plain text only, no JSON, no markdown.`
-        : `Write a very short, warm "welcome back" message for a returning customer who was away for a while. Make it feel personal and inviting. Plain text only, no JSON, no markdown.`;
+        ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly. Plain text only, no JSON, no markdown.${formatConstraints}`
+        : `Write a short, warm "welcome back" message for a returning customer who was away for a while. It is currently ${timeOfDay} for them, so open with the matching time-of-day greeting (e.g. "Good ${timeOfDay}"). Make it feel personal and inviting. Plain text only, no JSON, no markdown.${formatConstraints}`;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -764,9 +852,52 @@ export async function generateGreeting(type, business, language = 'english') {
       temperature: 0.7,
     });
 
-    return completion.choices?.[0]?.message?.content?.trim() || fallback;
+    return sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback;
   } catch (error) {
     logger.error('generateGreeting failed:', error);
+    return fallback;
+  }
+}
+
+/**
+ * Polite "you didn't finish checking out" nudge. Fired by the follow-up sweeper
+ * roughly an hour after a payment link was sent and the customer went quiet
+ * without paying. Warm and no-pressure — never pushy or guilt-trippy.
+ */
+export async function generatePaymentFollowUp(business, productName, amount, language = 'english') {
+  const tone = business.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const languageInstruction =
+    language === 'pidgin'
+      ? ' The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.'
+      : '';
+
+  const priceText = typeof amount === 'number' ? `₦${amount.toLocaleString()}` : null;
+
+  const fallback =
+    language === 'pidgin'
+      ? `Hello! 👋 I still keep your ${productName}${priceText ? ` (${priceText})` : ''} ready for you. You wan make we complete the order? I dey here if you get any question.`
+      : `Hi! 👋 Just checking in — your ${productName}${priceText ? ` (${priceText})` : ''} is still reserved for you. Would you like to complete your order? I'm happy to help if you have any questions.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an AI sales assistant for "${business.name}".${toneInstruction}${languageInstruction}`,
+        },
+        {
+          role: 'user',
+          content: `A customer began checking out "${productName}"${priceText ? ` for ${priceText}` : ''} — a payment link was sent — but they did not complete payment and have been quiet for about an hour. Write a SHORT, warm, no-pressure follow-up: gently let them know the item is still available/reserved and invite them to complete the order or ask any question. Do NOT be pushy, do NOT guilt them, and do NOT mention any discount unless told to. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
+        },
+      ],
+      temperature: 0.7,
+    });
+
+    return sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback;
+  } catch (error) {
+    logger.error('generatePaymentFollowUp failed:', error);
     return fallback;
   }
 }

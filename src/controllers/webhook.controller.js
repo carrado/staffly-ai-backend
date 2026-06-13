@@ -19,6 +19,8 @@ import {
   setLastProduct,
   setNegotiation,
   clearNegotiation,
+  hydrateSession,
+  clearPendingFollowUp,
 } from "../models/ConversationState.js";
 import * as whatsapp from "../services/whatsapp.service.js";
 import * as openaiService from "../services/openai.service.js";
@@ -182,12 +184,27 @@ async function runCheckout({
     ? `${product.name} (${selectedModifiers.map((m) => m.name).join(', ')})`
     : product.name;
 
-  const { paymentLink, orderId } = paymentService.generatePaymentLink(
+  const { paymentLink, orderId } = await paymentService.generatePaymentLink(
     businessId,
     customerNumber,
     itemLabel,
     amount,
   );
+
+  // Arm an abandoned-checkout follow-up. If the customer pays (payment webhook)
+  // or sends any further message (handled at the top of handleIncomingMessage),
+  // this is cleared; otherwise the sweeper nudges them ~1 hour from now.
+  const sessionBeforeCheckout = getSession(businessId, customerNumber);
+  setSession(businessId, customerNumber, {
+    ...sessionBeforeCheckout,
+    pendingFollowUp: {
+      orderId,
+      productName: product.name,
+      amount,
+      createdAt: new Date(),
+      sentAt: null,
+    },
+  });
 
   await emailService.sendInvoiceEmail(email || `${customerNumber}@staffly.app`, {
     product,
@@ -360,7 +377,13 @@ async function extractUserMessage(message, accessToken, business) {
 }
 
 
-async function executeAction({ action, businessId, customerNumber, session }) {
+async function executeAction({
+  action,
+  businessId,
+  customerNumber,
+  session,
+  shownProductIds = new Set(),
+}) {
   let actionResult = null;
   let productsToShow = [];
   let asPickableCards = false; // search results carry a "Pick this one" button
@@ -382,14 +405,26 @@ async function executeAction({ action, businessId, customerNumber, session }) {
       const isBroadBrowse = query === "*";
       const pageSize = isBroadBrowse ? BROWSE_PAGE_SIZE : SEARCH_PAGE_SIZE;
 
-      const found = await productService.searchProducts(
+      const allMatches = await productService.searchProducts(
         businessId,
         query,
         isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
       );
 
+      // Budget refinement ("cheaper ones", "under 15k"): keep the same
+      // category matches the search returned, just drop anything above the
+      // customer's limit. The category stays intact — we never swap in
+      // unrelated items to fill the page.
+      const maxPrice =
+        typeof action.data.maxPrice === "number" && action.data.maxPrice > 0
+          ? action.data.maxPrice
+          : null;
+      const found = maxPrice
+        ? allMatches.filter((p) => typeof p.price === "number" && p.price <= maxPrice)
+        : allMatches;
+
       logger.info(
-        `[Search] "${query}" → ${found.length} match(es) for business ${businessId}`,
+        `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""} → ${found.length} match(es) for business ${businessId}`,
       );
 
       // Results arrive ordered by matchPercent. The strong tier (≥90%) is
@@ -453,6 +488,22 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         startNumber: 1,
         displayMode: productsToShow.length ? "cards" : "text",
         products: productsToDisplay.map(mapProductForAI),
+        // Budget context so the reply can say "here are <category> within your
+        // budget" — and, when nothing fits, stay in-category instead of drifting.
+        ...(maxPrice
+          ? {
+              budget: maxPrice,
+              // The category had items, just none under their limit.
+              noneWithinBudget: found.length === 0 && allMatches.length > 0,
+              cheapestInCategory:
+                found.length === 0 && allMatches.length > 0
+                  ? allMatches
+                      .map((p) => p.price)
+                      .filter((n) => typeof n === "number")
+                      .sort((a, b) => a - b)[0] ?? null
+                  : null,
+            }
+          : {}),
       };
 
       break;
@@ -587,12 +638,17 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         break;
       }
 
+      // A follow-up about a product whose card was already shown this session
+      // stays as plain chat — re-send the photo + details only the first time
+      // this product comes up.
+      const alreadyShown = shownProductIds.has(product.id);
+
       if (!attributeKey) {
         actionResult = createDefaultActionResult(
           `I found ${product.name}, but I could not tell which attribute you want to check.`,
         );
         setLastProduct(businessId, customerNumber, product);
-        productsToShow = [product]; // show the product's photo + details
+        productsToShow = alreadyShown ? [] : [product];
         break;
       }
 
@@ -611,7 +667,7 @@ async function executeAction({ action, businessId, customerNumber, session }) {
         ...check,
       };
 
-      productsToShow = [product]; // show the product's photo + details
+      productsToShow = alreadyShown ? [] : [product];
       break;
     }
 
@@ -1069,6 +1125,12 @@ export async function handleIncomingMessage(req, res) {
     }
 
     const { access_token: accessToken, id: businessId } = business;
+
+    // Load this customer's saved session from Mongo into the cache before any
+    // synchronous read below — this is what makes absence detection (and the
+    // rest of the session) survive a process restart.
+    await hydrateSession(businessId, customerNumber);
+
     replyContext = {
       phoneNumberId,
       accessToken,
@@ -1076,9 +1138,9 @@ export async function handleIncomingMessage(req, res) {
       language: getSession(businessId, customerNumber).language,
     };
 
-    // Acknowledge immediately — shows read ticks and typing indicator while we process
-    whatsapp.markMessageAsRead(phoneNumberId, accessToken, messageId);
-    whatsapp.sendTypingIndicator(phoneNumberId, accessToken, customerNumber);
+    // Mark read and show the "typing…" bubble before we start composing, so the
+    // customer sees activity while the AI works (it auto-clears when we reply).
+    await whatsapp.sendTypingIndicator(phoneNumberId, accessToken, messageId);
 
     // "Pick this one" tap on a product card — resolve it directly.
     const buttonReply =
@@ -1133,6 +1195,14 @@ export async function handleIncomingMessage(req, res) {
 
     const session = getSession(businessId, customerNumber);
 
+    // The customer is back and engaging, so cancel any armed abandoned-checkout
+    // follow-up. If this very turn generates a fresh payment link, runCheckout
+    // re-arms it; if they're just chatting or asking about another product, it
+    // stays cancelled and the sweeper never nudges them.
+    if (session.pendingFollowUp) {
+      clearPendingFollowUp(businessId, customerNumber);
+    }
+
     const ONE_HOUR_MS = 60 * 60 * 1000;
     const absenceMs = session.lastMessageAt
       ? Date.now() - new Date(session.lastMessageAt).getTime()
@@ -1140,6 +1210,16 @@ export async function handleIncomingMessage(req, res) {
 
     const isFirstVisit = !session.lastMessageAt;
     const isReturningAfterAbsence = absenceMs !== null && absenceMs > ONE_HOUR_MS;
+
+    // A product card (image + full details) is only re-displayed when the buyer
+    // turns to a DIFFERENT product. Once a product's card has been shown in this
+    // conversation session, follow-up questions about that same item flow as
+    // plain text. The set is reset when a new session begins (first visit, or a
+    // return after a long absence).
+    const newConversationSession = isFirstVisit || isReturningAfterAbsence;
+    const shownProductIds = new Set(
+      newConversationSession ? [] : session.shownProductIds || [],
+    );
 
     let activeSession = session;
     let greetingWasSent = false;
@@ -1163,6 +1243,12 @@ export async function handleIncomingMessage(req, res) {
     if (greeting) {
       await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, greeting);
       await new Promise((r) => setTimeout(r, 600));
+
+      // Sending the greeting cleared the typing bubble — re-trigger it (same
+      // inbound message id) so the customer sees "typing…" again while we
+      // compose the actual reply. Clears once more when that reply goes out.
+      await whatsapp.sendTypingIndicator(phoneNumberId, accessToken, messageId);
+
       greetingWasSent = true;
       activeSession = {
         ...session,
@@ -1213,6 +1299,7 @@ export async function handleIncomingMessage(req, res) {
         businessId,
         customerNumber,
         session,
+        shownProductIds,
       });
 
       const freshSession = getSession(businessId, customerNumber);
@@ -1280,6 +1367,12 @@ export async function handleIncomingMessage(req, res) {
           language,
         });
       }
+
+      // Remember every card we just put on screen so later questions about the
+      // same item stay text-only.
+      for (const p of productsToShow) {
+        if (p?.id != null) shownProductIds.add(p.id);
+      }
     } else if (!greetingWasSent) {
       await whatsapp.sendTextMessage(
         phoneNumberId,
@@ -1300,6 +1393,7 @@ export async function handleIncomingMessage(req, res) {
         userMessage,
         responseText,
       ),
+      shownProductIds: [...shownProductIds],
       language,
       lastMessageAt: new Date(),
     });

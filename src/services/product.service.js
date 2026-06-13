@@ -388,6 +388,7 @@ export function buildProductContext(product) {
   // hidden floor and must never reach the model's prompt (see negotiation rules).
   const lines = [
     `Name: ${product.name}`,
+    `Category: ${product.category || 'uncategorized'}`,
     `Description: ${product.description}`,
     `Price: ₦${product.price.toLocaleString()}`,
     `Stock: ${product.stock}`,

@@ -1,31 +1,65 @@
 /**
- * Order Model — Multi-Tenant
- * In production, replace with a DB table that includes business_id as a column.
+ * Order Model — Multi-Tenant, Mongo-backed
+ *
+ * Lightweight checkout records for the WhatsApp payment flow, persisted so they
+ * survive restarts: a payment webhook (which can arrive long after a deploy)
+ * must still be able to find its order, and the abandoned-checkout follow-up
+ * must still be able to tell paid from unpaid.
+ *
+ * Backed by the dedicated `staffly_orders` collection (see mongoose/StafflyOrder
+ * for why this is kept apart from the platform `orders` collection).
  */
 
-const orders = new Map();
+import { StafflyOrder } from './mongoose/StafflyOrder.js';
 
-export const createOrder = ({ businessId, customerNumber, product, amount, status = 'pending' }) => {
-  const order = {
-    id: `ord_${Date.now()}`,
+const toOrder = (doc) =>
+  doc
+    ? {
+        id: doc.orderId,
+        businessId: doc.businessId,
+        customerNumber: doc.customerNumber,
+        product: doc.product,
+        amount: doc.amount,
+        status: doc.status,
+        createdAt: doc.createdAt,
+      }
+    : null;
+
+export const createOrder = async ({
+  businessId,
+  customerNumber,
+  product,
+  amount,
+  status = 'pending',
+}) => {
+  // Random suffix so two links generated in the same millisecond can't collide.
+  const orderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const doc = await StafflyOrder.create({
+    orderId,
     businessId,
     customerNumber,
     product,
     amount,
     status,
-    createdAt: new Date(),
-  };
-  orders.set(order.id, order);
-  return order;
+  });
+  return toOrder(doc);
 };
 
-export const updateOrderStatus = (orderId, status) => {
-  const order = orders.get(orderId);
-  if (order) order.status = status;
-  return order || null;
+export const updateOrderStatus = async (orderId, status) => {
+  const doc = await StafflyOrder.findOneAndUpdate(
+    { orderId },
+    { $set: { status } },
+    { new: true },
+  ).lean();
+  return toOrder(doc);
 };
 
-export const getOrderById = (id) => orders.get(id) || null;
+export const getOrderById = async (id) => {
+  const doc = await StafflyOrder.findOne({ orderId: id }).lean();
+  return toOrder(doc);
+};
 
-export const getOrdersByBusiness = (businessId) =>
-  Array.from(orders.values()).filter((o) => o.businessId === businessId);
+export const getOrdersByBusiness = async (businessId) => {
+  const docs = await StafflyOrder.find({ businessId }).sort({ createdAt: -1 }).lean();
+  return docs.map(toOrder);
+};

@@ -1,5 +1,6 @@
 import { updateOrderStatus, getOrderById } from '../models/Order.js';
 import { getBusinessById } from '../models/Business.js';
+import { cancelFollowUpForOrder } from '../models/ConversationState.js';
 import * as whatsapp from '../services/whatsapp.service.js';
 import { logger } from '../utils/logger.js';
 
@@ -12,13 +13,17 @@ export async function handlePaymentWebhook(req, res) {
     const { orderId, status } = req.body;
     if (!orderId || !status) return res.status(400).json({ error: 'Missing orderId or status' });
 
-    const order = getOrderById(orderId);
+    const order = await getOrderById(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
-    updateOrderStatus(orderId, status);
+    await updateOrderStatus(orderId, status);
 
     // Notify the customer via WhatsApp
     if (status === 'paid') {
+      // Payment landed — make sure the abandoned-checkout sweeper never nudges
+      // this customer about an order they already settled.
+      await cancelFollowUpForOrder(orderId);
+
       const business = getBusinessById(order.businessId);
       if (business) {
         const msg = `✅ Payment confirmed! Your order for *${order.product}* has been received. Thank you for shopping with ${business.name}!`;
