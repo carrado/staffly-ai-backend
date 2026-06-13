@@ -337,15 +337,44 @@ export async function markMessageAsRead(phoneNumberId, accessToken, messageId) {
   }
 }
 
-export async function sendTypingIndicator(phoneNumberId, accessToken, to) {
+/**
+ * Show the "typing…" bubble while we put the reply together — the same way you
+ * see it when a person is typing on WhatsApp.
+ *
+ * On WhatsApp Cloud API this is one call that BOTH marks the inbound message as
+ * read AND requests the indicator (it's keyed off the message id, not the
+ * recipient). The bubble shows for up to ~25s and clears automatically the
+ * instant we send our reply — so we fire it as soon as the message arrives, then
+ * build and send the response. Falls back to a plain read receipt on older API
+ * versions that don't accept `typing_indicator`, so the read ticks still show.
+ */
+export async function sendTypingIndicator(phoneNumberId, accessToken, messageId) {
+  const url = `${GRAPH_URL}/${phoneNumberId}/messages`;
+  const headers = { Authorization: `Bearer ${accessToken}` };
+
   try {
     await axios.post(
-      `${GRAPH_URL}/${phoneNumberId}/messages`,
-      { messaging_product: 'whatsapp', to, type: 'typing' },
-      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: SEND_TIMEOUT_MS },
+      url,
+      {
+        messaging_product: 'whatsapp',
+        status: 'read',
+        message_id: messageId,
+        typing_indicator: { type: 'text' },
+      },
+      { headers, timeout: SEND_TIMEOUT_MS },
     );
   } catch {
-    // typing indicators not supported on all accounts — fail silently
+    // Older API versions reject the typing_indicator field — still mark the
+    // message read so the customer at least sees the blue ticks.
+    try {
+      await axios.post(
+        url,
+        { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
+        { headers, timeout: SEND_TIMEOUT_MS },
+      );
+    } catch {
+      // non-critical — never block the response
+    }
   }
 }
 
