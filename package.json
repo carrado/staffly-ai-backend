@@ -7,9 +7,11 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test:webhook": "node scripts/test-webhook.js"
+    "test:webhook": "node scripts/test-webhook.js",
+    "eval": "node scripts/eval-understanding.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",

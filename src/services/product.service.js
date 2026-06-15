@@ -7,8 +7,9 @@ import {
 import { getBusinessById } from '../models/Business.js';
 import { Product } from '../models/mongoose/Product.js';
 import { ModifierOption } from '../models/mongoose/ModifierOption.js';
-import { openai } from '../config/openai.js';
+import { anthropic } from '../config/anthropic.js';
 import { logger } from '../utils/logger.js';
+import { env } from '../config/env.js';
 
 // ─── Shape conversion ─────────────────────────────────────────────────────────
 
@@ -128,72 +129,174 @@ export function invalidateProductCache(businessId) {
   semanticCache.delete(businessId);
 }
 
-// ─── Semantic search fallback ─────────────────────────────────────────────────
+// ─── Semantic relevance ranking ───────────────────────────────────────────────
 
-// Keyword scoring misses products whose copy never names what they are (e.g. a
-// "Chuck Taylor High Top" whose text never says "shoe"). After the keyword
-// pass, the model screens the UNMATCHED products and catches those by world
-// knowledge of brands and product types.
+// Keyword scoring can't reason about FIT — it happily returns sneakers for
+// "shoes for a wedding" because both are shoes. After the keyword pass the model
+// re-judges the catalog against the FULL intent (product type AND the occasion /
+// use-case / recipient / setting the shopper described) and sorts items into:
+//   strong  — genuinely right for the request, occasion included
+//   partial — same general kind of item but NOT the right fit (the closest we have)
+// Anything unrelated is dropped. It also recovers items whose copy never names
+// what they are (a "Chuck Taylor High Top" IS a shoe). Cached 5 min per query;
+// any failure degrades to keyword-only.
 const SEMANTIC_MAX_CANDIDATES = 150; // hard cap on products sent to the model
 const SEMANTIC_DESC_CHARS = 160;     // description excerpt per product
+const STRONG_SCORE = 100;            // matchPercent for a strong (occasion-fit) match
+const PARTIAL_SCORE = 55;            // matchPercent for a closest-but-not-right match
 
-const semanticCache = new Map(); // businessId → Map(query → { ids, expiresAt })
+// Schema-constrained output for the ranker — query specificity plus two id arrays.
+const SEMANTIC_RANK_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['specificity', 'strong', 'partial'],
+  properties: {
+    specificity: { type: 'string', enum: ['broad', 'specific'] },
+    strong: { type: 'array', items: { type: 'string' } },
+    partial: { type: 'array', items: { type: 'string' } },
+  },
+};
 
-function getCachedSemanticIds(businessId, query) {
+const semanticCache = new Map(); // businessId → Map(query → { ranking, expiresAt })
+
+function getCachedRanking(businessId, query) {
   const entry = semanticCache.get(businessId)?.get(query);
-  return entry && Date.now() < entry.expiresAt ? entry.ids : null;
+  return entry && Date.now() < entry.expiresAt ? entry.ranking : null;
 }
 
-function setCachedSemanticIds(businessId, query, ids) {
+function setCachedRanking(businessId, query, ranking) {
   if (!semanticCache.has(businessId)) semanticCache.set(businessId, new Map());
-  semanticCache.get(businessId).set(query, { ids, expiresAt: Date.now() + CACHE_TTL_MS });
+  semanticCache.get(businessId).set(query, { ranking, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
 /**
- * Ask the model which of `candidates` a shopper searching `query` would expect
- * to see. Returns only ids that exist in `candidates`; an empty array on any
- * failure, so search degrades to keyword-only instead of breaking.
+ * Rank `candidates` by how well each fits `query`, weighing the occasion /
+ * use-case the shopper expressed, not just the product type. Returns
+ * { strong: [ids], partial: [ids] } using only ids from `candidates`; returns
+ * null on any failure so search degrades to keyword-only instead of breaking.
  */
-async function semanticMatchIds(query, candidates) {
+async function semanticRank(query, candidates) {
   const catalog = candidates.slice(0, SEMANTIC_MAX_CANDIDATES).map((p) => ({
     id: p.id,
     name: p.name,
     category: p.category || '',
     tags: p.tags || [],
     description: (p.description || '').slice(0, SEMANTIC_DESC_CHARS),
+    ...(p.visualDescription ? { visual: p.visualDescription } : {}),
   }));
+  if (!catalog.length) return null;
 
-  const prompt = `A customer is searching a store for: "${query}"
+  const prompt = `A customer is shopping and searched for: "${query}"
 
-Below is a product catalog as JSON. Using your knowledge of brands and product types, return the ids of products a typical shopper with that search would expect to see (e.g. a "Chuck Taylor High Top" IS a shoe even if its text never says so).
+First decide how specific the search is:
+- "broad": just a product type or category with no narrowing detail (e.g. "shoes", "bags", "do you have dresses?"). The shopper hasn't said what they really want yet.
+- "specific": it adds any constraint — occasion, use-case, setting, recipient, style, colour, size, material, brand, or budget (e.g. "shoes for a wedding", "red size 44 oxfords", "gift for my mum").
 
-Rules:
-- Only include products that genuinely fit the search — when in doubt, leave it out.
-- Only use ids from the catalog below. Never invent ids.
-- Respond with JSON: {"matches": ["id1", "id2"]}. Use an empty array when nothing fits.
+Then sort the products into two groups, using real-world knowledge (e.g. sneakers and canvas shoes are casual and are NOT appropriate for a wedding, while oxfords/brogues/loafers/dress shoes are; a hoodie is not office wear; a deep fryer is not "something healthy"):
+- "strong": for a BROAD search, EVERY product of the requested type counts as strong — the shopper hasn't narrowed, so show the whole range. For a SPECIFIC search, a product is strong ONLY if it genuinely satisfies the stated details (the type AND the occasion/colour/size/etc.) — be strict.
+- "partial": the right general kind of item that does NOT meet the stated details (e.g. casual sneakers when they asked for wedding shoes) — the closest thing available, not a real match. Usually empty for a broad search.
+Leave a product out of both groups when it is unrelated. Include items that fit by world knowledge even if their text never says so (a "Chuck Taylor High Top" IS a shoe). When a product has a "visual" field, it was generated from the product's actual photo — trust it for the item's true style and formality over thin or generic text.
+
+Only use ids from the catalog below; never invent ids. Respond with JSON: {"specificity": "broad" | "specific", "strong": ["id", ...], "partial": ["id", ...]}. Use empty arrays where nothing fits.
 
 Catalog:
 ${JSON.stringify(catalog)}`;
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [{ role: 'user', content: prompt }],
-      response_format: { type: 'json_object' },
+    const completion = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 2048,
       temperature: 0,
+      messages: [{ role: 'user', content: prompt }],
+      output_config: {
+        format: { type: 'json_schema', schema: SEMANTIC_RANK_SCHEMA },
+      },
     });
 
-    const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
-    const validIds = new Set(catalog.map((c) => c.id));
-    return (Array.isArray(parsed.matches) ? parsed.matches : [])
-      .map(String)
-      .filter((id) => validIds.has(id));
+    const raw =
+      (completion.content || [])
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join('') || '{}';
+    const parsed = JSON.parse(raw);
+    const valid = new Set(catalog.map((c) => c.id));
+    const clean = (arr) =>
+      (Array.isArray(arr) ? arr : []).map(String).filter((id) => valid.has(id));
+    const strong = clean(parsed.strong);
+    const strongSet = new Set(strong);
+    // A product can't be both tiers; strong wins.
+    const partial = clean(parsed.partial).filter((id) => !strongSet.has(id));
+    const specificity = parsed.specificity === 'broad' ? 'broad' : 'specific';
+    return { specificity, strong, partial };
   } catch (error) {
     logger.warn(
-      `[Search] Semantic fallback failed (keyword results still returned): ${error.message}`,
+      `[Search] Semantic ranking failed (keyword results still returned): ${error.message}`,
     );
-    return [];
+    return null;
   }
+}
+
+// ─── Visual product understanding (optional, env.productVision) ─────────────────
+
+// Vendor product text is often thin or mislabeled ("Men's Shoe"), leaving the
+// ranker to guess. When PRODUCT_VISION is on, each product's photo is described
+// once by the vision model and that description is fed to the ranker — so a
+// "wedding shoes" request can be told apart from sneakers by how the item
+// actually looks, for ANY product type. Cached per image URL (24h); failures
+// degrade silently to text-only.
+const VISION_MAX = 40;                            // most images described per ranking
+const VISION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const visualCache = new Map();                    // imageUrl → { text, expiresAt }
+
+async function describeProductImage(imageUrl) {
+  if (!imageUrl) return null;
+  const hit = visualCache.get(imageUrl);
+  if (hit && Date.now() < hit.expiresAt) return hit.text;
+
+  try {
+    const completion = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 160,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'url', url: imageUrl } },
+            {
+              type: 'text',
+              text: 'Describe this product in ONE factual sentence for search matching: what the item is, its style and formality (casual vs formal/dressy), key colour/material if visible, and what occasions or uses it suits. No marketing language.',
+            },
+          ],
+        },
+      ],
+    });
+    const text =
+      (completion.content || [])
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join(' ')
+        .trim() || null;
+    if (text) visualCache.set(imageUrl, { text, expiresAt: Date.now() + VISION_CACHE_TTL_MS });
+    return text;
+  } catch (error) {
+    logger.warn(`[Vision] Image description failed (${imageUrl}): ${error.message}`);
+    return null;
+  }
+}
+
+// Attach a `visualDescription` (read from the product photo) to up to VISION_MAX
+// of the given products. No-op unless PRODUCT_VISION is enabled.
+async function attachVisualDescriptions(products) {
+  if (env.productVision !== true) return products;
+
+  const slice = products.slice(0, VISION_MAX);
+  const described = await Promise.all(
+    slice.map(async (p) => ({ id: p.id, text: await describeProductImage(p.image_url) })),
+  );
+  const byId = new Map(described.filter((d) => d.text).map((d) => [d.id, d.text]));
+  return products.map((p) =>
+    byId.has(p.id) ? { ...p, visualDescription: byId.get(p.id) } : p,
+  );
 }
 
 // ─── Data source ──────────────────────────────────────────────────────────────
@@ -216,13 +319,16 @@ async function getProductsForBusiness(businessId) {
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 
-// Semantic catches have no keyword score — the model says the product fits but
-// its copy never names what it is. Treat that as a solid-but-not-exact match.
-const SEMANTIC_MATCH_PERCENT = 75;
-
 /**
- * Search results carry a `matchPercent` (0–100) on each product — how closely
- * it matches the query — and are ordered by it, strongest first.
+ * Search for products matching `query`.
+ *
+ * Returns { products, specificity } where:
+ *  - products: each carries a `matchPercent` (0–100, how well it fits), ordered
+ *    strongest first. A semantic pass re-ranks by true fit (occasion/use-case
+ *    included), so sneakers come back as "partial" (55), not strong (100), for
+ *    "shoes for a wedding".
+ *  - specificity: "broad" (a bare type, e.g. "shoes" — show a selection and
+ *    invite narrowing) or "specific" (constraints given — match precisely).
  */
 export async function searchProducts(businessId, query, limit = 50) {
   const all = await getProductsForBusiness(businessId);
@@ -235,36 +341,60 @@ export async function searchProducts(businessId, query, limit = 50) {
     ({ product, matchPercent }) => ({ ...product, matchPercent }),
   );
 
-  // Broad "*" browses already list everything; specific searches get a second,
-  // semantic pass over whatever the keyword scorer missed.
-  if (!query || query.trim() === '*' || keywordMatches.length >= limit) {
-    return keywordMatches;
-  }
+  // Broad "*" browses list everything as-is; only specific searches get the
+  // semantic relevance pass.
+  if (!query || query.trim() === '*') return { products: keywordMatches, specificity: 'broad' };
 
-  const matchedIds = new Set(keywordMatches.map((p) => p.id));
-  const candidates = available.filter((p) => !matchedIds.has(p.id));
-  if (!candidates.length) return keywordMatches;
+  // Candidate set for ranking: keyword matches first (most likely relevant, so
+  // never dropped by the candidate cap), then the rest of the catalog so the
+  // model can also recover items the keyword pass missed. The model re-tiers the
+  // keyword matches AND catches misses in one pass.
+  const keywordIds = new Set(keywordMatches.map((p) => p.id));
+  const candidates = [
+    ...keywordMatches,
+    ...available.filter((p) => !keywordIds.has(p.id)),
+  ];
 
   const cacheKey = query.trim().toLowerCase();
-  let extraIds = getCachedSemanticIds(businessId, cacheKey);
-  if (extraIds === null) {
-    extraIds = await semanticMatchIds(query, candidates);
-    setCachedSemanticIds(businessId, cacheKey, extraIds);
+  let ranking = getCachedRanking(businessId, cacheKey);
+  if (ranking === null) {
+    // Enrich with photo-derived descriptions (no-op unless PRODUCT_VISION is on)
+    // so the ranker can judge poorly-described items by how they actually look.
+    const enriched = await attachVisualDescriptions(candidates);
+    ranking = await semanticRank(query, enriched);
+    setCachedRanking(businessId, cacheKey, ranking);
   }
 
-  // Cached ids are re-resolved against the CURRENT candidate set, so products
-  // that sold out (or now match by keyword) drop out naturally.
-  const byId = new Map(candidates.map((p) => [p.id, p]));
-  const extras = extraIds
-    .map((id) => byId.get(id))
-    .filter(Boolean)
-    .map((p) => ({ ...p, matchPercent: SEMANTIC_MATCH_PERCENT }));
+  // Semantic pass unavailable, or it found nothing usable → keyword-only. We
+  // have no specificity signal here, so default to "specific" (no extra nudging).
+  if (!ranking || (!ranking.strong.length && !ranking.partial.length)) {
+    return { products: keywordMatches, specificity: 'specific' };
+  }
 
-  // One list ordered by match strength; the sort is stable, so on equal
-  // percentages keyword matches stay ahead of semantic catches.
-  return [...keywordMatches, ...extras]
-    .sort((a, b) => b.matchPercent - a.matchPercent)
-    .slice(0, limit);
+  // Re-resolve ids against the CURRENT available set, so anything that sold out
+  // since the ranking was cached drops out naturally.
+  const byId = new Map(available.map((p) => [p.id, p]));
+  const keywordRank = new Map(keywordMatches.map((p, i) => [p.id, i]));
+  // Within a tier, keep keyword hits first (in their score order); semantic-only
+  // recoveries follow.
+  const orderTier = (ids) =>
+    [...ids].sort((a, b) => {
+      const ra = keywordRank.has(a) ? keywordRank.get(a) : Infinity;
+      const rb = keywordRank.has(b) ? keywordRank.get(b) : Infinity;
+      return ra - rb;
+    });
+  const build = (ids, score) =>
+    orderTier(ids)
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .map((p) => ({ ...p, matchPercent: score }));
+
+  const products = [
+    ...build(ranking.strong, STRONG_SCORE),
+    ...build(ranking.partial, PARTIAL_SCORE),
+  ].slice(0, limit);
+
+  return { products, specificity: ranking.specificity || 'specific' };
 }
 
 export async function getProductsByIds(ids) {

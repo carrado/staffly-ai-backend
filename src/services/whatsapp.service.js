@@ -7,6 +7,7 @@
 
 import axios from 'axios';
 import { logger } from '../utils/logger.js';
+import { translateUiString } from './openai.service.js';
 
 const GRAPH_URL = 'https://graph.facebook.com/v22.0';
 
@@ -102,9 +103,10 @@ export function sendableImageUrl(product) {
 }
 
 // Fixed card labels per conversation language. Product descriptions are
-// translated upstream (openai.service translateDescriptionsToPidgin) — this
-// table covers everything composed in code. Button titles must stay within
-// Meta's 20-character limit.
+// translated upstream (openai.service translateDescriptions) — this table covers
+// everything composed in code. English and Pidgin are hand-written; any other
+// language is filled in by getCaptionStrings below. Button titles must stay
+// within Meta's 20-character limit.
 const CAPTION_STRINGS = {
   english: {
     price: (p) => `💰 Price: ₦${p}`,
@@ -144,7 +146,53 @@ const CAPTION_STRINGS = {
   },
 };
 
-const captionStrings = (language) => CAPTION_STRINGS[language] || CAPTION_STRINGS.english;
+// Card label chrome for any language. English and Pidgin are hand-written above;
+// for every other language the bare label words are AI-translated once and
+// cached, while emojis, ₦, numbers and values are added in code so they never
+// get mangled. Returns a table shaped exactly like a CAPTION_STRINGS entry.
+const captionTableCache = new Map(); // language -> table
+
+async function getCaptionStrings(language) {
+  const lang = (language || 'english').toLowerCase().trim();
+  if (CAPTION_STRINGS[lang]) return CAPTION_STRINGS[lang];
+  if (captionTableCache.has(lang)) return captionTableCache.get(lang);
+
+  const tr = (text) => translateUiString(text, lang);
+  const [
+    price, sizes, colors, material, gender,
+    chooseOne, chooseAtLeastOne, optional, readyIn,
+    availableNow, soldOutToday, preOrders, inStock,
+    remain, negotiable, pickButton,
+  ] = await Promise.all([
+    tr('Price'), tr('Sizes'), tr('Colors'), tr('Material'), tr('Gender'),
+    tr('choose one'), tr('choose at least one'), tr('optional'), tr('Ready in'),
+    tr('Available now'), tr('Sold out for today'), tr('Pre-orders accepted'), tr('In stock'),
+    tr('available'), tr('Price is negotiable'), tr('Pick this one'),
+  ]);
+
+  const table = {
+    price: (p) => `💰 ${price}: ₦${p}`,
+    sizes: (v) => `📐 ${sizes}: ${v}`,
+    colors: (v) => `🎨 ${colors}: ${v}`,
+    material: (v) => `🧵 ${material}: ${v}`,
+    gender: (v) => `👤 ${gender}: ${v}`,
+    chooseOne,
+    chooseAtLeastOne,
+    optional,
+    readyIn: (m) => `⏱️ ${readyIn} ~${m} mins`,
+    availableNow: `🍽️ ${availableNow}`,
+    soldOutToday: `🚫 ${soldOutToday}`,
+    preOrders: `📅 ${preOrders}`,
+    inStock: `📦 ${inStock}`,
+    stockCount: (n) => `📦 ${n} ${remain}`,
+    negotiable: `✅ ${negotiable}`,
+    // Meta caps interactive button titles at 20 characters (emoji included).
+    pickButton: `🛒 ${pickButton}`.slice(0, 20),
+  };
+
+  captionTableCache.set(lang, table);
+  return table;
+}
 
 /**
  * Build the image caption for a product card.
@@ -153,8 +201,8 @@ const captionStrings = (language) => CAPTION_STRINGS[language] || CAPTION_STRING
  * WhatsApp captions support basic formatting:
  *   *bold*  _italic_  ~strikethrough~
  */
-function buildProductCaption(product, language = 'english') {
-  const s = captionStrings(language);
+async function buildProductCaption(product, language = 'english') {
+  const s = await getCaptionStrings(language);
   const attrs = product.attributes || {};
   const lines = [];
 
@@ -215,7 +263,7 @@ function buildProductCaption(product, language = 'english') {
  * Falls back to text-only if no image URL is set.
  */
 export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '', language = 'english') {
-  const caption = buildProductCaption(product, language);
+  const caption = await buildProductCaption(product, language);
   const imageUrl = sendableImageUrl(product);
 
   if (imageUrl) {
@@ -250,7 +298,8 @@ const INTERACTIVE_BODY_LIMIT = 1024;
  * Falls back to a plain image/text card if the interactive send fails.
  */
 export async function sendProductButtonCard(phoneNumberId, accessToken, to, product, language = 'english') {
-  const caption = buildProductCaption(product, language).slice(0, INTERACTIVE_BODY_LIMIT);
+  const caption = (await buildProductCaption(product, language)).slice(0, INTERACTIVE_BODY_LIMIT);
+  const labels = await getCaptionStrings(language);
   const imageUrl = sendableImageUrl(product);
 
   const payload = {
@@ -264,7 +313,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
         buttons: [
           {
             type: 'reply',
-            reply: { id: `select_product:${product.id}`, title: captionStrings(language).pickButton },
+            reply: { id: `select_product:${product.id}`, title: labels.pickButton },
           },
         ],
       },

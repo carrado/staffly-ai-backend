@@ -80,6 +80,16 @@ const STRINGS = {
 
 const t = (language) => STRINGS[language] || STRINGS.english;
 
+// Async accessor for code-composed strings. English and Pidgin use the
+// hand-written tables above; any other language gets an AI-translated, cached
+// version (see openai.service translateUiString). `pick` renders the wanted
+// string from a table, e.g. tr(language, (s) => s.moreItems(3)).
+async function tr(language, pick) {
+  const table = STRINGS[language];
+  if (table) return pick(table);
+  return openaiService.translateUiString(pick(STRINGS.english), language);
+}
+
 function buildConversationHistory(
   currentHistory = [],
   userMessage,
@@ -228,13 +238,14 @@ async function runCheckout({
 }
 
 /**
- * Card captions print product.description verbatim — for Pidgin sessions,
- * translate it so the card matches the conversation. The card's fixed labels
- * and button title are handled by whatsapp.service's own string table.
+ * Card captions print product.description verbatim — for non-English sessions,
+ * translate it into the session language so the card matches the conversation.
+ * The card's fixed labels and button title are handled by whatsapp.service's own
+ * string table.
  */
 async function localizeProductsForLanguage(products, language) {
-  if (language !== "pidgin" || !products.length) return products;
-  return openaiService.translateDescriptionsToPidgin(products);
+  if (!products.length) return products;
+  return openaiService.translateDescriptions(products, language);
 }
 
 async function sendOutboundMessage({
@@ -294,14 +305,13 @@ async function handleProductSelection({
 }) {
   const product = await productService.getProductById(productId);
   const language = getSession(businessId, customerNumber).language;
-  const strings = t(language);
 
   if (!product) {
     await whatsapp.sendTextMessage(
       phoneNumberId,
       accessToken,
       customerNumber,
-      strings.productGone,
+      await tr(language, (s) => s.productGone),
     );
     return;
   }
@@ -309,8 +319,8 @@ async function handleProductSelection({
   setLastProduct(businessId, customerNumber, product);
 
   const followUpText = product.is_food
-    ? strings.pickedFood(product.name, product.prep_time_mins)
-    : strings.pickedRetail(product.name);
+    ? await tr(language, (s) => s.pickedFood(product.name, product.prep_time_mins))
+    : await tr(language, (s) => s.pickedRetail(product.name));
 
   const [localized] = await localizeProductsForLanguage([product], language);
 
@@ -405,11 +415,12 @@ async function executeAction({
       const isBroadBrowse = query === "*";
       const pageSize = isBroadBrowse ? BROWSE_PAGE_SIZE : SEARCH_PAGE_SIZE;
 
-      const allMatches = await productService.searchProducts(
-        businessId,
-        query,
-        isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
-      );
+      const { products: allMatches, specificity: searchBreadth } =
+        await productService.searchProducts(
+          businessId,
+          query,
+          isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
+        );
 
       // Budget refinement ("cheaper ones", "under 15k"): keep the same
       // category matches the search returned, just drop anything above the
@@ -453,11 +464,14 @@ async function executeAction({
         !isBroadBrowse && strongCount > 0 && remainingCount > 0 &&
         strongCount <= productsToDisplay.length;
 
+      // A partial match (specific search, no strong/exact fit) is NOT shown as
+      // cards — we send only an honest text message. Cards are reserved for
+      // strong matches; a broad browse stays a numbered text list.
+      const isPartialMatch = !isBroadBrowse && found.length > 0 && strongCount === 0;
+
       if (found.length > 0) {
         setLastProduct(businessId, customerNumber, found[0]);
-        // Only specific searches send image cards with a "Pick this one"
-        // button; a broad browse stays a numbered text list.
-        if (!isBroadBrowse) {
+        if (!isBroadBrowse && strongCount > 0) {
           productsToShow = productsToDisplay;
           asPickableCards = true;
         }
@@ -471,7 +485,9 @@ async function executeAction({
         lastSearch: {
           query,
           productIds: found.map((product) => product.id),
-          offset: productsToDisplay.length,
+          // Nothing was shown for a partial match, so a later "show more" starts
+          // from the top rather than skipping the first page.
+          offset: isPartialMatch ? 0 : productsToDisplay.length,
           strongCount,
         },
       });
@@ -479,14 +495,20 @@ async function executeAction({
       actionResult = {
         query,
         count: found.length,
-        shownCount: productsToDisplay.length,
-        remainingCount,
+        shownCount: isPartialMatch ? 0 : productsToDisplay.length,
+        // Partial matches show nothing, so there is no "show more" to offer.
+        remainingCount: isPartialMatch ? 0 : remainingCount,
         remainingAreSuggestions,
         // "strong": the shown products are what the customer asked for.
         // "partial": nothing matched closely — these are the nearest fits.
         matchTier: isBroadBrowse ? undefined : strongCount > 0 ? "strong" : "partial",
+        // "broad": bare-type query → present a selection and invite narrowing.
+        // "specific": constraints given → match precisely or be honest.
+        searchBreadth,
         startNumber: 1,
-        displayMode: productsToShow.length ? "cards" : "text",
+        // "cards" for strong matches, "text" for a broad browse, "none" for a
+        // partial match (message only — no product list, no cards).
+        displayMode: isBroadBrowse ? "text" : strongCount > 0 ? "cards" : "none",
         products: productsToDisplay.map(mapProductForAI),
         // Budget context so the reply can say "here are <category> within your
         // budget" — and, when nothing fits, stay in-category instead of drifting.
@@ -1187,7 +1209,7 @@ export async function handleIncomingMessage(req, res) {
         phoneNumberId,
         accessToken,
         customerNumber,
-        t(replyContext.language).notUnderstood,
+        await tr(replyContext.language, (s) => s.notUnderstood),
       );
 
       return;
@@ -1310,35 +1332,53 @@ export async function handleIncomingMessage(req, res) {
       const remainingCount = actionResult?.remainingCount;
       const moreItemsHint =
         typeof remainingCount === "number" && remainingCount > 0
-          ? actionResult?.remainingAreSuggestions
-            ? t(language).otherItems(remainingCount)
-            : t(language).moreItems(remainingCount)
+          ? await tr(language, (s) =>
+              actionResult?.remainingAreSuggestions
+                ? s.otherItems(remainingCount)
+                : s.moreItems(remainingCount),
+            )
           : null;
 
       const sendingCards = asPickableCards && productsToShow.length > 0;
 
       if (sendingCards) {
-        // Search results: the cards ARE the response — image, full details,
-        // and the "Pick this one" button — no AI intro bubble before them.
-        // The hint about more items goes out after the last card.
+        // Strong, specific matches: the cards speak for themselves — no intro
+        // bubble. A BROAD search (a wide selection that should invite narrowing)
+        // gets a short AI intro line before the cards. (Partial matches never
+        // reach this branch — they're sent as a message only, no cards.)
+        const needsIntro = actionResult?.searchBreadth === "broad";
+
+        let introText = "";
+        if (needsIntro) {
+          const composed = await openaiService.generateResponseWithActionResult(
+            userMessage,
+            { ...freshSession, language },
+            actionResult,
+            business,
+          );
+          introText = composed.response;
+        }
+
         const localizedCards = await localizeProductsForLanguage(
           productsToShow,
           language,
         );
 
+        // The intro (when needed) is the header bubble; the more-items hint
+        // goes out after the last card.
         await whatsapp.sendProductList(
           phoneNumberId,
           accessToken,
           customerNumber,
           localizedCards,
-          "",
+          introText,
           moreItemsHint || "",
           language,
         );
 
         // History note (never sent) so follow-ups like "the second one" or
         // "the jollof" stay grounded in exactly what was shown.
-        responseText = `[Sent product cards: ${productsToShow
+        responseText = `${introText ? `${introText}\n` : ""}[Sent product cards: ${productsToShow
           .map((p) => p.name)
           .join(", ")}]${moreItemsHint ? ` ${moreItemsHint}` : ""}`;
       } else {

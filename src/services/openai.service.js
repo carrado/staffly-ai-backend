@@ -7,6 +7,7 @@
  */
 
 import { openai } from "../config/openai.js";
+import { anthropic } from "../config/anthropic.js";
 import { logger } from "../utils/logger.js";
 import { buildProductContext } from "../services/product.service.js";
 import fs from 'fs';
@@ -91,6 +92,28 @@ function toCleanString(value) {
 function toNullableString(value) {
   const cleaned = toCleanString(value);
   return cleaned || null;
+}
+
+// Languages flow through the system as free-form lowercase names (english,
+// pidgin, yoruba, hausa, french, swahili, …) rather than a fixed enum, so new
+// languages need no code change. Normalize casing/spacing and fold the common
+// aliases for Nigerian Pidgin so it stays one canonical value.
+function normalizeLanguageName(value) {
+  const cleaned = String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+  if (/\bpidgin\b/.test(cleaned) || cleaned === "naija") return "pidgin";
+  return cleaned;
+}
+
+// Shared snippet appended to the system prompts of the small AI-composed helpers
+// (greetings, payment follow-ups, voice-error notes) so they answer in the
+// session's language.
+function languageWritingInstruction(language) {
+  const lang = normalizeLanguageName(language);
+  if (!lang || lang === "english") return "";
+  if (lang === "pidgin")
+    return " The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.";
+  return ` The customer chats in ${lang} — write your reply in warm, natural ${lang}, the way people actually chat on WhatsApp.`;
 }
 
 function parsePossibleNumber(value) {
@@ -309,7 +332,7 @@ function normalizeActionData(type, rawData = {}, session = {}) {
 }
 
 export function normalizeAiOutput(aiOutput, session = {}) {
-  const sessionLanguage = session.language === "pidgin" ? "pidgin" : "english";
+  const sessionLanguage = normalizeLanguageName(session.language) || "english";
 
   const fallback = {
     response:
@@ -324,18 +347,20 @@ export function normalizeAiOutput(aiOutput, session = {}) {
     return fallback;
   }
 
-  const detected =
-    aiOutput.language === "pidgin" || aiOutput.language === "english"
-      ? aiOutput.language
-      : null;
+  const detected = normalizeLanguageName(aiOutput.language);
 
   // Language preference is sticky and asymmetric, so it can't fluctuate.
-  // Pidgin speakers freely drop into plain English for a word, a number, or a
-  // quick "ok" — that is NOT a request to switch. So once a customer has shown
-  // they prefer Pidgin, we stay in Pidgin for the rest of the conversation; we
-  // only ever sit in English while Pidgin has not yet appeared.
+  // English is the unmarked default; any other language, once the customer
+  // clearly writes in it, becomes their established preference for the rest of
+  // the chat. Customers drop in English words, numbers, or a quick "ok" all the
+  // time — that is NOT a switch — so a plain-English/blank turn never pulls them
+  // back out of their language. A different concrete language DOES switch them.
   const language =
-    sessionLanguage === "pidgin" || detected === "pidgin" ? "pidgin" : "english";
+    detected && detected !== "english"
+      ? detected
+      : sessionLanguage !== "english"
+        ? sessionLanguage
+        : detected || "english";
 
   const response =
     typeof aiOutput.response === "string" && aiOutput.response.trim()
@@ -395,124 +420,61 @@ export function normalizeAiOutput(aiOutput, session = {}) {
   };
 }
 
-function buildActionDecisionPrompt(business, session) {
+function buildActionDecisionSystem(business, session) {
   const contextStr = buildContextString(session);
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
 
-  return `You are an AI sales assistant for "${business.name}".${toneInstruction} You help customers browse products, check sizes/colors/attributes, negotiate prices, and place orders via WhatsApp.
+  // Static instruction body — byte-identical across every call and every
+  // business, so it can serve as a cached system prefix (Anthropic prompt
+  // caching). Business- and turn-specific details go in the second, uncached
+  // block below, AFTER the cache breakpoint, so the cached prefix never shifts.
+  const instructions = `You are an AI sales assistant for an online store on WhatsApp. You help customers browse products, check attributes (size/color/material/stock), negotiate prices, and place orders.
 
-You MUST return ONLY a valid JSON object in this exact structure:
-{
-  "response": "short natural reply for the customer",
-  "language": "english" | "pidgin",
-  "action": {
-    "type": "none" | "search_products" | "show_more_products" | "check_attribute" | "start_negotiation" | "make_offer" | "accept_offer" | "find_similar_negotiable" | "send_product_image" | "generate_payment_link" | "list_categories",
-    "data": {}
-  }
-}
+Return ONLY a JSON object: { "response": short reply to the customer, "language": language name, "action": { "type": one allowed type, "data": {...} } }.
+Allowed action.type (choose exactly one, never invent one): none, search_products, show_more_products, check_attribute, start_negotiation, make_offer, accept_offer, find_similar_negotiable, send_product_image, generate_payment_link, list_categories.
 
-Language (the customer's established preference for THIS conversation is: ${session.language || "english"}):
-- This preference is STICKY and must not flicker turn to turn.
-- If the established preference is "pidgin": the customer prefers Nigerian Pidgin. KEEP "language": "pidgin" and write "response" in warm, natural Nigerian Pidgin — EVEN WHEN their latest message is short, is just a number, or is written in plain English. Pidgin speakers mix English in all the time; that is NOT a request to switch. NEVER flip a Pidgin customer back to formal English.
-- If the established preference is "english": set "language": "pidgin" the moment the customer genuinely writes in Nigerian Pidgin (markers like "dey", "wan", "abeg", "na", "wetin", "fit", "make I", "sef", "abi", "o"). Until then, keep "english".
-- Short or ambiguous replies ("ok", "yes", "how much?", a number) NEVER change the language — keep the established preference exactly.
-- Whatever you set "language" to, "response" MUST be written in that exact language. Nigerian Pidgin must sound warm and natural — the way Nigerians actually chat on WhatsApp — never an exaggerated caricature. Keep product names, prices (₦), and links exactly as they are.
+LANGUAGE:
+- Set "language" to the language the customer is writing in, as a lowercase English name (e.g. english, pidgin, yoruba, hausa, igbo, french). Use "pidgin" for Nigerian Pidgin.
+- The established preference is in "Current context" and is STICKY: english is the default, but once the customer clearly writes in another language, stay in it. Mixed-in English words, numbers, or "ok"/"yes"/"how much?" never switch it. Never flip back to English just because a message was short.
+- Write "response" ENTIRELY in that language, warm and natural like real WhatsApp chat (never a caricature). Keep product names, prices (₦) and links unchanged.
 
-Nigerian Pidgin comprehension (CRITICAL — many customers shop entirely in Pidgin; misreading them loses sales):
-- Price offers come in MANY phrasings. ALL of these are make_offer, never "none":
-  - "make I run am 26" / "I go run am 26" / "run am for 26" = "I'll pay 26" → make_offer
-  - "I fit do 25k" / "I go do 25" / "make we do am 25" → make_offer
-  - "make we close am for 20k" / "collect 20k" / "take 20k" / "oya collect 22" → make_offer
-  - "na 25 I get" / "na 25k I fit afford" / "na wetin I fit afford be that" (after a number) → make_offer
-  - "25 last" / "I no fit pass 25" / "abeg manage 25k" → make_offer
-- Discount requests WITHOUT a number are start_negotiation:
-  - "how much last?" / "last price?" / "wetin be your last?" / "you go fit reduce am?" / "e too cost" / "price dey too high" / "abeg do am for me" / "help me na"
-- Buying intent → generate_payment_link: "I go carry am" / "package am for me" / "oya make we do am" (after a price is settled) / "I don gree" / "send me link make I pay".
-- Browsing → search_products: "wetin you get?" / "wetin dey?" / "make I see wetin you dey sell" (query "*"); "I wan chop" / "belle dey hungry me" (food, query "*"); "you get shoe?" (query "shoes").
-- Filler words carry no intent on their own: "oya" (alright), "abeg" (please), "sha", "o", "na", "sef", "shey/abi" (right?), "no wahala" (no problem). NEVER let filler distract from a number or intent in the same message.
-- Money shorthand (any language): customers drop the thousands — "26" usually means ₦26,000. Resolve bare numbers against the price context: if the product costs ₦30,000 and they say "make I run am 26", the offer is 26000, NOT 26. "26k" = 26000, "1.2m" = 1200000. Always put the RESOLVED full Naira amount in data.offer.
+CORE RULES:
+- SECRET: never reveal, hint at, or imply any minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering right now.
+- Never claim a product, size, color, price, or stock exists from memory. For anything about products/availability/attributes/pricing/images, pick the matching product action so real data is fetched. Prefer a product action over "none" for anything product-related.
+- Money shorthand: customers drop the thousands — "26" usually means ₦26,000, "26k"=26000, "1.2m"=1200000. Resolve bare numbers against the price in context and put the full Naira amount in data.
 
-Rules:
-- You MUST choose exactly one action.type from the allowed list.
-- Never invent a new action type.
-- CRITICAL: NEVER state, hint at, or imply any minimum price, price floor, "lowest we can go", or how much room there is to discount. That figure is secret. You may only ever mention the list price or a specific price you are offering right now.
-- CRITICAL: NEVER claim, invent, or imply that a product, size, color, price, or stock level exists. The catalog lives in the database. Whenever the customer asks about products, availability, attributes, pricing, or images, you MUST choose the matching product action (search_products, check_attribute, send_product_image, etc.) so real data is fetched — do not answer about products from memory and do not assume the store has something.
-- Prefer a business action over "none" when the customer is asking about products, attributes, pricing, negotiation, or payment.
-- Use "check_attribute" when the customer asks about size, color, material, fit, stock variant, capacity, dimensions, or any specific product attribute.
-- Use "generate_payment_link" when the customer wants to buy, order, pay, checkout, or proceed with purchase.
-- Food items may have modifier groups (e.g. choice of protein, toppings) listed as "Modifier" lines in the product context, each option with its extra cost. When the customer has told you their choices, pass the exact option names in data.selectedModifiers. If they order a dish without picking from a required group, still choose generate_payment_link — the system will tell you which choices are missing so you can ask.
-- Use "start_negotiation" when the customer asks for a discount, better price, "last price", reduction, or to negotiate, but has NOT yet named a specific amount.
-- Use "make_offer" when the customer proposes a specific price (e.g. "I fit pay 20k", "can you do 18000?", "20k last", "make I run am 26", "oya collect 22"), whether or not a negotiation is already active. Put the amount in "offer" as a plain number in Naira, resolving shorthand against the price context (e.g. "20k" → 20000; "26" → 26000 when the product costs tens of thousands).
-- NEVER stall on a price offer. Do not write that you will "check", "confirm", "see if e fit work", "get back to them", or consider it — pricing is resolved INSTANTLY by the system. Choose "make_offer" and the system hands you the decision (a counter-price, an acceptance, or a final price) to deliver in the same reply.
-- Use "accept_offer" only when the customer clearly agrees to the price YOU last offered (e.g. "ok", "deal", "that's fine", "I'll take it").
-- Use "find_similar_negotiable" when the customer agrees to see similar or alternative products after you offered to find items they can negotiate on (e.g. they reply "yes", "sure", "show me"), or when they directly ask for similar items they can bargain on.
-- Use "send_product_image" when the customer wants to SEE a product — its picture, photo, image, what it looks like, or to see a product together with its details (e.g. "send me the picture", "can I see it?", "show me a photo and details", "what does it look like?", "any images?"). This is the ONLY way to send a photo.
-- Use "none" only for pure greetings, thanks, or casual conversation with absolutely no product interest.
-- If the customer says "it", "that one", or similar, use the last product from context.
-- Use "show_more_products" when the customer says "show more", "see more", "next", "more products", "can I see more", "can you show me the rest" or wants to continue the previous product search.
-- Use "list_categories" ONLY when the customer explicitly asks for category or department names, e.g. "what categories do you have?", "list your categories", "what departments do you have?".
+CHOOSING THE ACTION:
+- search_products — wants to see/browse products. Use { "query": "*" } for broad requests ("what do you have/sell?", "show me everything", "what's on the menu?", "I'm hungry", "wetin you get?"). Use a specific query for a type/category and KEEP the product type/brand plus every real qualifier — color, gender, AND any occasion / use-case / setting / recipient ("I need shoes for a wedding"→"shoes for wedding"; "something to wear to the office"→"office wear"; "a gift for my mum"→"gift for mum"; "I wan buy nice shoes for men"→"men shoes"). Drop only true filler like "I want", "please", "nice", "abeg". The occasion/use-case is NOT filler — it decides which products actually fit. Add "maxPrice" in Naira only when they state a spending limit ("under 15k"→15000).
+- Cheaper/affordable/budget request while already browsing a category: KEEP that same category in "query" (reuse the last product's category / last search from context) and put any limit in "maxPrice". Never build the query from the budget word and never drift to an unrelated category. Only switch category when they name a different product type.
+- show_more_products — "show more", "see more", "next", "the rest".
+- check_attribute — asks about size/color/material/fit/stock/dimensions. data: { productName (null = last product), attributeKey, requestedValue (or null) }.
+- start_negotiation — asks for a discount/"last price"/reduction WITHOUT a number ("how much last?", "you fit reduce am?", "e too cost", "abeg do am for me").
+- make_offer — proposes a specific price, any phrasing: "I fit do 25k", "can you do 18000?", "make I run am 26", "20k last", "oya collect 22", "na 25 I get", "I no fit pass 25". Put the resolved amount in data.offer. NEVER stall, "check", "confirm" or "get back to them" — pricing is resolved instantly; the system gives you the counter/acceptance/final price to deliver.
+- accept_offer — clearly agrees to the price YOU last offered ("ok", "deal", "I'll take it").
+- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), email, selectedSize, selectedColor, selectedModifiers:[] }. For food with modifier groups, pass the chosen option names; if a required group is unchosen, still use this action — the system says what's missing.
+- send_product_image — wants to SEE a product (picture/photo/"what does it look like?"). The ONLY way to send a photo.
+- find_similar_negotiable — agrees to see similar items they can bargain on, or asks for them directly.
+- list_categories — explicitly asks for category/department names.
+- none — ONLY pure greetings, thanks, or chit-chat with no product interest.
+- "it"/"that one" = the last product in context.
 
-CRITICAL — product browsing detection:
-- Use "search_products" for ANY message where the customer wants to SEE or BROWSE products.
-- Use { "query": "*" } to show ALL products for these broad requests (and similar ones):
-  - "What do you have?" / "What do you sell?" / "What is available?"
-  - "Show me your products" / "Show me what you have" / "Show me everything"
-  - "Do you have products?" / "What's in your store?" / "I want to see your items"
-  - "Let me see your products" / "What can I buy?" / "Browse products"
-- Use a specific query for category or type requests:
-  - "show me fashion items" → { "query": "fashion" }
-  - "what clothes do you have?" → { "query": "clothes" }
-  - "do you have bags?" → { "query": "bags" }
-  - "show me shoes" → { "query": "shoes" }
-  - "I wan buy nice shoes for men" → { "query": "men shoes" } (keep only the product type, brand, and real qualifiers like color/gender/size — drop filler such as "I want to buy", "nice", "fine", "abeg")
-  - "anything for ladies?" → { "query": "female fashion" }
-  - "what do you have for men?" → { "query": "male fashion" }
-  - "something used in the kitchen" → { "query": "kitchen" }
-- Food businesses work the same way — dishes, meals, and drinks are products:
-  - "what's on the menu?" / "what can I eat?" / "I'm hungry" → { "query": "*" }
-  - "do you have jollof rice?" → { "query": "jollof rice" }
-  - "any soups?" → { "query": "soup" }
-  - "what drinks do you have?" → { "query": "drinks" }
-- search_products applies to product names, categories, descriptions, use cases, and any product-related phrase.
+Current context is provided below.`;
 
-STAY ON TOPIC — cheaper / budget / alternative requests (CRITICAL):
-- When the customer is already discussing a product or category (see "Last Product Discussed" and the previous search context) and then asks for cheaper, more affordable, lower-priced, smaller-budget, or "what can I afford" options, you MUST keep the search in that SAME category or close look-alikes. NEVER drift to an unrelated category (e.g. do not show handbags when the conversation is about shoes).
-  - Build the query from the category/type they were already looking at, NOT from the budget word. "show me cheaper ones" while browsing shoes → { "query": "shoes" }, NOT { "query": "cheaper" }.
-  - The active category lives in the context above (the last product's Category, or the previous search). Reuse it.
-- When the customer names a spending limit, pass it as maxPrice (resolve shorthand: "under 15k" → 15000, "I get 20k" → 20000, "around 10000" → 10000). Keep the category in query and put the limit in maxPrice:
-  - "any shoes under 15k?" → { "query": "shoes", "maxPrice": 15000 }
-  - (while browsing shoes) "anything cheaper, like 10k?" → { "query": "shoes", "maxPrice": 10000 }
-  - "what bag fits 8000?" → { "query": "bags", "maxPrice": 8000 }
-- If they want items they can BARGAIN/negotiate on (not just cheaper ones), use find_similar_negotiable instead — it already stays within the same category and look-alikes.
-- Only switch categories when the customer themselves clearly names a different product type or category.
-- Keep responses concise and WhatsApp-friendly.
-
-Action data rules:
-- search_products → { "query": "* for all products, or a specific category/type/name", "maxPrice": <optional budget in Naira, only when the customer states a spending limit> }
-- check_attribute → {
-    "productName": "product name or null if last product should be used",
-    "attributeKey": "sizes | colors | material | stock | dimensions | etc",
-    "requestedValue": "specific value or null"
-  }
-- start_negotiation → { "productName": "product name or null if last product should be used" }
-- make_offer → { "offer": 25000 }
-- accept_offer → { "finalPrice": 25000 }
-- find_similar_negotiable → { "productName": "the product they were looking at, or null to use the last product" }
-- send_product_image → { "productName": "product name or null to use the last product" }
-- generate_payment_link → {
-    "productName": "exact product name or null if last product should be used",
-    "email": "customer email if provided or null",
-    "selectedSize": "chosen size if provided or null",
-    "selectedColor": "chosen color if provided or null",
-    "selectedModifiers": ["exact modifier option names the customer chose, e.g. [\"Chicken\", \"Extra Plantain\"], or [] if none"]
-  }
-- show_more_products → {}
-- list_categories → {}
-- none → {}
-
-Current context:
-${contextStr}`;
+  return [
+    {
+      type: "text",
+      text: instructions,
+      cache_control: { type: "ephemeral" },
+    },
+    {
+      type: "text",
+      text:
+        `Business: "${business.name}".${toneInstruction}\n` +
+        `The customer's established language preference for THIS conversation is: ${session.language || "english"}.\n\n` +
+        `Current context:\n${contextStr}`,
+    },
+  ];
 }
 
 function buildActionResultPrompt(business, session, actionResult) {
@@ -530,18 +492,19 @@ Action result:
 ${JSON.stringify(actionResult, null, 2)}
 
 Guidelines:
-- LANGUAGE (already decided for this conversation — obey it exactly, do not re-judge from the latest message): ${
-    session.language === "pidgin"
-      ? "The customer prefers Nigerian Pidgin — EVERY sentence of your reply, including any opening and closing line, must be in warm, natural Nigerian Pidgin (the way Nigerians actually chat on WhatsApp, never an exaggerated caricature). Do not slip back into standard English anywhere, even if their last message was in plain English."
-      : "Reply in clear, friendly English."
-  } Keep product names, prices (₦), and links exactly as given.
+- LANGUAGE (already decided for this conversation — obey it exactly, do not re-judge from the latest message): write EVERY sentence of your reply — opening, list intro, and closing line included — in ${session.language || "english"}. It must read warm and natural, the way real people actually chat on WhatsApp in that language, never stiff or an exaggerated caricature. Do not slip into another language anywhere, even if the customer's last message contained words from another language. Keep product names, prices (₦), and links exactly as given.
 - HONESTY (most important): Only ever mention products, prices, sizes, colors, images, or stock that ACTUALLY appear in the action result or context above. Never invent, assume, or imply that the store has something. The catalog is the database — if it isn't in the result, it doesn't exist for you.
 - For product search results:
   - If actionResult.count === 0 (or products is empty): clearly and politely tell the customer you don't currently have any product matching that. Do NOT pretend a match exists or describe an imaginary item. Offer to show available categories or ask them to describe what else they need.
   - actionResult.matchTier tells you how well the shown products fit the search:
     - "strong": they are what the customer asked for — present them confidently.
-    - "partial": nothing closely matched the exact request — be upfront that you don't have exactly that, then present these as the closest items they might like instead. Never pass a partial match off as the exact product they named.
+    - "partial": nothing genuinely fits what they asked for — be upfront that you don't have exactly that (e.g. nothing suited to the occasion or use they described), then present these as the closest items you do have, in case they're interested. Never pass a partial match off as the right product for their need — e.g. do NOT present sneakers as wedding shoes; say you don't have formal/wedding shoes right now and these casual options are what you have.
     - Never mention match percentages, scores, or tiers to the customer.
+  - actionResult.searchBreadth tells you how specific the request was, so you can scale your confidence:
+    - "broad": they named only a general type (e.g. "shoes") without narrowing it. Present the shown products as a representative selection — NOT as the one perfect item — and add ONE short, friendly line inviting them to narrow it down (by style, colour, size, occasion, or budget) so you can pin their exact match.
+    - "specific": they gave real details. If matchTier is "strong", present the items confidently as matching exactly what they asked for. If "partial", be upfront you don't have that exact thing and offer these as the closest.
+  - If displayMode is "none": NO products are being shown — no cards, no list. The search was specific and nothing is an exact match. Write a brief, honest message (1–2 sentences): say you don't currently have exactly what they asked for, describe in a few words what your closest items are like (e.g. "what I have leans more casual"), and offer to show those closest options or help them look for something else. Do NOT list or number any products.
+  - If displayMode is "cards": the product images and full details are sent as separate cards right AFTER your message — so write only a SHORT intro line and do NOT list or repeat product details. Set the tone from searchBreadth: "broad" → introduce them as a selection and invite them to narrow down (style, colour, size, occasion, budget); otherwise a brief confident lead-in.
   - If displayMode is "text" (or absent): list ONLY the products in actionResult.products as a numbered list, one entry per product, numbering from actionResult.startNumber (default 1). Each entry MUST follow EXACTLY this format:
     1. *Product Name* - Short one-line description. Price: ₦18,000. Available in red, black, white, and blue, with sizes 39, 41, and 42.
     Build the "Available in ..." sentence from the product's actual attributes (colors, sizes, etc.); omit it when the product has no attributes. Use each product's real description, shortened to one line. Do not add anything else per entry.
@@ -557,7 +520,7 @@ Guidelines:
   - Never confirm a size/color/variant that is not in the result.
 - For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
   - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
-- For payment links: confirm product, selected options, price, and share the link naturally. If the result includes selectedModifiers, confirm those choices as part of the order (the price already includes their extra cost).
+- For payment links: confirm the product, selected options, and price, then share actionResult.paymentLink EXACTLY as given — a bare URL, never altered, shortened, wrapped in markdown, or invented. Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. If the result includes selectedModifiers, confirm those choices as part of the order (the price already includes their extra cost).
 - If the result has "needsModifiers": true, the order was NOT placed and no payment link exists yet. Ask the customer to choose from each group in missingGroups, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"). Do not invent options and do not share any link.
 - For price negotiation (the action result has a "negotiation" object):
   - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
@@ -582,55 +545,133 @@ Guidelines:
 - Plain text only. NEVER use markdown link syntax like [text](url) — WhatsApp does not render it; always write URLs bare.
 - No JSON.
 - Keep it concise for WhatsApp.${
-    session.language === "pidgin"
-      ? "\n\nFINAL REMINDER: every single sentence of the reply — opening, list intro, and closing line included — must be in Nigerian Pidgin. No standard-English sentence anywhere."
+    session.language && session.language !== "english"
+      ? `\n\nFINAL REMINDER: every single sentence of the reply — opening, list intro, and closing line included — must be written in ${session.language}. Do not write any sentence in another language.`
       : ""
   }`;
 }
 
+// The classifier only needs recent conversational context — lastProduct and
+// negotiation state already ride in the system context block — so cap the
+// history sent to it. Bounds input tokens (and cost) on long haggling sessions.
+const CLASSIFIER_HISTORY_LIMIT = 8;
+
+// JSON-schema-constrained output for the classifier. With structured outputs the
+// model can only return a well-formed object: a present "response" string, a
+// valid action "type" from the enum, and a "data" object. This makes the
+// empty-reply and invalid-action failure modes structurally impossible — the
+// salvage logic in normalizeAiOutput becomes a thin safety net, not load-bearing.
+const nullable = (schema) => ({ anyOf: [schema, { type: "null" }] });
+
+// Every field any action can carry, unioned. Irrelevant fields come back null
+// for a given action; normalizeActionData reads only the ones it needs.
+const ACTION_DATA_PROPERTIES = {
+  query: nullable({ type: "string" }),
+  maxPrice: nullable({ type: "number" }),
+  productName: nullable({ type: "string" }),
+  attributeKey: nullable({ type: "string" }),
+  requestedValue: nullable({ type: "string" }),
+  offer: nullable({ type: "number" }),
+  finalPrice: nullable({ type: "number" }),
+  email: nullable({ type: "string" }),
+  selectedSize: nullable({ type: "string" }),
+  selectedColor: nullable({ type: "string" }),
+  selectedModifiers: nullable({ type: "array", items: { type: "string" } }),
+};
+
+const ACTION_DECISION_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["response", "language", "action"],
+  properties: {
+    response: { type: "string" },
+    language: {
+      type: "string",
+      description:
+        "The language the customer is writing in, as a lowercase English name (e.g. english, pidgin, yoruba, hausa, igbo, french, swahili, arabic). Use 'pidgin' for Nigerian Pidgin.",
+    },
+    action: {
+      type: "object",
+      additionalProperties: false,
+      required: ["type", "data"],
+      properties: {
+        type: { type: "string", enum: [...VALID_ACTION_TYPES] },
+        data: {
+          type: "object",
+          additionalProperties: false,
+          required: Object.keys(ACTION_DATA_PROPERTIES),
+          properties: ACTION_DATA_PROPERTIES,
+        },
+      },
+    },
+  },
+};
+
+// Claude requires the first message to be from the user and every message to
+// carry non-empty content. A session's history can legitimately open with an
+// assistant greeting, so drop leading assistant/empty turns before sending.
+function toClaudeMessages(conversationHistory, userMessage) {
+  const cleaned = conversationHistory
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({ role: m.role, content: String(m.content ?? "") }))
+    .filter((m) => m.content.trim());
+
+  while (cleaned.length && cleaned[0].role === "assistant") {
+    cleaned.shift();
+  }
+
+  return [...cleaned, { role: "user", content: userMessage }];
+}
+
 /**
  * First AI call: given the user's message and session context, decide what
- * action to take and draft an initial response.
+ * action to take and draft an initial response. Runs on Claude Haiku 4.5 with
+ * JSON-schema-constrained output — chosen for stronger Nigerian Pidgin intent
+ * comprehension and a guaranteed response shape.
  *
  * Returns: { response: string, action: { type: string, data: object } }
  */
 export async function processMessage(userMessage, session = {}, business) {
+  // Only the most recent turns matter for intent; lastProduct/negotiation
+  // context already travels in the system block, so cap history to bound cost.
   const conversationHistory = Array.isArray(session.conversationHistory)
-    ? session.conversationHistory
+    ? session.conversationHistory.slice(-CLASSIFIER_HISTORY_LIMIT)
     : [];
 
-  const messages = [
-    { role: "system", content: buildActionDecisionPrompt(business, session) },
-    ...conversationHistory,
-    { role: "user", content: userMessage },
-  ];
+  const fallback = {
+    response: "I'm sorry, I encountered an error. Please try again.",
+    action: { type: "none", data: {} },
+  };
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages,
-      response_format: { type: "json_object" },
-      temperature: 0.1,
+    const completion = await anthropic.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1024,
+      temperature: 0,
+      system: buildActionDecisionSystem(business, session),
+      messages: toClaudeMessages(conversationHistory, userMessage),
+      output_config: {
+        format: { type: "json_schema", schema: ACTION_DECISION_SCHEMA },
+      },
     });
 
-    const rawContent = completion.choices?.[0]?.message?.content || "{}";
+    const rawContent =
+      (completion.content || [])
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("") || "{}";
+
     const parsed = safeJsonParse(rawContent);
 
     if (!parsed) {
       logger.warn(`processMessage returned invalid JSON: ${rawContent}`);
-      return {
-        response: "I'm sorry, I encountered an error. Please try again.",
-        action: { type: "none", data: {} },
-      };
+      return fallback;
     }
 
     return parsed;
   } catch (error) {
     logger.error("processMessage failed:", error);
-    return {
-      response: "I'm sorry, I encountered an error. Please try again.",
-      action: { type: "none", data: {} },
-    };
+    return fallback;
   }
 }
 
@@ -680,29 +721,34 @@ export async function generateResponseWithActionResult(
   }
 }
 
-// ─── Pidgin product descriptions ──────────────────────────────────────────────
+// ─── Localized product descriptions ───────────────────────────────────────────
 
-// Vendor descriptions are written in English; Pidgin sessions get them
-// translated so product cards match the conversation. Cached per product —
-// the key includes the text itself, so an edited description re-translates.
-const pidginDescriptionCache = new Map(); // `${id}:${description}` → { text, expiresAt }
-const PIDGIN_DESC_CACHE_TTL_MS = 60 * 60 * 1000;
+// Vendor descriptions are written in English; non-English sessions get them
+// translated so product cards match the conversation. Cached per
+// language+product — the key includes the text itself, so an edited description
+// re-translates.
+const descriptionCache = new Map(); // `${language}:${id}:${description}` → { text, expiresAt }
+const DESC_CACHE_TTL_MS = 60 * 60 * 1000;
 
 /**
- * Return copies of `products` with descriptions translated to Nigerian
- * Pidgin. One batched model call per send covers every uncached product;
- * any failure leaves the original English description in place.
+ * Return copies of `products` with descriptions translated into `language`.
+ * English (or empty/unknown) is a no-op. One batched model call per send covers
+ * every uncached product; any failure leaves the original English description in
+ * place.
  */
-export async function translateDescriptionsToPidgin(products) {
-  const translated = new Map(); // product id → pidgin description
+export async function translateDescriptions(products, language) {
+  const lang = normalizeLanguageName(language);
+  if (!lang || lang === "english" || !products.length) return products;
+
+  const translated = new Map(); // product id → translated description
   const pending = [];
 
   for (const product of products) {
     const description = (product.description || '').trim();
     if (!description) continue;
 
-    const cacheKey = `${product.id}:${description}`;
-    const hit = pidginDescriptionCache.get(cacheKey);
+    const cacheKey = `${lang}:${product.id}:${description}`;
+    const hit = descriptionCache.get(cacheKey);
     if (hit && Date.now() < hit.expiresAt) {
       translated.set(product.id, hit.text);
     } else {
@@ -711,9 +757,9 @@ export async function translateDescriptionsToPidgin(products) {
   }
 
   if (pending.length) {
-    const prompt = `Translate each product description below into warm, natural Nigerian Pidgin — the way Nigerians actually chat on WhatsApp, never an exaggerated caricature. Keep product names, brand names, numbers, and prices exactly as they are, and keep each translation about the same length as the original.
+    const prompt = `Translate each product description below into warm, natural ${lang} — the way people actually chat on WhatsApp, never an exaggerated caricature. Keep product names, brand names, numbers, and prices exactly as they are, and keep each translation about the same length as the original.
 
-Respond with JSON: {"translations": {"<id>": "<pidgin description>"}} — one entry per item, using the exact ids given.
+Respond with JSON: {"translations": {"<id>": "<translated description>"}} — one entry per item, using the exact ids given.
 
 Items:
 ${JSON.stringify(pending)}`;
@@ -733,14 +779,14 @@ ${JSON.stringify(pending)}`;
         const text = toCleanString(translations[id]);
         if (!text) continue; // missing/empty → that card stays English
         translated.set(id, text);
-        pidginDescriptionCache.set(`${id}:${description}`, {
+        descriptionCache.set(`${lang}:${id}:${description}`, {
           text,
-          expiresAt: Date.now() + PIDGIN_DESC_CACHE_TTL_MS,
+          expiresAt: Date.now() + DESC_CACHE_TTL_MS,
         });
       }
     } catch (error) {
       logger.warn(
-        `[Pidgin] Description translation failed (cards stay in English): ${error.message}`,
+        `[i18n] Description translation to ${lang} failed (cards stay in English): ${error.message}`,
       );
     }
   }
@@ -748,6 +794,44 @@ ${JSON.stringify(pending)}`;
   return products.map((p) =>
     translated.has(p.id) ? { ...p, description: translated.get(p.id) } : p,
   );
+}
+
+// ─── UI string localization ────────────────────────────────────────────────────
+
+// Short, code-composed WhatsApp strings (show-more hints, error notices, the
+// "great choice" prompt, etc.) are hand-written for English and Pidgin. For any
+// OTHER language they are AI-translated once and cached — the set of rendered
+// strings is tiny and repeats, so this is effectively all cache hits after warmup.
+const uiStringCache = new Map(); // `${language}:::${text}` → translated
+
+export async function translateUiString(text, language) {
+  const lang = normalizeLanguageName(language);
+  if (!text || !lang || lang === "english") return text;
+
+  const key = `${lang}:::${text}`;
+  const cached = uiStringCache.get(key);
+  if (cached) return cached;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You translate short WhatsApp UI strings for an e-commerce assistant into ${lang}. Translate naturally and warmly, the way people actually chat on WhatsApp. Keep any *asterisk-wrapped* trigger words, emojis, numbers, ₦ amounts, links, and product names exactly as they are. Reply with ONLY the translation — no quotes, no notes.`,
+        },
+        { role: "user", content: text },
+      ],
+      temperature: 0.2,
+    });
+
+    const result = completion.choices?.[0]?.message?.content?.trim() || text;
+    uiStringCache.set(key, result);
+    return result;
+  } catch (error) {
+    logger.warn(`[i18n] UI string translation to ${lang} failed; using English: ${error.message}`);
+    return text;
+  }
 }
 
 // ─── Audio helpers ────────────────────────────────────────────────────────────
@@ -817,10 +901,7 @@ const SHORT_MESSAGE_CONSTRAINTS =
 export async function generateGreeting(type, business, language = 'english') {
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
-  const languageInstruction =
-    language === 'pidgin'
-      ? ' The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.'
-      : '';
+  const languageInstruction = languageWritingInstruction(language);
 
   const formatConstraints = SHORT_MESSAGE_CONSTRAINTS;
 
@@ -867,10 +948,7 @@ export async function generateGreeting(type, business, language = 'english') {
 export async function generatePaymentFollowUp(business, productName, amount, language = 'english') {
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
-  const languageInstruction =
-    language === 'pidgin'
-      ? ' The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin.'
-      : '';
+  const languageInstruction = languageWritingInstruction(language);
 
   const priceText = typeof amount === 'number' ? `₦${amount.toLocaleString()}` : null;
 
@@ -914,11 +992,7 @@ export async function generateVoiceErrorMessage(business, language = "english") 
       messages: [
         {
           role: "system",
-          content: `You are a helpful AI assistant for "${business.name}".${
-            language === "pidgin"
-              ? " The customer chats in Nigerian Pidgin — write in warm, natural Nigerian Pidgin."
-              : ""
-          }`,
+          content: `You are a helpful AI assistant for "${business.name}".${languageWritingInstruction(language)}`,
         },
         {
           role: "user",
