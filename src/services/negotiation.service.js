@@ -23,6 +23,12 @@ function resolveFloor(product) {
   return roundToStep(Number(product.price) * DEFAULT_FLOOR_RATIO);
 }
 
+// When the customer asks for a discount WITHOUT naming a number ("abeg reduce
+// am", "do better", "how much last?"), each press steps our quote this fraction
+// of the way from our current anchor down toward the hidden floor — a real but
+// shrinking concession that never reaches the floor until the descent is spent.
+const CONCESSION_FRACTION = 0.4;
+
 export function startNegotiation(businessId, customerNumber, product) {
   const negotiation = {
     productId: product.id,
@@ -39,6 +45,54 @@ export function startNegotiation(businessId, customerNumber, product) {
   };
   setSession(businessId, customerNumber, { negotiation });
   return negotiation;
+}
+
+/**
+ * Respond to a discount request that carries NO number (the customer is pressing
+ * us to come down, but hasn't named a price). We make the move ourselves: an
+ * opening offer below the list price, then a deeper cut each time they press —
+ * always strictly below our previous quote and never below the hidden floor.
+ * Once there's no room left to move without breaching the floor, the floor is
+ * surfaced as the take-it-or-leave-it FINAL price.
+ *
+ *   outcome 'counter' → quote counterPrice (model justifies with real qualities)
+ *   outcome 'final'   → quote finalPrice (the floor) as the final price
+ */
+export function concede(negotiation) {
+  const list = negotiation.originalPrice;
+  const floor = negotiation.minPrice;
+  const rounds = (negotiation.rounds || 0) + 1;
+  const base = { ...negotiation, rounds };
+  const lastQuoted = Number.isFinite(negotiation.lastCounter) ? negotiation.lastCounter : null;
+
+  const finalDecision = {
+    outcome: 'final',
+    finalPrice: floor,
+    negotiation: { ...base, lastCounter: floor, stage: 'final' },
+  };
+
+  // No meaningful room between list and floor — just hold the floor.
+  if (list - floor <= PRICE_STEP) return finalDecision;
+
+  // Step down from wherever we last stood (the list price on the first press)
+  // toward the floor.
+  const anchor = lastQuoted !== null ? lastQuoted : list;
+  let counter = roundToStep(anchor - (anchor - floor) * CONCESSION_FRACTION);
+
+  // Each press must beat our previous quote, stay under the list, and never dip
+  // below the floor.
+  if (lastQuoted !== null) counter = Math.min(counter, lastQuoted - PRICE_STEP);
+  counter = Math.min(counter, list - PRICE_STEP);
+  counter = Math.max(counter, floor);
+
+  // Can't move below our last quote without hitting the floor → floor is final.
+  if (counter <= floor || (lastQuoted !== null && counter >= lastQuoted)) return finalDecision;
+
+  return {
+    outcome: 'counter',
+    counterPrice: counter,
+    negotiation: { ...base, lastCounter: counter, stage: 'countered' },
+  };
 }
 
 /**

@@ -6,6 +6,7 @@
  */
 
 import axios from 'axios';
+import FormData from 'form-data';
 import { logger } from '../utils/logger.js';
 import { translateUiString } from './openai.service.js';
 
@@ -55,6 +56,137 @@ export async function sendImageMessage(phoneNumberId, accessToken, to, imageUrl,
       timeout: SEND_TIMEOUT_MS,
     }
   );
+}
+
+// Send an image that's ALREADY uploaded to Meta (by media id, not a link).
+// Media sent by id is on Meta's servers, so it delivers fast and in order —
+// before any follow-up button — which a link-fetched image can't guarantee.
+export async function sendImageMessageById(phoneNumberId, accessToken, to, mediaId, caption) {
+  await axios.post(
+    `${GRAPH_URL}/${phoneNumberId}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'image',
+      image: { id: mediaId, caption },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: SEND_TIMEOUT_MS,
+    }
+  );
+}
+
+// ─── Media-id cache (link → uploaded Meta media id) ───────────────────────────
+//
+// Sending a product photo by `link` makes Meta fetch the URL before delivering,
+// so the image bubble lags behind the lightweight follow-up button and arrives
+// out of order. Uploading the image once to Meta and sending it by `id` removes
+// that fetch from the send path, so the card lands first. Media ids are scoped
+// to the uploading phone number, so the cache is keyed by phoneNumberId + url.
+// Bounded LRU with a TTL well inside Meta's media retention window.
+const MEDIA_ID_CACHE_MAX = 2000;
+const MEDIA_ID_TTL_MS = 12 * 60 * 60 * 1000; // 12h
+
+class MediaIdCache extends Map {
+  get(key) {
+    if (!super.has(key)) return undefined;
+    const value = super.get(key);
+    super.delete(key);
+    super.set(key, value); // most-recently-used
+    return value;
+  }
+  set(key, value) {
+    if (super.has(key)) super.delete(key);
+    super.set(key, value);
+    while (this.size > MEDIA_ID_CACHE_MAX) {
+      super.delete(super.keys().next().value); // evict least-recently-used
+    }
+    return this;
+  }
+}
+
+const mediaIdCache = new MediaIdCache();
+
+const mediaCacheKey = (phoneNumberId, imageUrl) => `${phoneNumberId}:${imageUrl}`;
+
+// Download the image and upload it to Meta, returning a reusable media id.
+async function uploadImageByUrl(phoneNumberId, accessToken, imageUrl) {
+  const fileRes = await axios.get(imageUrl, {
+    responseType: 'arraybuffer',
+    timeout: MEDIA_TIMEOUT_MS,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+  });
+
+  // Meta only accepts JPEG/PNG here (sendableImageUrl already screens out the
+  // rest); trust the served content-type, defaulting to jpeg.
+  const contentType = (fileRes.headers['content-type'] || '').toLowerCase();
+  const mimeType = contentType.includes('png') ? 'image/png' : 'image/jpeg';
+  const filename = mimeType === 'image/png' ? 'product.png' : 'product.jpg';
+
+  const form = new FormData();
+  form.append('messaging_product', 'whatsapp');
+  form.append('type', mimeType);
+  form.append('file', Buffer.from(fileRes.data), { filename, contentType: mimeType });
+
+  const uploadRes = await axios.post(`${GRAPH_URL}/${phoneNumberId}/media`, form, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...form.getHeaders(),
+    },
+    timeout: MEDIA_TIMEOUT_MS,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+  });
+
+  const mediaId = uploadRes.data?.id;
+  if (!mediaId) throw new Error('Meta /media upload returned no id');
+  return mediaId;
+}
+
+// Resolve a usable media id for an image url, uploading (and caching) on a miss.
+async function resolveMediaId(phoneNumberId, accessToken, imageUrl) {
+  const key = mediaCacheKey(phoneNumberId, imageUrl);
+  const cached = mediaIdCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.mediaId;
+
+  const mediaId = await uploadImageByUrl(phoneNumberId, accessToken, imageUrl);
+  mediaIdCache.set(key, { mediaId, expiresAt: Date.now() + MEDIA_ID_TTL_MS });
+  return mediaId;
+}
+
+// Send a product's photo + caption as one image bubble, preferring the media-id
+// path (delivers in order) and degrading gracefully: media-id → link → text.
+// A rejected cached id (expired/deleted on Meta's side) is dropped and retried
+// via the link path so a stale cache never swallows a card.
+async function sendProductImageBubble(phoneNumberId, accessToken, to, product, caption) {
+  const imageUrl = sendableImageUrl(product);
+  if (!imageUrl) {
+    await sendTextMessage(phoneNumberId, accessToken, to, caption);
+    return;
+  }
+
+  try {
+    const mediaId = await resolveMediaId(phoneNumberId, accessToken, imageUrl);
+    await sendImageMessageById(phoneNumberId, accessToken, to, mediaId, caption);
+    return;
+  } catch (err) {
+    mediaIdCache.delete(mediaCacheKey(phoneNumberId, imageUrl));
+    logger.warn(
+      `[WhatsApp] media-id image send failed for "${product.name}", falling back to link: ${err.response?.data?.error?.message || err.message}`,
+    );
+  }
+
+  try {
+    await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
+  } catch (err) {
+    logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
+    await sendTextMessage(phoneNumberId, accessToken, to, caption);
+  }
 }
 
 // ─── Product card helpers ─────────────────────────────────────────────────────
@@ -245,20 +377,10 @@ async function buildProductCaption(product, language = 'english') {
  */
 export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '', language = 'english') {
   const caption = await buildProductCaption(product, language);
-  const imageUrl = sendableImageUrl(product);
 
-  if (imageUrl) {
-    try {
-      await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
-    } catch (err) {
-      // Image failed — fall back to plain text card
-      logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
-      await sendTextMessage(phoneNumberId, accessToken, to, caption);
-    }
-  } else {
-    // No image — send text card
-    await sendTextMessage(phoneNumberId, accessToken, to, caption);
-  }
+  // Image (by media id so it delivers before the follow-up), falling back to
+  // link then a plain text card.
+  await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
 
   // Send the AI's conversational response as a separate follow-up bubble
   if (followUpText) {
@@ -287,19 +409,10 @@ const INTERACTIVE_BODY_LIMIT = 1024;
 export async function sendProductButtonCard(phoneNumberId, accessToken, to, product, language = 'english') {
   const caption = await buildProductCaption(product, language);
   const labels = await getCaptionStrings(language);
-  const imageUrl = sendableImageUrl(product);
 
   // 1) Full details — image + caption (or a text card when there's no image).
-  if (imageUrl) {
-    try {
-      await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
-    } catch (err) {
-      logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
-      await sendTextMessage(phoneNumberId, accessToken, to, caption);
-    }
-  } else {
-    await sendTextMessage(phoneNumberId, accessToken, to, caption);
-  }
+  // Sent by media id so the photo lands BEFORE the button below, not after it.
+  await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
 
   // 2) Compact interactive button so the customer can still tap to pick. The body
   // ties the button to its product (name + price) without repeating every detail.

@@ -10,6 +10,7 @@ import { ModifierOption } from '../models/mongoose/ModifierOption.js';
 import { anthropic } from '../config/anthropic.js';
 import { logger } from '../utils/logger.js';
 import { env } from '../config/env.js';
+import { buildTaxConfig, computeTax } from '../utils/pricing.js';
 
 // ─── Shape conversion ─────────────────────────────────────────────────────────
 
@@ -79,14 +80,23 @@ function toStafflyProduct(p, modifierOptionMap = new Map()) {
       : Math.max((p.stockQuantity || 0) - (p.orderedQuantity || 0), 0);
   const stock = isFood ? (foodAvailable ? 999 : 0) : expired ? 0 : retailStock;
 
+  // VAT is folded into every customer-facing price here: the number the shopper
+  // sees, negotiates on, and pays already includes tax — it's only ever rendered
+  // as "Price", never broken out. With no tax config this is a no-op. Applied to
+  // the list price, the negotiation floor, and modifier add-ons alike so the
+  // whole basket is consistently tax-inclusive.
+  const taxCfg = buildTaxConfig(p);
+  const withVat = (naira) => computeTax(naira, taxCfg).gross;
+
   return {
     id: p._id.toString(),
     business_id: p.vendorId?.toString() || '',
     name: p.name,
     category: p.categoryId || '',
     description: p.description || '',
-    // Prices are stored in the smallest unit (kobo); divide by 100 for Naira.
-    price: (p.discountedPrice || p.price || 0) / 100,
+    // Prices are stored in the smallest unit (kobo); divide by 100 for Naira,
+    // then fold in VAT so the shown price is the all-in price.
+    price: withVat((p.discountedPrice || p.price || 0) / 100),
     // 999 is the "untracked stock" sentinel — never show it as a literal count.
     stock,
     is_food: isFood,
@@ -94,7 +104,9 @@ function toStafflyProduct(p, modifierOptionMap = new Map()) {
     sold_out_for_today: soldOutForToday,
     allow_preorder: p.allowPreOrder === true,
     // Food modifier groups with options resolved to { name, additionalPrice }
-    // (additionalPrice converted from kobo to Naira, like product prices).
+    // (additionalPrice converted from kobo to Naira). Tax is applied to the
+    // product price and floor only — mirroring velte's computePrice, which does
+    // not tax modifier add-ons.
     modifiers: (p.modifiers || [])
       .map((group) => ({
         name: group.name,
@@ -110,7 +122,9 @@ function toStafflyProduct(p, modifierOptionMap = new Map()) {
     // pre-orderable); retail = stock on hand (or untracked).
     is_available: isFood ? foodAvailable || p.allowPreOrder === true : stock > 0,
     allow_negotiation: p.isNegotiable || false,
-    min_price: p.minimumPrice ? p.minimumPrice / 100 : null,
+    // Floor is VAT-inclusive too, so the negotiation band is all in the same
+    // (tax-inclusive) terms the customer sees.
+    min_price: p.minimumPrice ? withVat(p.minimumPrice / 100) : null,
     image_url: toWhatsappSafeImageUrl(p.mainImageUrl),
     gallery: (p.thumbnailUrls || []).map(toWhatsappSafeImageUrl),
     tags: p.tags || [],

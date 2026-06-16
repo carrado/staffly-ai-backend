@@ -27,7 +27,7 @@ import * as openaiService from "../services/openai.service.js";
 import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
 import * as emailService from "../services/email.service.js";
-import { startNegotiation, evaluateOffer } from "../services/negotiation.service.js";
+import { startNegotiation, evaluateOffer, concede } from "../services/negotiation.service.js";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
@@ -404,6 +404,8 @@ async function runCheckout({
     ? `${product.name} (${selectedModifiers.map((m) => m.name).join(', ')})`
     : product.name;
 
+  // `amount` is already VAT-inclusive (tax is folded in at the product mapper),
+  // so it's charged as-is — the customer only ever sees a single "Price".
   const { paymentLink, orderId } = await paymentService.generatePaymentLink(
     businessId,
     customerNumber,
@@ -439,6 +441,7 @@ async function runCheckout({
     paymentLink,
     orderId,
     product: product.name,
+    // VAT-inclusive, shown to the customer only as "Price".
     price: amount,
     customerName: customerName || null,
     location: location || null,
@@ -965,49 +968,48 @@ async function executeAction({
         break;
       }
 
-      // Mid-haggle "you no fit reduce am?" gets classified as start_negotiation
-      // too. Resetting would forget the prices already quoted and let the next
-      // counter jump back UP — a quoted price is a commitment. If a negotiation
-      // for this product already has a standing quote, restate it instead.
-      const existing = getSession(businessId, customerNumber).negotiation;
-      if (
-        existing?.productId === product.id &&
-        Number.isFinite(existing.lastCounter)
-      ) {
+      // The customer is asking us to come down but hasn't named a number
+      // ("abeg reduce am", "how much last?", "do better"). Rather than just
+      // restate the list price (which read as "the system won't budge"), we make
+      // the move ourselves: open below list and cut deeper on every press, never
+      // below the hidden floor. A stale negotiation for a DIFFERENT product is
+      // reset; an existing one for THIS product is pressed further so a quoted
+      // price is never forgotten and a counter never jumps back UP.
+      let negotiation = getSession(businessId, customerNumber).negotiation;
+      if (!negotiation || negotiation.productId !== product.id) {
+        negotiation = startNegotiation(businessId, customerNumber, product);
+      }
+
+      const decision = concede(negotiation);
+      setNegotiation(businessId, customerNumber, decision.negotiation);
+
+      if (decision.outcome === "final") {
         actionResult = {
-          negotiation:
-            existing.stage === "final"
-              ? {
-                  outcome: "final",
-                  finalPrice: existing.lastCounter,
-                  listPrice: existing.originalPrice,
-                  product: product.name,
-                }
-              : {
-                  outcome: "counter",
-                  counterPrice: existing.lastCounter,
-                  listPrice: existing.originalPrice,
-                  round: existing.rounds,
-                  product: product.name,
-                },
+          negotiation: {
+            outcome: "final",
+            finalPrice: decision.finalPrice,
+            listPrice: product.price,
+            product: product.name,
+          },
           product: mapProductForAI(product),
+          suggestSimilar: true,
         };
         productsToShow = [];
         break;
       }
 
-      const negotiation = startNegotiation(businessId, customerNumber, product);
-
       // NOTE: never expose minPrice — it stays server-side only.
       actionResult = {
         negotiation: {
-          outcome: "started",
+          outcome: "counter",
+          counterPrice: decision.counterPrice,
+          listPrice: product.price,
+          round: decision.negotiation.rounds,
           product: product.name,
-          listPrice: negotiation.originalPrice,
         },
-        message: "Negotiation started — invite the customer to make an offer.",
+        product: mapProductForAI(product),
       };
-
+      productsToShow = [];
       break;
     }
 
