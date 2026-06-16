@@ -119,14 +119,61 @@ function toStafflyProduct(p, modifierOptionMap = new Map()) {
   };
 }
 
+// ─── Bounded LRU cache ──────────────────────────────────────────────────────
+
+// A Map with a hard entry cap and least-recently-used eviction. These caches are
+// the only per-process state that can grow without bound (one entry per business
+// / query / product image), so each gets a ceiling. TTL still expires stale
+// entries on read; the LRU bound caps total memory regardless of how many
+// distinct keys are seen over the process's lifetime. Reading or writing a key
+// marks it most-recently-used; once over capacity the oldest key is evicted.
+// (Single-instance memory guard — a multi-instance deploy would move these to
+// Redis instead; see CLAUDE.md.)
+class LruCache extends Map {
+  constructor(maxSize) {
+    super();
+    this.maxSize = maxSize;
+  }
+
+  get(key) {
+    if (!super.has(key)) return undefined;
+    const value = super.get(key);
+    super.delete(key);
+    super.set(key, value); // re-insert as most-recently-used
+    return value;
+  }
+
+  set(key, value) {
+    if (super.has(key)) super.delete(key);
+    super.set(key, value);
+    while (this.size > this.maxSize) {
+      super.delete(super.keys().next().value); // evict least-recently-used
+    }
+    return this;
+  }
+}
+
 // ─── Product cache ────────────────────────────────────────────────────────────
 
-const productCache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const PRODUCT_CACHE_MAX = 200;        // distinct businesses' product lists held
+const SEMANTIC_BUSINESS_MAX = 200;    // distinct businesses with cached rankings
+const SEMANTIC_QUERY_CACHE_MAX = 100; // cached rankings kept per business
+const VISUAL_CACHE_MAX = 2000;        // product-image descriptions (shared)
+
+const productCache = new LruCache(PRODUCT_CACHE_MAX);
 
 export function invalidateProductCache(businessId) {
   productCache.delete(businessId);
   semanticCache.delete(businessId);
+}
+
+// Drop every business's cached products and rankings. Used by the change stream
+// for delete events, which don't carry the document's vendorId — so we can't
+// target a single business and clear all instead (deletes are rare).
+export function invalidateAllProductCaches() {
+  productCache.clear();
+  semanticCache.clear();
 }
 
 // ─── Semantic relevance ranking ───────────────────────────────────────────────
@@ -145,6 +192,13 @@ const SEMANTIC_DESC_CHARS = 160;     // description excerpt per product
 const STRONG_SCORE = 100;            // matchPercent for a strong (occasion-fit) match
 const PARTIAL_SCORE = 55;            // matchPercent for a closest-but-not-right match
 
+// Cost gate for the semantic pass (the heaviest call — up to SEMANTIC_MAX_CANDIDATES
+// products in the prompt). A bare single-word query already backed by enough
+// confident keyword matches skips the model entirely; qualified or low-confidence
+// searches still run it (see searchProducts).
+const KEYWORD_CONFIDENT_PERCENT = 90;     // matchPercent at/above this = a confident keyword hit
+const MIN_CONFIDENT_TO_SKIP_SEMANTIC = 3; // need at least a full card page of them to skip
+
 // Schema-constrained output for the ranker — query specificity plus two id arrays.
 const SEMANTIC_RANK_SCHEMA = {
   type: 'object',
@@ -157,7 +211,7 @@ const SEMANTIC_RANK_SCHEMA = {
   },
 };
 
-const semanticCache = new Map(); // businessId → Map(query → { ranking, expiresAt })
+const semanticCache = new LruCache(SEMANTIC_BUSINESS_MAX); // businessId → LruCache(query → { ranking, expiresAt })
 
 function getCachedRanking(businessId, query) {
   const entry = semanticCache.get(businessId)?.get(query);
@@ -165,7 +219,7 @@ function getCachedRanking(businessId, query) {
 }
 
 function setCachedRanking(businessId, query, ranking) {
-  if (!semanticCache.has(businessId)) semanticCache.set(businessId, new Map());
+  if (!semanticCache.has(businessId)) semanticCache.set(businessId, new LruCache(SEMANTIC_QUERY_CACHE_MAX));
   semanticCache.get(businessId).set(query, { ranking, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
@@ -189,13 +243,29 @@ async function semanticRank(query, candidates) {
   const prompt = `A customer is shopping and searched for: "${query}"
 
 First decide how specific the search is:
-- "broad": just a product type or category with no narrowing detail (e.g. "shoes", "bags", "do you have dresses?"). The shopper hasn't said what they really want yet.
-- "specific": it adds any constraint — occasion, use-case, setting, recipient, style, colour, size, material, brand, or budget (e.g. "shoes for a wedding", "red size 44 oxfords", "gift for my mum").
+- "broad": a BARE product type or category with NO narrowing detail and NO audience (e.g. "shoes", "bags", "do you have dresses?"). The shopper hasn't said what they really want yet.
+- "specific": it adds any constraint — occasion, use-case, setting, recipient/audience (e.g. for women, for men, for kids, a gift for someone), style, colour, size, material, brand, dietary need, or budget (e.g. "shoes for a wedding", "red size 44 oxfords", "gift for my mum", "snacks for kids", "vegan options", "fashion for women", "ladies shoes"). A recipient/audience is ALWAYS a narrowing detail — treat it as specific even when no product type is named and even when it reads like a department name. In particular "fashion for women", "ladies fashion", "women's clothing", "for women", "for kids" are SPECIFIC (audience-constrained), NEVER broad.
 
-Then sort the products into two groups, using real-world knowledge (e.g. sneakers and canvas shoes are casual and are NOT appropriate for a wedding, while oxfords/brogues/loafers/dress shoes are; a hoodie is not office wear; a deep fryer is not "something healthy"):
-- "strong": for a BROAD search, EVERY product of the requested type counts as strong — the shopper hasn't narrowed, so show the whole range. For a SPECIFIC search, a product is strong ONLY if it genuinely satisfies the stated details (the type AND the occasion/colour/size/etc.) — be strict.
-- "partial": the right general kind of item that does NOT meet the stated details (e.g. casual sneakers when they asked for wedding shoes) — the closest thing available, not a real match. Usually empty for a broad search.
-Leave a product out of both groups when it is unrelated. Include items that fit by world knowledge even if their text never says so (a "Chuck Taylor High Top" IS a shoe). When a product has a "visual" field, it was generated from the product's actual photo — trust it for the item's true style and formality over thin or generic text.
+This judgement applies to EVERY kind of business — fashion/retail, food & dishes, drinks, electronics, home goods, AND catering & event services. Reason from what each item or service actually IS, not from its category label. For catering/services, the "type" is the dish or service (small chops, jollof, drinks package, event setup) and the constraints include headcount/guests, event type, date/time, and dietary needs.
+
+How specificity scales — the MORE details the shopper gives, the STRICTER you must be, because each extra detail is another requirement an item must meet to be "strong":
+- 0 details → broad: "shoes", "what dishes do you have?", "any drinks?", "what catering do you offer?"
+- 1 detail → specific: "red shoes", "vegan dishes", "office bag", "small chops", "drinks for an event"
+- 2 details → specific: "red shoes for women", "vegan dishes for kids", "jollof for a party"
+- 3+ details → specific (strictest): "red leather oxford shoes for a wedding, size 44", "vegan small chops for 50 guests on Saturday"
+At each step up, an item must satisfy ALL the stated details to be "strong"; meeting only some makes it "partial".
+
+Then sort the products using real-world knowledge. Treat the stated details as a CHECKLIST: a product is "strong" ONLY if it satisfies EVERY stated detail. Missing even one drops it to "partial" (or out entirely, if unrelated). Check in this order:
+
+1. PRODUCT TYPE — a hard gate, checked FIRST. If the shopper named a type (clothes, dress, shoes, soup, phone, etc.), the item must actually BE that type. A different type is NEVER "strong", no matter how well it matches everything else. Judge the type from what the item REALLY IS — its name first, and its "visual" field (from its actual photo) when present. Do NOT rely on the vendor's "category" or "tags" labels when they conflict with that, because many shops blanket-tag every item with a department word like "fashion", "clothes", or "clothing" even when the item is shoes or a bag — those labels are unreliable for typing. Reason about real-world categories: "clothes" (also "clothing", "wear", "apparel", "outfit", "fashion") means garments worn on the body — dresses, tops, shirts, trousers, skirts, jackets, gowns. Footwear (shoes, sneakers, trainers, heels, boots, slippers, sandals), bags (handbag, tote, backpack), and other accessories (belts, caps/hats, jewellery, watches, sunglasses) are each their OWN distinct type and are NOT clothes. So for "clothes for men", men's sneakers or a men's bag are the WRONG TYPE → "partial" at most, never "strong" — EVEN IF their category/tags say "fashion", "clothes", or "men". For "soup for kids", a kid-friendly drink is the wrong type → "partial" at most. (Still include items that genuinely fit the type by world knowledge even if their text doesn't say so — a "Chuck Taylor High Top" IS a shoe.)
+2. EVERY OTHER STATED DETAIL must also hold — occasion/use (sneakers are not wedding shoes; a hoodie is not office wear), colour, size, material, dietary need (a spicy meat dish is not "vegan" and not "for a toddler"), budget, and audience.
+3. AUDIENCE/GENDER (for women / for men / for kids) — strong only if the item genuinely suits that audience. Trust a product's "visual" field (generated from its actual photo) over thin text for style, formality AND gender: a visual that reads women's supports "strong"; one that reads men's or kids' (when they asked for women) is wrong-audience → "partial" or drop. If the audience CANNOT be confirmed from name, category, description, tags, or photo, do NOT assume it fits — "partial", never "strong".
+
+For a BROAD search (a bare type with no details), skip the OTHER details — but the PRODUCT TYPE gate in step 1 STILL applies. Every product OF THE NAMED TYPE is "strong" (the shopper hasn't narrowed within the type, so don't demand occasion/colour/size), but items of a DIFFERENT type are still excluded, never "strong": a bare "clothes" or "fashion" search must still never return footwear, bags, or accessories as "strong".
+
+"partial" = the closest available item that misses one or more stated details — right type but wrong audience/occasion, OR right audience but wrong type. It is NOT a real match, just the nearest thing. Leave a product out of both groups when it is unrelated to the request.
+
+Consequence to internalise: if a shopper asks for "clothes for women" and the shop only stocks a women's handbag and some sneakers, there are ZERO strong matches — those go to "partial" (wrong type), and the reply then honestly says there are no women's clothes right now but offers the closest items, instead of presenting a handbag and sneakers as the clothes they asked for.
 
 Only use ids from the catalog below; never invent ids. Respond with JSON: {"specificity": "broad" | "specific", "strong": ["id", ...], "partial": ["id", ...]}. Use empty arrays where nothing fits.
 
@@ -227,6 +297,15 @@ ${JSON.stringify(catalog)}`;
     // A product can't be both tiers; strong wins.
     const partial = clean(parsed.partial).filter((id) => !strongSet.has(id));
     const specificity = parsed.specificity === 'broad' ? 'broad' : 'specific';
+    // Diagnostic: shows exactly what the ranker decided for this query — the
+    // single most useful line for debugging "it showed everything / nothing".
+    // specificity=broad means it judged the query a bare type (and marks all
+    // type-matches strong); a large `strong` on a query that should be narrow
+    // means the catalog lacks the data to tell items apart.
+    const visualUsed = catalog.filter((c) => c.visual).length;
+    logger.info(
+      `[SemanticRank] "${query}" → specificity=${specificity}, strong=${strong.length}, partial=${partial.length} (of ${catalog.length} candidates, ${visualUsed} with photo descriptions)`,
+    );
     return { specificity, strong, partial };
   } catch (error) {
     logger.warn(
@@ -246,7 +325,7 @@ ${JSON.stringify(catalog)}`;
 // degrade silently to text-only.
 const VISION_MAX = 40;                            // most images described per ranking
 const VISION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const visualCache = new Map();                    // imageUrl → { text, expiresAt }
+const visualCache = new LruCache(VISUAL_CACHE_MAX); // imageUrl → { text, expiresAt }
 
 async function describeProductImage(imageUrl) {
   if (!imageUrl) return null;
@@ -264,7 +343,7 @@ async function describeProductImage(imageUrl) {
             { type: 'image', source: { type: 'url', url: imageUrl } },
             {
               type: 'text',
-              text: 'Describe this product in ONE factual sentence for search matching: what the item is, its style and formality (casual vs formal/dressy), key colour/material if visible, and what occasions or uses it suits. No marketing language.',
+              text: "Describe this product in ONE or TWO factual sentences for search matching. Include, when visible: what the item is; its apparent target audience/gender — women's, men's, unisex, or kids' — judged from styling, cut, shape, and presentation (say \"unisex/unclear\" only when there is genuinely no signal, don't default to it); its style and formality (casual vs formal/dressy); key colour/material; and the occasions or uses it suits. No marketing language.",
             },
           ],
         },
@@ -344,6 +423,26 @@ export async function searchProducts(businessId, query, limit = 50) {
   // Broad "*" browses list everything as-is; only specific searches get the
   // semantic relevance pass.
   if (!query || query.trim() === '*') return { products: keywordMatches, specificity: 'broad' };
+
+  // Cost gate: a bare single-word query (a plain product type, e.g. "shoes")
+  // already backed by a full page of confident keyword hits doesn't need the
+  // semantic re-rank — the keyword results ARE the answer, shown as a broad
+  // selection. The model pass is reserved for the cases that need it: qualified
+  // queries ("corporate shoes", "shoes for a wedding") that need fit judgment,
+  // and sparse/low-confidence keyword results that need recovery or honest
+  // "closest match" tiering. This skips the heaviest call on the most common,
+  // easiest searches.
+  const isSingleWordQuery =
+    query.trim().split(/\s+/).filter(Boolean).length === 1;
+  const confidentKeywordMatches = keywordMatches.filter(
+    (p) => (p.matchPercent ?? 0) >= KEYWORD_CONFIDENT_PERCENT,
+  ).length;
+  if (isSingleWordQuery && confidentKeywordMatches >= MIN_CONFIDENT_TO_SKIP_SEMANTIC) {
+    logger.info(
+      `[Search] "${query}" → ${keywordMatches.length} keyword match(es); skipped semantic rank (bare-type query, ${confidentKeywordMatches} confident matches)`,
+    );
+    return { products: keywordMatches, specificity: 'broad' };
+  }
 
   // Candidate set for ranking: keyword matches first (most likely relevant, so
   // never dropped by the candidate cap), then the rest of the catalog so the
@@ -439,6 +538,58 @@ export async function getProductCategories(businessId) {
 
   const docs = await Product.find({ vendorId: business.velteUserId }, { categoryId: 1 }).lean();
   return [...new Set(docs.map((d) => d.categoryId).filter(Boolean))];
+}
+
+/**
+ * Compact overview of what the store actually stocks right now — the categories
+ * with available stock and how many items are in each. Built from the SAME
+ * 5-min-cached product list the search uses (no extra DB query), so it costs
+ * nothing per message. Fed to the action-decision model so it can ground its
+ * routing (e.g. not claim the store is empty when it isn't) — it is NOT a source
+ * of truth for specific items, prices, or stock; those always come from a
+ * product action.
+ */
+export async function getCatalogSummary(businessId) {
+  const all = await getProductsForBusiness(businessId);
+  const available = all.filter((p) => p.is_available);
+
+  const counts = new Map();
+  for (const p of available) {
+    const name = String(p.category || '').trim() || 'Other';
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+
+  const categories = [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count);
+
+  return { totalAvailable: available.length, categories };
+}
+
+/**
+ * A compact vocabulary of this store's real product/dish/service names and
+ * categories — the proper nouns a speech-to-text model is most likely to
+ * mis-hear ("UrbanFlex", "LuxeMini", "jollof", "egusi"). Fed to the voice
+ * transcriber as context so it spells them right. Built from the same cached
+ * product list (no extra DB query); product names first (most error-prone),
+ * then categories, deduped and capped to keep the transcription prompt short.
+ */
+export async function getCatalogVocabulary(businessId, limit = 40) {
+  const all = await getProductsForBusiness(businessId);
+  const terms = [];
+  const seen = new Set();
+  const add = (value) => {
+    const t = String(value || '').trim();
+    const key = t.toLowerCase();
+    if (t && !seen.has(key)) {
+      seen.add(key);
+      terms.push(t);
+    }
+  };
+
+  for (const p of all) add(p.name);       // proper nouns / brands first
+  for (const p of all) add(p.category);   // then category labels
+  return terms.slice(0, limit);
 }
 
 // ─── Similar products (negotiable alternatives) ─────────────────────────────────

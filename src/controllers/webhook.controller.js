@@ -28,6 +28,7 @@ import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
 import * as emailService from "../services/email.service.js";
 import { startNegotiation, evaluateOffer } from "../services/negotiation.service.js";
+import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
 const SEARCH_PAGE_SIZE = 3;      // image cards per page for a specific search
@@ -48,7 +49,7 @@ const STRINGS = {
     moreItems: (n) =>
       `I still have ${n} more item${n === 1 ? "" : "s"} — reply *show more* to see ${n === 1 ? "it" : "them"}.`,
     otherItems: (n) =>
-      `I also have ${n} other item${n === 1 ? "" : "s"} you might like — reply *show more* to see ${n === 1 ? "it" : "them"}.`,
+      `I also have ${n} other item${n === 1 ? "" : "s"} that ${n === 1 ? "isn't" : "aren't"} exactly what you asked for but could still be a good fit — reply *show more* to see ${n === 1 ? "it" : "them"}.`,
     productGone:
       "Sorry, that product is no longer available. Tell me what you're looking for and I'll find something similar.",
     pickedFood: (name, mins) =>
@@ -64,7 +65,7 @@ const STRINGS = {
     moreItems: (n) =>
       `I still get ${n} more item${n === 1 ? "" : "s"} — reply *show more* make you see ${n === 1 ? "am" : "them"}.`,
     otherItems: (n) =>
-      `I still get ${n} other item${n === 1 ? "" : "s"} wey fit catch your eye — reply *show more* make you see ${n === 1 ? "am" : "them"}.`,
+      `I get ${n} other item${n === 1 ? "" : "s"} wey no be exactly wetin you ask for, but e fit still work for you — reply *show more* make you see ${n === 1 ? "am" : "them"}.`,
     productGone:
       "Sorry o, that product don finish. Tell me wetin you dey find make I show you something wey resemble am.",
     pickedFood: (name, mins) =>
@@ -88,6 +89,64 @@ async function tr(language, pick) {
   const table = STRINGS[language];
   if (table) return pick(table);
   return openaiService.translateUiString(pick(STRINGS.english), language);
+}
+
+// Internal grounding markers we write into the conversation history — e.g.
+// "[Sent product cards: ...]" — must NEVER reach the customer. The classifier
+// and the response model both replay history verbatim, and they sometimes parrot
+// the marker back into their reply (often truncated, like "[Sent product cards:").
+// Strip any such fragment — closed or not — from every customer-facing message.
+function stripInternalMarkers(text) {
+  if (typeof text !== "string") return text;
+  return text
+    .replace(/\[Sent product cards\b[^\]]*\]?/gi, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// The payment URL is money-critical and must reach the customer byte-for-byte.
+// The reply model is NOT trusted to render it: it tends to "fix" URLs it deems
+// odd (e.g. rewriting a localhost velte link to some other domain) or hallucinate
+// one. So the model only leaves a {{PAYMENT_LINK}} placeholder; here we swap in
+// the real link, overwrite any URL it invented anyway, and guarantee it's present.
+function enforcePaymentLink(text, link) {
+  if (!link) return text;
+  let out = String(text ?? "").replace(/\{\{\s*PAYMENT_LINK\s*\}\}/gi, link);
+  // Replace any other URL the model emitted (a rewrite/hallucination) with ours.
+  const urls = out.match(/\bhttps?:\/\/\S+/gi) || [];
+  for (const u of urls) {
+    if (u !== link) out = out.split(u).join(link);
+  }
+  if (!out.includes(link)) out = `${out.trim()}\n\n${link}`;
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// AI-written, code-guarded "N more items — *show more*" line. The count and the
+// decision to show it at all come from code (grounding); the model only phrases
+// it. The result is accepted ONLY if it contains the exact count AND a "show
+// more" cue — otherwise (or on failure) we fall back to the fixed template, so
+// the offer can never carry a wrong count or be dropped.
+async function composeMoreItemsHint({ count, asSuggestions, language, business }) {
+  const template = await tr(language, (s) =>
+    asSuggestions ? s.otherItems(count) : s.moreItems(count),
+  );
+
+  try {
+    const note = await openaiService.generateMoreItemsNote({
+      count,
+      asSuggestions,
+      language,
+      business,
+    });
+    if (note && note.includes(String(count)) && /show more/i.test(note)) {
+      return note;
+    }
+  } catch {
+    // fall through to the guaranteed-correct template
+  }
+
+  return template;
 }
 
 function buildConversationHistory(
@@ -172,6 +231,155 @@ function resolveSelectedModifiers(product, selectedNames = []) {
   return { selections, missingRequired, extraTotal };
 }
 
+// A perfect order needs more than the product: a chosen size/colour when the
+// product lists them, every required food modifier, and the buyer's name, email
+// and delivery location. The next three helpers gather those across turns, work
+// out what's still missing, and only place the order once nothing is.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Resolve a customer-typed value to the product's canonical option (case-
+// insensitive). Returns null when the value isn't one of the real options, so a
+// typo or a not-offered choice is treated as "still needs a valid pick".
+function resolveOption(value, options = []) {
+  if (!value) return null;
+  const v = String(value).toLowerCase().trim();
+  return options.find((o) => String(o).toLowerCase().trim() === v) || null;
+}
+
+// Merge the details supplied this turn with everything gathered on earlier turns
+// so checkout info accumulates instead of resetting when the customer answers
+// one question at a time. New non-null values win; prior values are kept.
+function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
+  const modifiers = Array.isArray(data.selectedModifiers)
+    ? data.selectedModifiers.filter(Boolean)
+    : [];
+  return {
+    productName: resolvedProductName || prior.productName || null,
+    email: data.email || prior.email || null,
+    customerName: data.customerName || prior.customerName || null,
+    location: data.location || prior.location || null,
+    selectedSize: data.selectedSize || prior.selectedSize || null,
+    selectedColor: data.selectedColor || prior.selectedColor || null,
+    selectedModifiers: modifiers.length ? modifiers : prior.selectedModifiers || [],
+    // A price agreed via negotiation overrides the list price; carried across
+    // turns so a checkout completed later still closes at the agreed number.
+    negotiatedPrice: prior.negotiatedPrice ?? null,
+  };
+}
+
+// Everything still required before this product can become an order. `missing`
+// is empty when the checkout is complete; otherwise each entry names a field the
+// reply must ask for (size/color/modifiers carry their valid options).
+function computeCheckoutGaps(product, checkout) {
+  const attrs = product.attributes || {};
+  const missing = [];
+
+  let size = null;
+  if (attrs.sizes?.length) {
+    size = resolveOption(checkout.selectedSize, attrs.sizes);
+    if (!size) missing.push({ field: "size", options: attrs.sizes });
+  }
+
+  let color = null;
+  if (attrs.colors?.length) {
+    color = resolveOption(checkout.selectedColor, attrs.colors);
+    if (!color) missing.push({ field: "color", options: attrs.colors });
+  }
+
+  const modifierCheck = resolveSelectedModifiers(product, checkout.selectedModifiers);
+  if (modifierCheck.missingRequired.length > 0) {
+    missing.push({
+      field: "modifiers",
+      groups: modifierCheck.missingRequired.map((group) => ({
+        name: group.name,
+        multiSelect: group.multiSelect,
+        options: group.options.map((o) => ({
+          name: o.name,
+          additionalPrice: o.additionalPrice,
+        })),
+      })),
+    });
+  }
+
+  if (!checkout.customerName) missing.push({ field: "name" });
+  if (!checkout.email || !EMAIL_RE.test(checkout.email)) missing.push({ field: "email" });
+  if (!checkout.location) missing.push({ field: "location" });
+
+  return {
+    missing,
+    selections: modifierCheck.selections,
+    extraTotal: modifierCheck.extraTotal,
+    size,
+    color,
+  };
+}
+
+/**
+ * The single gate every checkout passes through. Accumulates the buyer details,
+ * and EITHER returns a `needsInfo` result (so the reply asks for exactly what's
+ * left, and the gathered details persist to the session for the next turn) OR,
+ * when nothing is missing, places the order via runCheckout and clears the
+ * gathered state. `negotiatedPrice` (when set) is the agreed unit price that
+ * overrides the list price.
+ */
+async function gatherCheckoutOrAsk({
+  businessId,
+  customerNumber,
+  product,
+  data = {},
+  negotiatedPrice = null,
+}) {
+  const prior = getSession(businessId, customerNumber).checkout || {};
+  const checkout = mergeCheckout(prior, data, product.name);
+  if (negotiatedPrice != null) checkout.negotiatedPrice = negotiatedPrice;
+
+  const gaps = computeCheckoutGaps(product, checkout);
+  const baseAmount = checkout.negotiatedPrice ?? product.price;
+  const amount = baseAmount + gaps.extraTotal;
+  const negotiated = checkout.negotiatedPrice != null;
+
+  if (gaps.missing.length > 0) {
+    // Keep this product in focus and remember what we've gathered so far.
+    setLastProduct(businessId, customerNumber, product);
+    const s = getSession(businessId, customerNumber);
+    setSession(businessId, customerNumber, { ...s, checkout });
+    return {
+      needsInfo: true,
+      product: product.name,
+      price: amount,
+      negotiated,
+      missing: gaps.missing,
+      collected: {
+        size: checkout.selectedSize || null,
+        color: checkout.selectedColor || null,
+        name: checkout.customerName || null,
+        email: checkout.email || null,
+        location: checkout.location || null,
+      },
+    };
+  }
+
+  const result = await runCheckout({
+    businessId,
+    customerNumber,
+    product,
+    amount,
+    email: checkout.email,
+    customerName: checkout.customerName,
+    location: checkout.location,
+    selectedSize: gaps.size,
+    selectedColor: gaps.color,
+    selectedModifiers: gaps.selections,
+  });
+
+  // Order placed — clear the gathered checkout (and any finished negotiation) so
+  // the next purchase starts clean.
+  clearNegotiation(businessId, customerNumber);
+  const s = getSession(businessId, customerNumber);
+  setSession(businessId, customerNumber, { ...s, checkout: null });
+  return { ...result, negotiated };
+}
+
 /**
  * Checkout handoff. Single source of truth for turning an agreed price into a
  * payment link + invoice. Both the buy flow and an accepted negotiation call
@@ -183,6 +391,8 @@ async function runCheckout({
   product,
   amount,
   email,
+  customerName,
+  location,
   selectedSize,
   selectedColor,
   selectedModifiers = [],
@@ -199,6 +409,7 @@ async function runCheckout({
     customerNumber,
     itemLabel,
     amount,
+    { customerName, customerEmail: email, location },
   );
 
   // Arm an abandoned-checkout follow-up. If the customer pays (payment webhook)
@@ -220,6 +431,8 @@ async function runCheckout({
     product,
     orderId,
     amount,
+    customerName,
+    location,
   });
 
   return {
@@ -227,6 +440,9 @@ async function runCheckout({
     orderId,
     product: product.name,
     price: amount,
+    customerName: customerName || null,
+    location: location || null,
+    email: email || null,
     selectedSize: selectedSize || null,
     selectedColor: selectedColor || null,
     selectedModifiers: selectedModifiers.map((m) => ({
@@ -369,7 +585,7 @@ async function extractUserMessage(message, accessToken, business) {
 
       const audioData = await whatsapp.downloadMedia(mediaId, accessToken);
 
-      const transcription = await openaiService.transcribeAudio(audioData);
+      const transcription = await openaiService.transcribeAudio(audioData, business);
 
       if (!transcription) {
         throw new Error("Empty transcription");
@@ -694,7 +910,6 @@ async function executeAction({
     }
 
     case "generate_payment_link": {
-      const { email, selectedSize, selectedColor, selectedModifiers } = action.data;
       const resolvedProductName = getResolvedProductName(action.data, session);
 
       const product = resolvedProductName
@@ -708,37 +923,14 @@ async function executeAction({
         break;
       }
 
-      // Modifier check — every required group needs a chosen option before we
-      // can take payment; selected options add their cost to the price.
-      const modifierCheck = resolveSelectedModifiers(product, selectedModifiers);
-
-      if (modifierCheck.missingRequired.length > 0) {
-        setLastProduct(businessId, customerNumber, product);
-        actionResult = {
-          needsModifiers: true,
-          product: product.name,
-          basePrice: product.price,
-          missingGroups: modifierCheck.missingRequired.map((group) => ({
-            name: group.name,
-            multiSelect: group.multiSelect,
-            options: group.options.map((o) => ({
-              name: o.name,
-              additionalPrice: o.additionalPrice,
-            })),
-          })),
-        };
-        break;
-      }
-
-      actionResult = await runCheckout({
+      // Gather size/colour, required modifiers, name, email and location —
+      // asking for whatever's still missing — and only place the order once the
+      // checkout is complete.
+      actionResult = await gatherCheckoutOrAsk({
         businessId,
         customerNumber,
         product,
-        amount: product.price + modifierCheck.extraTotal,
-        email,
-        selectedSize,
-        selectedColor,
-        selectedModifiers: modifierCheck.selections,
+        data: action.data,
       });
 
       break;
@@ -949,12 +1141,22 @@ async function executeAction({
         product.price;
       agreedPrice = Math.min(Math.max(agreedPrice, floor), product.price);
 
-      const checkout = await runCheckout({
+      // Same checkout gate as a direct buy, but at the agreed (negotiated) price.
+      // If buyer details are still missing this returns needsInfo and we keep the
+      // negotiation alive; once everything's in, the order is placed.
+      const checkout = await gatherCheckoutOrAsk({
         businessId,
         customerNumber,
         product,
-        amount: agreedPrice,
+        data: action.data,
+        negotiatedPrice: agreedPrice,
       });
+
+      if (checkout.needsInfo) {
+        actionResult = checkout;
+        break;
+      }
+
       clearNegotiation(businessId, customerNumber);
 
       actionResult = {
@@ -1251,14 +1453,17 @@ export async function handleIncomingMessage(req, res) {
     let greeting = null;
 
     if (isFirstVisit) {
+      // A configured greeting is shown verbatim; an AI-generated one bridges into
+      // whatever the customer just asked for so it isn't a disconnected line.
       greeting =
         business.aiConfig?.greetingMessage?.trim() ||
-        (await openaiService.generateGreeting("first_visit", business, session.language));
+        (await openaiService.generateGreeting("first_visit", business, session.language, userMessage));
     } else if (isReturningAfterAbsence) {
       greeting = await openaiService.generateGreeting(
         "welcome_back",
         business,
         session.language,
+        userMessage,
       );
     }
 
@@ -1313,7 +1518,7 @@ export async function handleIncomingMessage(req, res) {
       `[${business.name}] Normalized action: ${action.type} (language: ${language})`,
     );
 
-    let responseText = aiOutput.response;
+    let responseText = stripInternalMarkers(aiOutput.response);
 
     if (action.type !== "none") {
       const { actionResult, productsToShow, asPickableCards } = await executeAction({
@@ -1326,17 +1531,20 @@ export async function handleIncomingMessage(req, res) {
 
       const freshSession = getSession(businessId, customerNumber);
 
-      // The "show more" hint is written in code, never by the model — it must
-      // only ever appear when items genuinely remain. When everything left is
-      // a lower-tier match, frame it as suggestions instead of more results.
+      // The "show more" hint is AI-written but code-guarded: code decides the
+      // exact count and whether to show it at all (it must only ever appear when
+      // items genuinely remain), the model only phrases it naturally, and a bad
+      // generation falls back to the fixed template. When everything left is a
+      // lower-tier match, it's framed as suggestions instead of more results.
       const remainingCount = actionResult?.remainingCount;
       const moreItemsHint =
         typeof remainingCount === "number" && remainingCount > 0
-          ? await tr(language, (s) =>
-              actionResult?.remainingAreSuggestions
-                ? s.otherItems(remainingCount)
-                : s.moreItems(remainingCount),
-            )
+          ? await composeMoreItemsHint({
+              count: remainingCount,
+              asSuggestions: !!actionResult?.remainingAreSuggestions,
+              language,
+              business,
+            })
           : null;
 
       const sendingCards = asPickableCards && productsToShow.length > 0;
@@ -1356,7 +1564,7 @@ export async function handleIncomingMessage(req, res) {
             actionResult,
             business,
           );
-          introText = composed.response;
+          introText = stripInternalMarkers(composed.response);
         }
 
         const localizedCards = await localizeProductsForLanguage(
@@ -1392,7 +1600,12 @@ export async function handleIncomingMessage(req, res) {
             business,
           );
 
-        responseText = finalAiOutput.response;
+        responseText = stripInternalMarkers(finalAiOutput.response);
+
+        // Force the exact payment URL in (the model isn't trusted to render it).
+        if (actionResult?.paymentLink) {
+          responseText = enforcePaymentLink(responseText, actionResult.paymentLink);
+        }
 
         if (moreItemsHint) {
           responseText += `\n\n${moreItemsHint}`;

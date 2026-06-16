@@ -22,6 +22,11 @@ const StafflyOrderSchema = new mongoose.Schema(
     product: { type: String },
     amount: { type: Number },
     status: { type: String, default: 'pending' }, // pending | paid | failed
+    // Buyer details gathered during the WhatsApp checkout, used to fulfil the
+    // order (name on the order, receipt email, delivery location).
+    customerName: { type: String, default: null },
+    customerEmail: { type: String, default: null },
+    location: { type: String, default: null },
   },
   { collection: 'staffly_orders', timestamps: true },
 );

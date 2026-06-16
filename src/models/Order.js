@@ -21,6 +21,9 @@ const toOrder = (doc) =>
         product: doc.product,
         amount: doc.amount,
         status: doc.status,
+        customerName: doc.customerName || null,
+        customerEmail: doc.customerEmail || null,
+        location: doc.location || null,
         createdAt: doc.createdAt,
       }
     : null;
@@ -31,6 +34,9 @@ export const createOrder = async ({
   product,
   amount,
   status = 'pending',
+  customerName = null,
+  customerEmail = null,
+  location = null,
 }) => {
   // Random suffix so two links generated in the same millisecond can't collide.
   const orderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -41,6 +47,9 @@ export const createOrder = async ({
     product,
     amount,
     status,
+    customerName,
+    customerEmail,
+    location,
   });
   return toOrder(doc);
 };

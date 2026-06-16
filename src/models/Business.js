@@ -62,6 +62,23 @@ export const getBusinessByPhoneNumberId = (phoneNumberId) => {
 
 export const getBusinessById = (id) => businesses.get(id) || null;
 
+/**
+ * Reverse lookup used by the product change stream: a changed product carries
+ * its `vendorId` (the Velte user id), and we need the Staffly business it maps
+ * to so we can invalidate that business's product cache. `velteUserId` is stored
+ * as a string; compare stringified to be safe against ObjectId inputs.
+ */
+export const getBusinessByVelteUserId = (velteUserId) => {
+  if (!velteUserId) return null;
+  const target = String(velteUserId);
+  for (const business of businesses.values()) {
+    if (business.velteUserId && String(business.velteUserId) === target) {
+      return business;
+    }
+  }
+  return null;
+};
+
 export const getAllBusinesses = () => Array.from(businesses.values());
 
 // ─── Token management ─────────────────────────────────────────────────────────

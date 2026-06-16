@@ -9,7 +9,7 @@
 import { openai } from "../config/openai.js";
 import { anthropic } from "../config/anthropic.js";
 import { logger } from "../utils/logger.js";
-import { buildProductContext } from "../services/product.service.js";
+import { buildProductContext, getCatalogSummary, getCatalogVocabulary } from "../services/product.service.js";
 import fs from 'fs';
 import { promisify } from 'util';
 import { toFile } from "openai/uploads";
@@ -31,24 +31,34 @@ const VALID_ACTION_TYPES = new Set([
   'list_categories',
 ]);
 
+// Each rule collapses a BARE, generic browse to a canonical broad query the
+// semantic ranker handles well. `broad` lists ONLY the words that genuinely mean
+// "just this broad type" — synonyms and plain plurals. Narrower SUBTYPES
+// (handbag, sneaker, tote, purse) are deliberately excluded: a shopper asking
+// for "handbags" or "sneakers" wants that specific kind, not the whole category,
+// so those queries pass through untouched for the ranker to judge.
 const BROAD_SEARCH_KEYWORDS = [
-  { terms: ["fashion", "style", "apparel", "outfit"], query: "fashion" },
-  { terms: ["clothes", "clothing", "wear"], query: "clothes" },
-  {
-    terms: ["shoe", "shoes", "sneaker", "sneakers", "footwear"],
-    query: "shoes",
-  },
-  { terms: ["bag", "bags", "tote", "handbag", "purse"], query: "bags" },
-  {
-    terms: ["shirt", "shirts", "tshirt", "t-shirt", "tee", "top"],
-    query: "shirt",
-  },
-  { terms: ["jacket", "jackets", "coat", "denim"], query: "jacket" },
-  {
-    terms: ["ladies", "lady", "female", "women", "woman", "girl", "girls"],
-    query: "female fashion",
-  },
-  { terms: ["men", "male", "man", "boys", "boy"], query: "male fashion" },
+  { broad: ["fashion", "style", "apparel", "outfit"], query: "fashion" },
+  { broad: ["clothes", "clothing", "wear"], query: "clothes" },
+  { broad: ["shoe", "shoes", "footwear"], query: "shoes" },
+  { broad: ["bag", "bags"], query: "bags" },
+  { broad: ["shirt", "shirts", "tshirt", "t-shirt", "tee"], query: "shirt" },
+  { broad: ["jacket", "jackets", "coat"], query: "jacket" },
+];
+
+// Audience/recipient words. These are a RECIPIENT CONSTRAINT, not a product
+// category — handled separately (see reframeAudienceQuery) because the
+// classifier often pairs them with a type word ("ladies fashion", "shoes for
+// men"), which the bare-type rules above can't catch. Whenever an audience word
+// appears anywhere in the query, we rewrite it as "<type> for <audience>" (or
+// just "for <audience>" if no type was named) so the ranker reads the audience
+// as a narrowing constraint and judges fit — instead of reading "ladies
+// fashion" as a department name and showing the whole catalog. Product-neutral:
+// works for fashion, food, electronics, anything.
+const AUDIENCE_TERMS = [
+  { terms: ["women", "woman", "ladies", "lady", "female", "females", "girl", "girls", "womens"], label: "women" },
+  { terms: ["men", "man", "male", "males", "boys", "boy", "mens", "gentlemen"], label: "men" },
+  { terms: ["kids", "kid", "children", "child", "baby", "babies", "toddler", "toddlers", "infant"], label: "kids" },
 ];
 
 
@@ -92,6 +102,23 @@ function toCleanString(value) {
 function toNullableString(value) {
   const cleaned = toCleanString(value);
   return cleaned || null;
+}
+
+// The buyer/order details any checkout action may carry. Shared by
+// generate_payment_link, accept_offer, and make_offer so a customer can supply
+// them at any point (e.g. alongside an offer, or in a later reply) and the
+// controller accumulates them until the order has everything it needs.
+function extractCheckoutData(data = {}) {
+  return {
+    email: toNullableString(data.email),
+    customerName: toNullableString(data.customerName),
+    location: toNullableString(data.location),
+    selectedSize: toNullableString(data.selectedSize),
+    selectedColor: toNullableString(data.selectedColor),
+    selectedModifiers: Array.isArray(data.selectedModifiers)
+      ? data.selectedModifiers.map((m) => toNullableString(m)).filter(Boolean)
+      : [],
+  };
 }
 
 // Languages flow through the system as free-form lowercase names (english,
@@ -210,15 +237,79 @@ function buildContextString(session) {
   return contextStr || "No current context.";
 }
 
-function normalizeBroadSearchQuery(rawQuery) {
+// Filler words that never narrow a search — mirror the product-search stopwords
+// so "do you have any nice products for ladies?" still reduces to the bare
+// browse word "ladies". Includes generic nouns ("product", "something") that add
+// no product type of their own, so a gender/type word left beside them still
+// counts as a bare browse.
+const BROAD_QUERY_FILLER = new Set([
+  "i", "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "is", "it",
+  "my", "me", "you", "your", "we", "our", "for", "with", "this", "that", "these",
+  "do", "does", "have", "has", "there", "some", "any", "please", "pls", "want",
+  "need", "buy", "get", "purchase", "order", "find", "show", "see", "looking",
+  "look", "search", "available", "sell", "nice", "fine", "good", "great", "best",
+  "quality", "original", "cheap", "affordable", "new",
+  "product", "products", "item", "items", "something", "anything", "stuff",
+  "thing", "things", "one", "ones",
+  "wan", "wetin", "abeg", "make", "una", "dey", "na", "am", "sef", "go", "fit",
+]);
+
+// Collapse a query to a canonical broad term ONLY when it is a bare product
+// type with no narrowing qualifier — so "shoes" / "do you have bags?" become a
+// broad browse, but "corporate shoes", "shoes for a wedding", or "handbags"
+// keep their full text. Flattening those (the old behaviour: any query merely
+// CONTAINING a type word was replaced by the bare type) discarded the occasion /
+// subtype the classifier was told to preserve, leaving the semantic ranker
+// nothing to judge fit by — so partial matches surfaced as strong cards.
+// If the query names an audience (women/men/kids) anywhere, rewrite it as
+// "<type> for <audience>" so the ranker reads the audience as a recipient
+// CONSTRAINT, not a category. "ladies fashion" → "fashion for women";
+// "ladies" → "for women"; "shoes for men" → "shoes for men". Returns null when
+// no audience word is present (caller falls through to normal handling).
+export function reframeAudienceQuery(query) {
+  const tokens = query.split(" ").filter(Boolean);
+  let audience = null;
+  const rest = [];
+  for (const token of tokens) {
+    if (token.length <= 1) continue; // drop possessive "s" left by punctuation stripping
+    const match = AUDIENCE_TERMS.find((a) => a.terms.includes(token));
+    if (match) {
+      if (!audience) audience = match.label; // first audience wins; extra audience words dropped
+      continue;
+    }
+    rest.push(token);
+  }
+  if (!audience) return null;
+
+  // Whatever product type is left, minus filler, becomes "<type> for <audience>".
+  const typeWords = rest.filter((word) => !BROAD_QUERY_FILLER.has(word));
+  return typeWords.length ? `${typeWords.join(" ")} for ${audience}` : `for ${audience}`;
+}
+
+export function normalizeBroadSearchQuery(rawQuery) {
   if (rawQuery?.trim() === '*') return '*';
 
   const query = normalizeText(rawQuery);
   if (!query) return "";
 
+  // Audience reframing first — it must win over bare-type collapse so
+  // "ladies fashion" becomes "fashion for women", not "fashion".
+  const reframed = reframeAudienceQuery(query);
+  if (reframed) return reframed;
+
+  const contentWords = query
+    .split(" ")
+    .filter((word) => word && !BROAD_QUERY_FILLER.has(word));
+
   for (const rule of BROAD_SEARCH_KEYWORDS) {
-    const hasMatch = rule.terms.some((term) => query.includes(term));
-    if (hasMatch) {
+    // Bare browse only: every remaining word is a generic/synonym word for this
+    // broad type (e.g. "shoes", "ladies", "women"). A subtype ("handbags",
+    // "sneakers") or a qualified query ("corporate shoes", "shoes for a
+    // wedding") fails this and passes through unchanged for the ranker to judge.
+    const isBareType =
+      contentWords.length > 0 &&
+      contentWords.every((word) => rule.broad.includes(word));
+    if (isBareType) {
       return rule.query;
     }
   }
@@ -231,7 +322,12 @@ function normalizeActionData(type, rawData = {}, session = {}) {
 
   switch (type) {
     case "search_products": {
-      let query = normalizeBroadSearchQuery(toCleanString(data.query));
+      const rawQuery = toCleanString(data.query);
+      let query = normalizeBroadSearchQuery(rawQuery);
+      // Diagnostic: classifier's raw query vs what we search on. If the classifier
+      // returned "*" or dropped the qualifier (e.g. "ladies" → "products"), the
+      // issue is upstream of search; if normalization changed intent, it's here.
+      logger.info(`[Query] classifier="${rawQuery}" → search="${query}"`);
 
       // Budget shorthand ("under 15k", "I get 20k") scales like price offers.
       const referencePrice = session.lastProduct?.price || null;
@@ -281,11 +377,16 @@ function normalizeActionData(type, rawData = {}, session = {}) {
     case "make_offer":
       return {
         offer: parsePossibleNumber(data.offer),
+        // Buyer may volunteer order details in the same breath as an offer.
+        ...extractCheckoutData(data),
       };
 
     case "accept_offer":
       return {
         finalPrice: parsePossibleNumber(data.finalPrice),
+        // An acceptance often carries the buyer details too ("ok deal, I'm
+        // John, john@x.com, deliver to 12 Allen Ave") — keep them for checkout.
+        ...extractCheckoutData(data),
       };
 
     case "find_similar_negotiable":
@@ -310,14 +411,7 @@ function normalizeActionData(type, rawData = {}, session = {}) {
           toNullableString(data.productName) ||
           session.lastProduct?.name ||
           null,
-        email: toNullableString(data.email),
-        selectedSize: toNullableString(data.selectedSize),
-        selectedColor: toNullableString(data.selectedColor),
-        selectedModifiers: Array.isArray(data.selectedModifiers)
-          ? data.selectedModifiers
-              .map((m) => toNullableString(m))
-              .filter(Boolean)
-          : [],
+        ...extractCheckoutData(data),
       };
 
     case "show_more_products":
@@ -349,18 +443,14 @@ export function normalizeAiOutput(aiOutput, session = {}) {
 
   const detected = normalizeLanguageName(aiOutput.language);
 
-  // Language preference is sticky and asymmetric, so it can't fluctuate.
-  // English is the unmarked default; any other language, once the customer
-  // clearly writes in it, becomes their established preference for the rest of
-  // the chat. Customers drop in English words, numbers, or a quick "ok" all the
-  // time — that is NOT a switch — so a plain-English/blank turn never pulls them
-  // back out of their language. A different concrete language DOES switch them.
-  const language =
-    detected && detected !== "english"
-      ? detected
-      : sessionLanguage !== "english"
-        ? sessionLanguage
-        : detected || "english";
+  // Per-message language: reply in the language of the CURRENT message. The
+  // model returns the language it detected for this turn — and is instructed to
+  // echo the previous preference ONLY when the message is too neutral to tell
+  // (a bare "ok"/"yes", a number, an emoji). So we trust that detection directly
+  // and never force the reply back to a stale language: write English when they
+  // wrote English, Pidgin when they wrote Pidgin. Fall back to the session
+  // language only if the model returned nothing, then to english.
+  const language = detected || sessionLanguage || "english";
 
   const response =
     typeof aiOutput.response === "string" && aiOutput.response.trim()
@@ -420,8 +510,32 @@ export function normalizeAiOutput(aiOutput, session = {}) {
   };
 }
 
-function buildActionDecisionSystem(business, session) {
+// Render the catalog summary into a single grounding line for the classifier.
+// Counts let the model route confidently ("any bags?" → search, never "we have
+// none"), but it must still fetch real items via a product action — so the line
+// is explicit that the summary is NOT a source of product/price/stock truth.
+function buildCatalogSnapshot(catalogSummary) {
+  if (!catalogSummary || !catalogSummary.totalAvailable) {
+    return "Store catalog: no products are in stock right now.";
+  }
+
+  const MAX_CATEGORIES = 30;
+  const shown = catalogSummary.categories.slice(0, MAX_CATEGORIES);
+  const list = shown.map((c) => `${c.name} (${c.count})`).join(", ");
+  const hiddenCount = catalogSummary.categories.length - shown.length;
+  const more = hiddenCount > 0 ? `, +${hiddenCount} more categories` : "";
+
+  return (
+    `Store catalog — categories in stock now, with item counts: ${list}${more}. ` +
+    `Total available items: ${catalogSummary.totalAvailable}. ` +
+    `Use this ONLY to route correctly (e.g. don't tell a customer the store is empty when a relevant category exists — search instead). ` +
+    `NEVER quote a specific product, price, size, or stock from this summary; always confirm those through a product action.`
+  );
+}
+
+function buildActionDecisionSystem(business, session, catalogSummary = null) {
   const contextStr = buildContextString(session);
+  const catalogSnapshot = buildCatalogSnapshot(catalogSummary);
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
 
@@ -435,9 +549,11 @@ Return ONLY a JSON object: { "response": short reply to the customer, "language"
 Allowed action.type (choose exactly one, never invent one): none, search_products, show_more_products, check_attribute, start_negotiation, make_offer, accept_offer, find_similar_negotiable, send_product_image, generate_payment_link, list_categories.
 
 LANGUAGE:
-- Set "language" to the language the customer is writing in, as a lowercase English name (e.g. english, pidgin, yoruba, hausa, igbo, french). Use "pidgin" for Nigerian Pidgin.
-- The established preference is in "Current context" and is STICKY: english is the default, but once the customer clearly writes in another language, stay in it. Mixed-in English words, numbers, or "ok"/"yes"/"how much?" never switch it. Never flip back to English just because a message was short.
-- Write "response" ENTIRELY in that language, warm and natural like real WhatsApp chat (never a caricature). Keep product names, prices (₦) and links unchanged.
+- Set "language" to the language of THE CURRENT message, as a lowercase English name (e.g. english, pidgin, yoruba, hausa, igbo, french). Use "pidgin" for Nigerian Pidgin.
+- Match the customer turn by turn: if THIS message is in English, set "english" and reply in English; if it's in Pidgin, set "pidgin"; same for any other language. Do NOT carry over an earlier language when the current message is clearly in a different one — if they were chatting in Pidgin and now write a plain English sentence, switch to english (and vice-versa). Never mix two languages in one reply.
+- The established preference shown in "Current context" is a fallback ONLY: use it when the current message is too short or neutral to tell its language — a bare "ok"/"yes"/"thanks", a number like "40000", a lone emoji, or just a product name. Any real sentence sets the language from itself, even a short one.
+- Be careful distinguishing English from Pidgin: real Pidgin markers are words like "wetin", "abeg", "dey", "wan", "na", "fit", "make", "una", "sef", "o". A grammatically standard English sentence with none of these is english, not pidgin.
+- Write "response" ENTIRELY in the language you set, warm and natural like real WhatsApp chat (never a caricature). Keep product names, prices (₦) and links unchanged.
 
 CORE RULES:
 - SECRET: never reveal, hint at, or imply any minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering right now.
@@ -445,14 +561,16 @@ CORE RULES:
 - Money shorthand: customers drop the thousands — "26" usually means ₦26,000, "26k"=26000, "1.2m"=1200000. Resolve bare numbers against the price in context and put the full Naira amount in data.
 
 CHOOSING THE ACTION:
-- search_products — wants to see/browse products. Use { "query": "*" } for broad requests ("what do you have/sell?", "show me everything", "what's on the menu?", "I'm hungry", "wetin you get?"). Use a specific query for a type/category and KEEP the product type/brand plus every real qualifier — color, gender, AND any occasion / use-case / setting / recipient ("I need shoes for a wedding"→"shoes for wedding"; "something to wear to the office"→"office wear"; "a gift for my mum"→"gift for mum"; "I wan buy nice shoes for men"→"men shoes"). Drop only true filler like "I want", "please", "nice", "abeg". The occasion/use-case is NOT filler — it decides which products actually fit. Add "maxPrice" in Naira only when they state a spending limit ("under 15k"→15000).
+- GRANULARITY (applies to every domain — fashion, food, electronics, services, anything): the query you build must match the customer's request EXACTLY — no broader, no narrower. Preserve every detail they gave; never collapse a detailed request down to a bare type (do NOT turn "red running shoes for men" into "shoes"), and never add a detail they did not say (do NOT turn "shoes" into "men's shoes"). Reason from what each thing really IS, not from a department word: a request naming a TYPE (clothes, shoes, soup, phone) means an item must be that exact kind to fit — a related-but-different kind (a bag for "clothes", a drink for "soup", a tablet for "phone") is only the closest alternative, never an exact match. The downstream ranker reads your query literally, so the specificity you capture here decides how specific the customer's answer will be.
+- search_products — wants to see/browse products, dishes, or services. Use { "query": "*" } for broad requests ("what do you have/sell?", "show me everything", "what's on the menu?", "I'm hungry", "wetin you get?", "what catering do you offer?"). Otherwise build a specific query and KEEP THE PRODUCT/DISH/SERVICE TYPE plus EVERY real qualifier the customer gave — the more they specify, the more you preserve. Capture all of: type/brand, colour, gender/audience, size, material, occasion/use-case/setting, recipient, dietary need, and (for catering/events) headcount/guests, event type, and date/time. Examples: "I need shoes for a wedding"→"shoes for wedding"; "nice clothes for my woman"→"women clothes"; "a gift for my mum"→"gift for mum"; "vegan small chops for 50 guests on Saturday"→"vegan small chops for 50 guests saturday"; "drinks package for a birthday party"→"drinks package for birthday party". Drop only true filler ("I want", "please", "nice", "abeg", "how far"). Occasion, audience, headcount, and dietary needs are NOT filler — they decide which items actually fit. Add "maxPrice" in Naira only when they state a spending limit ("under 15k"→15000).
 - Cheaper/affordable/budget request while already browsing a category: KEEP that same category in "query" (reuse the last product's category / last search from context) and put any limit in "maxPrice". Never build the query from the budget word and never drift to an unrelated category. Only switch category when they name a different product type.
 - show_more_products — "show more", "see more", "next", "the rest".
 - check_attribute — asks about size/color/material/fit/stock/dimensions. data: { productName (null = last product), attributeKey, requestedValue (or null) }.
 - start_negotiation — asks for a discount/"last price"/reduction WITHOUT a number ("how much last?", "you fit reduce am?", "e too cost", "abeg do am for me").
 - make_offer — proposes a specific price, any phrasing: "I fit do 25k", "can you do 18000?", "make I run am 26", "20k last", "oya collect 22", "na 25 I get", "I no fit pass 25". Put the resolved amount in data.offer. NEVER stall, "check", "confirm" or "get back to them" — pricing is resolved instantly; the system gives you the counter/acceptance/final price to deliver.
 - accept_offer — clearly agrees to the price YOU last offered ("ok", "deal", "I'll take it").
-- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), email, selectedSize, selectedColor, selectedModifiers:[] }. For food with modifier groups, pass the chosen option names; if a required group is unchosen, still use this action — the system says what's missing.
+- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), email, customerName, location, selectedSize, selectedColor, selectedModifiers:[] }. To place an order the system needs the buyer's name, email, and delivery location, plus a chosen size/colour when the product lists them and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; selectedSize; selectedColor; selectedModifiers = chosen option names). Do NOT invent or guess any of these — leave a field null if they haven't said it; the system replies asking for exactly what's still missing. Always use this action for buy/checkout intent even when details are incomplete.
+- CHECKOUT FOLLOW-UP: once you've asked the customer for order details (name, email, delivery location, size, colour, or a modifier choice), treat their next message that supplies any of those as continuing the SAME purchase → action generate_payment_link, with productName = the item being bought (from context) and every detail they just gave mapped into data. A bare reply like "John Doe, john@example.com, 12 Allen Avenue Ikeja" is name + email + location for the pending order — parse each part into customerName, email, and location. Never restart a search or answer "none" when the customer is clearly answering your checkout questions.
 - send_product_image — wants to SEE a product (picture/photo/"what does it look like?"). The ONLY way to send a photo.
 - find_similar_negotiable — agrees to see similar items they can bargain on, or asks for them directly.
 - list_categories — explicitly asks for category/department names.
@@ -472,6 +590,7 @@ Current context is provided below.`;
       text:
         `Business: "${business.name}".${toneInstruction}\n` +
         `The customer's established language preference for THIS conversation is: ${session.language || "english"}.\n\n` +
+        `${catalogSnapshot}\n\n` +
         `Current context:\n${contextStr}`,
     },
   ];
@@ -520,8 +639,15 @@ Guidelines:
   - Never confirm a size/color/variant that is not in the result.
 - For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
   - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
-- For payment links: confirm the product, selected options, and price, then share actionResult.paymentLink EXACTLY as given — a bare URL, never altered, shortened, wrapped in markdown, or invented. Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. If the result includes selectedModifiers, confirm those choices as part of the order (the price already includes their extra cost).
-- If the result has "needsModifiers": true, the order was NOT placed and no payment link exists yet. Ask the customer to choose from each group in missingGroups, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"). Do not invent options and do not share any link.
+- For payment links: the order is confirmed — present a short, friendly order summary, THEN the link. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). For the link itself, write the EXACT literal placeholder {{PAYMENT_LINK}} (those exact characters, double curly braces) on its own line where the link should appear — do NOT write, guess, copy, complete, or "fix" any actual URL yourself (the system substitutes the real payment link for that placeholder). Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. Only mention details that are actually present in the result; never invent any. (The price already includes any modifier extra cost.)
+- If the result has "needsInfo": true, the order is NOT placed yet and NO payment link exists — do not share or invent a link. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. Ask ONLY for the items listed in actionResult.missing, in ONE warm, natural message, and DON'T re-ask for anything in actionResult.collected (those are already provided — you may briefly acknowledge them). Map each missing entry by its "field":
+    - "size": ask which size they want and list the available ones from its "options".
+    - "color": ask which colour and list the available ones from its "options".
+    - "modifiers": for each group in "groups", ask them to choose, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"); never invent options.
+    - "name": ask for the name the order should be under.
+    - "email": ask for the email address for the order/receipt (if they gave one that looked wrong, say it didn't look valid and ask again).
+    - "location": ask for their delivery address/location.
+  Keep it friendly and conversational, not a stiff form. Once they reply with the details, the order is completed and the link is sent automatically.
 - For price negotiation (the action result has a "negotiation" object):
   - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
   - PRICES ONLY MOVE DOWN: never state a counter or final price HIGHER than any price you already offered this customer for this product earlier in the conversation. The price in the action result is the standing commitment — quote exactly that number, and never resurrect an older, higher number from the chat history.
@@ -574,6 +700,8 @@ const ACTION_DATA_PROPERTIES = {
   offer: nullable({ type: "number" }),
   finalPrice: nullable({ type: "number" }),
   email: nullable({ type: "string" }),
+  customerName: nullable({ type: "string" }),
+  location: nullable({ type: "string" }),
   selectedSize: nullable({ type: "string" }),
   selectedColor: nullable({ type: "string" }),
   selectedModifiers: nullable({ type: "array", items: { type: "string" } }),
@@ -643,17 +771,38 @@ export async function processMessage(userMessage, session = {}, business) {
     action: { type: "none", data: {} },
   };
 
+  // Catalog snapshot grounds the model's routing. It reads the 5-min-cached
+  // product list (no extra DB query); if it fails for any reason, classify
+  // without it rather than blocking the reply.
+  let catalogSummary = null;
+  try {
+    catalogSummary = await getCatalogSummary(business?.id);
+  } catch (error) {
+    logger.warn(`[Classifier] Catalog summary unavailable: ${error.message}`);
+  }
+
   try {
     const completion = await anthropic.messages.create({
       model: "claude-haiku-4-5",
       max_tokens: 1024,
       temperature: 0,
-      system: buildActionDecisionSystem(business, session),
+      system: buildActionDecisionSystem(business, session, catalogSummary),
       messages: toClaudeMessages(conversationHistory, userMessage),
       output_config: {
         format: { type: "json_schema", schema: ACTION_DECISION_SCHEMA },
       },
     });
+
+    // Cache health: with the static instruction prefix cached, `cacheRead`
+    // should dominate `input` after warmup (cached reads bill at ~0.1×). If
+    // `cacheRead` stays 0 across messages, a silent invalidator slipped into the
+    // cached block and you're paying full input rate every call. `cacheWrite`
+    // is the ~1.25× premium paid only when (re)warming the prefix.
+    const u = completion.usage || {};
+    logger.info(
+      `[Classifier usage] input=${u.input_tokens ?? 0} output=${u.output_tokens ?? 0} ` +
+        `cacheRead=${u.cache_read_input_tokens ?? 0} cacheWrite=${u.cache_creation_input_tokens ?? 0}`,
+    );
 
     const rawContent =
       (completion.content || [])
@@ -796,6 +945,50 @@ ${JSON.stringify(pending)}`;
   );
 }
 
+// ─── "More items" note (AI-written, code-guarded) ───────────────────────────────
+
+/**
+ * Compose the short "there are N more items — reply *show more*" line in the
+ * session language. GROUNDING stays in code: the caller decides the exact `count`
+ * and whether to show this at all (never the model) and then GUARDS the output —
+ * the line must contain `count` and a "show more" cue or it's discarded for a
+ * fixed template. This function only phrases those facts naturally; a bad
+ * generation can never invent a count or offer "show more" when nothing remains.
+ *
+ * `asSuggestions` true → frame the items as close-but-not-exact alternatives;
+ * false → frame them as more matches. Returns a string, or null on failure.
+ */
+export async function generateMoreItemsNote({ count, asSuggestions, language, business }) {
+  const lang = normalizeLanguageName(language) || "english";
+  const tone = business?.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Match this tone: ${tone}.` : "";
+  const framing = asSuggestions
+    ? `The ${count} item(s) are NOT an exact match for what the customer asked for, but could still be a good fit — be honest about that.`
+    : `There are ${count} more item(s) that match what the customer asked for.`;
+
+  const system =
+    `You write ONE short, warm WhatsApp line (max ~25 words) letting a customer know there are more products they can see.${toneInstruction} ` +
+    `Write it ENTIRELY in ${lang} — natural and conversational like real WhatsApp chat, never a caricature. ` +
+    `${framing} ` +
+    `You MUST include the exact number ${count}, and you MUST invite them to reply with the words *show more* (keep "show more" in English, wrapped in asterisks). ` +
+    `Reply with ONLY the line — no quotes, no preamble, no extra sentences.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.7, // a little variety so it doesn't read canned
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: `Compose the line. Number of other items: ${count}.` },
+      ],
+    });
+    return completion.choices?.[0]?.message?.content?.trim() || null;
+  } catch (error) {
+    logger.warn(`[MoreItemsNote] generation failed (template used): ${error.message}`);
+    return null;
+  }
+}
+
 // ─── UI string localization ────────────────────────────────────────────────────
 
 // Short, code-composed WhatsApp strings (show-more hints, error notices, the
@@ -836,7 +1029,34 @@ export async function translateUiString(text, language) {
 
 // ─── Audio helpers ────────────────────────────────────────────────────────────
 
-export async function transcribeAudio(audioData) {
+/**
+ * Build the transcription `prompt` — domain context that biases the speech model
+ * toward THIS store's real vocabulary so it spells product/dish/brand names and
+ * Naira amounts correctly instead of guessing ("jollof", not "jelly of"). Framed
+ * as "items this store sells" (not "what the customer said") to help recognition
+ * without making the model hallucinate those names when they aren't spoken. The
+ * multilingual note keeps it transcribing in the language actually spoken.
+ */
+async function buildTranscriptionPrompt(business) {
+  if (!business?.id) return null;
+  try {
+    const vocab = await getCatalogVocabulary(business.id);
+    const vocabStr = vocab.length
+      ? ` Items this store sells include: ${vocab.join(", ")}.`
+      : "";
+    return (
+      `A WhatsApp voice message from a customer to the Nigerian store "${business.name}". ` +
+      `The speaker may use English, Nigerian Pidgin, Yoruba, Hausa or Igbo — transcribe in the language actually spoken, do not translate. ` +
+      `Prices are in Naira.${vocabStr} ` +
+      `Transcribe product/brand names, places and amounts accurately, and capture every detail the speaker gives.`
+    );
+  } catch (error) {
+    logger.warn(`[Transcribe] vocabulary context unavailable: ${error.message}`);
+    return null;
+  }
+}
+
+export async function transcribeAudio(audioData, business = null) {
   const buffer = Buffer.isBuffer(audioData) ? audioData : audioData.buffer;
   const mimeType = Buffer.isBuffer(audioData)
     ? "audio/ogg"
@@ -848,10 +1068,24 @@ export async function transcribeAudio(audioData) {
     type: mimeType,
   });
 
+  // gpt-4o-transcribe (over whisper-1) for noticeably better accuracy on
+  // non-English and accented/noisy audio — notably Nigerian languages (Yoruba,
+  // Hausa, Igbo) and Pidgin. No `language` is passed on purpose: the model
+  // auto-detects the spoken language and transcribes IN that language (not
+  // translating to English), so the downstream per-message classifier can detect
+  // and reply in it. A `prompt` carrying the store's own vocabulary sharpens the
+  // hard words (product/brand/dish names, amounts). Returns `{ text }` as before.
+  const prompt = await buildTranscriptionPrompt(business);
+
   const transcription = await openai.audio.transcriptions.create({
     file,
-    model: "whisper-1",
+    model: "gpt-4o-transcribe",
+    ...(prompt ? { prompt } : {}),
   });
+
+  // Diagnostic: see exactly what was heard. If the transcript is wrong, the
+  // problem is here (audio/vocabulary), not in intent understanding downstream.
+  logger.info(`[Voice] transcribed: "${transcription.text}"`);
 
   return transcription.text;
 }
@@ -898,7 +1132,7 @@ function sanitizeGreeting(text) {
 const SHORT_MESSAGE_CONSTRAINTS =
   ' Write it as ONE short, friendly WhatsApp line (two at most). Do NOT address the customer by name or use any placeholder such as [Customer\'s Name] or [Name] — you do not know their name. Do NOT add a sign-off, signature, or team name (no "Warm regards", no "The Team"). No subject line, no letter formatting.';
 
-export async function generateGreeting(type, business, language = 'english') {
+export async function generateGreeting(type, business, language = 'english', userMessage = '') {
   const tone = business.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
   const languageInstruction = languageWritingInstruction(language);
@@ -916,10 +1150,19 @@ export async function generateGreeting(type, business, language = 'english') {
       : `Good ${timeOfDay}! Welcome back to ${business.name} 👋 How can I help you today?`;
 
   try {
+    // When the customer's opening message already asks for something, the
+    // greeting must NOT be a disconnected standalone line — it should warmly
+    // acknowledge what they asked for and bridge into it (the actual answer /
+    // product cards are sent right after, so the greeting must NOT itself answer
+    // or list products).
+    const bridge = userMessage
+      ? ` The customer's message also asks for something specific: "${userMessage}". In the SAME greeting, briefly acknowledge that request and say you're pulling it up for them — but do NOT answer it, name prices, or list any products here (that follows immediately after). Just make the greeting flow naturally into it.`
+      : '';
+
     const userPrompt =
       type === 'first_visit'
-        ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly. Plain text only, no JSON, no markdown.${formatConstraints}`
-        : `Write a short, warm "welcome back" message for a returning customer who was away for a while. It is currently ${timeOfDay} for them, so open with the matching time-of-day greeting (e.g. "Good ${timeOfDay}"). Make it feel personal and inviting. Plain text only, no JSON, no markdown.${formatConstraints}`;
+        ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly.${bridge} Plain text only, no JSON, no markdown.${formatConstraints}`
+        : `Write a short, warm "welcome back" message for a returning customer who was away for a while. It is currently ${timeOfDay} for them, so open with the matching time-of-day greeting (e.g. "Good ${timeOfDay}").${bridge || ' Make it feel personal and inviting.'} Plain text only, no JSON, no markdown.${formatConstraints}`;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -1009,14 +1252,4 @@ export async function generateVoiceErrorMessage(business, language = "english") 
 
     return fallback;
   }
-}
-
-export async function textToSpeech(text) {
-  const mp3 = await openai.audio.speech.create({
-    model: "tts-1",
-    voice: "nova",
-    input: text,
-  });
-
-  return Buffer.from(await mp3.arrayBuffer());
 }

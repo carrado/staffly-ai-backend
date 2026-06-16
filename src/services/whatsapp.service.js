@@ -57,25 +57,6 @@ export async function sendImageMessage(phoneNumberId, accessToken, to, imageUrl,
   );
 }
 
-export async function sendAudioMessage(phoneNumberId, accessToken, to, audioUrl) {
-  await axios.post(
-    `${GRAPH_URL}/${phoneNumberId}/messages`,
-    {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'audio',
-      audio: { link: audioUrl },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: SEND_TIMEOUT_MS,
-    }
-  );
-}
-
 // ─── Product card helpers ─────────────────────────────────────────────────────
 
 // WhatsApp image messages/headers only accept JPEG and PNG. A link to any
@@ -290,25 +271,49 @@ export async function sendProductCard(phoneNumberId, accessToken, to, product, f
 const INTERACTIVE_BODY_LIMIT = 1024;
 
 /**
- * Send one product as an interactive card: image header (when available),
- * full details as the body, and a "Pick this one" reply button whose id
- * encodes the product (`select_product:<id>`) so the webhook can resolve
- * the tap back to the exact product.
+ * Send one product as two bubbles:
+ *   1. The photo with the FULL details as its caption. WhatsApp shows an image
+ *      caption in full, whereas it collapses a long interactive `body` behind a
+ *      "Read more" — so putting the details in the caption keeps everything
+ *      visible without a tap.
+ *   2. A compact interactive "Pick this one" reply button whose id encodes the
+ *      product (`select_product:<id>`) so the webhook can resolve the tap back to
+ *      the exact product. Its body is just the name + price (short on purpose, so
+ *      nothing here gets collapsed) — the full details are already in (1) above.
  *
- * Falls back to a plain image/text card if the interactive send fails.
+ * The caption falls back to a text card when there's no usable image. If only the
+ * button send fails, the details have already gone out, so we just log it.
  */
 export async function sendProductButtonCard(phoneNumberId, accessToken, to, product, language = 'english') {
-  const caption = (await buildProductCaption(product, language)).slice(0, INTERACTIVE_BODY_LIMIT);
+  const caption = await buildProductCaption(product, language);
   const labels = await getCaptionStrings(language);
   const imageUrl = sendableImageUrl(product);
 
+  // 1) Full details — image + caption (or a text card when there's no image).
+  if (imageUrl) {
+    try {
+      await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
+    } catch (err) {
+      logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
+      await sendTextMessage(phoneNumberId, accessToken, to, caption);
+    }
+  } else {
+    await sendTextMessage(phoneNumberId, accessToken, to, caption);
+  }
+
+  // 2) Compact interactive button so the customer can still tap to pick. The body
+  // ties the button to its product (name + price) without repeating every detail.
+  const buttonBody = `*${product.name}*\n${labels.price(product.price.toLocaleString())}`.slice(
+    0,
+    INTERACTIVE_BODY_LIMIT,
+  );
   const payload = {
     messaging_product: 'whatsapp',
     to,
     type: 'interactive',
     interactive: {
       type: 'button',
-      body: { text: caption },
+      body: { text: buttonBody },
       action: {
         buttons: [
           {
@@ -320,10 +325,6 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
     },
   };
 
-  if (imageUrl) {
-    payload.interactive.header = { type: 'image', image: { link: imageUrl } };
-  }
-
   try {
     await axios.post(`${GRAPH_URL}/${phoneNumberId}/messages`, payload, {
       headers: {
@@ -333,10 +334,11 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
       timeout: SEND_TIMEOUT_MS,
     });
   } catch (err) {
+    // The details already went out as the caption above — only the tap button
+    // failed, so there's nothing more to resend.
     logger.warn(
-      `[WhatsApp] Button card failed for product "${product.name}": ${err.response?.data?.error?.message || err.message}`,
+      `[WhatsApp] Pick button failed for product "${product.name}" (details already sent): ${err.response?.data?.error?.message || err.message}`,
     );
-    await sendProductCard(phoneNumberId, accessToken, to, product, '', language);
   }
 }
 

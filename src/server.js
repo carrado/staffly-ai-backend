@@ -6,6 +6,7 @@ import { connectDatabase } from './config/database.js';
 import { loadBusinessesFromDB } from './services/business.service.js';
 import { startKeepAlive } from './initializers/keepAlive.js';
 import { startPaymentFollowUps } from './initializers/paymentFollowUp.js';
+import { startProductSync, stopProductSync } from './initializers/productSync.js';
 import { flushAllPending } from './models/ConversationState.js';
 
 const DB_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // re-sync every hour
@@ -29,6 +30,11 @@ function setupGracefulShutdown(server) {
     // Stop accepting new requests, let in-flight ones finish, THEN flush the
     // debounced session writes (Mongo is still open at this point) and close.
     server.close(async () => {
+      try {
+        await stopProductSync();
+      } catch (err) {
+        logger.error('[Shutdown] Product sync close failed:', err);
+      }
       try {
         await flushAllPending();
       } catch (err) {
@@ -71,6 +77,10 @@ async function start() {
 
     // Nudge customers who got a payment link but never paid
     startPaymentFollowUps();
+
+    // Invalidate product caches the instant a vendor changes a product (needs a
+    // replica set; degrades to the 5-min TTL refresh if unavailable).
+    startProductSync();
   });
 
   // Flush debounced session writes before the process dies (deploys, SIGTERM).

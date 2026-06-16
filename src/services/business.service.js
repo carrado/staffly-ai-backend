@@ -23,12 +23,17 @@ export async function loadBusinessesFromDB() {
       businessTone: setup.aiConfig?.businessTone || '',
     };
 
-    // If already in memory (e.g. from a previous load), just refresh token + config
+    // If already in memory (e.g. from a previous load, or from the OAuth callback
+    // which doesn't know the velte user), refresh token + config AND backfill the
+    // velteUserId. Without this backfill, a business first added via the callback
+    // keeps velteUserId=null forever — so its PaymentLink/product lookups (keyed
+    // by velteUserId) never match and checkout falls back to the placeholder link.
     const existing = getBusinessByPhoneNumberId(setup.selectedNumberId);
     if (existing && !existing.is_test) {
       updateBusiness(existing.id, {
         access_token: setup.metaAccessToken,
         aiConfig,
+        velteUserId: setup.userId.toString(),
       });
       refreshed++;
       continue;
