@@ -3,7 +3,8 @@ import { setSession } from '../models/ConversationState.js';
 // ─── Tunables ───────────────────────────────────────────────────────────────
 const PRICE_STEP = 500;            // round counters to a clean, human number
 const MAX_ROUNDS = 4;              // after this many rounds, accept any in-range offer
-const MAX_BELOW_FLOOR_ROUNDS = 3;  // sub-floor bids that earn a counter before the floor becomes the final price
+const MAX_BELOW_FLOOR_ROUNDS = 3;  // sub-floor bids that earn a counter before we hold firm
+const MAX_CONCEDE_ROUNDS = 3;      // no-number "reduce am" presses that earn a cut before we hold firm
 // How far ABOVE the customer's offer (toward the list price) we counter, per
 // round. Anchored high on round 1, stepping down toward the customer each round.
 const IN_RANGE_FRACTIONS = [0.7, 0.45, 0.25];
@@ -29,6 +30,32 @@ function resolveFloor(product) {
 // shrinking concession that never reaches the floor until the descent is spent.
 const CONCESSION_FRACTION = 0.4;
 
+/**
+ * Once a price has been declared FINAL it is locked: the haggling is over. The
+ * final price is whatever we last quoted (`lastCounter`) — we never drop below it
+ * again, and never raise it. Meeting or beating it closes the deal at that exact
+ * number; any lower press is gently held at the SAME final price. `offer` is the
+ * customer's number, or NaN for a no-number press ("abeg do better").
+ */
+function holdFinal(negotiation, offer) {
+  const finalPrice = negotiation.lastCounter;
+  if (Number.isFinite(offer) && offer >= finalPrice) {
+    return {
+      outcome: 'accept',
+      acceptedPrice: finalPrice,
+      negotiation: { ...negotiation, currentOffer: offer, lastCounter: null, stage: 'accepted' },
+    };
+  }
+  return {
+    outcome: 'final',
+    finalPrice,
+    negotiation: {
+      ...negotiation,
+      ...(Number.isFinite(offer) ? { currentOffer: offer } : {}),
+    },
+  };
+}
+
 export function startNegotiation(businessId, customerNumber, product) {
   const negotiation = {
     productId: product.id,
@@ -41,6 +68,7 @@ export function startNegotiation(businessId, customerNumber, product) {
     lastCounter: null,
     rounds: 0,
     belowFloorRounds: 0,
+    concedeRounds: 0,
     stage: 'started',
   };
   setSession(businessId, customerNumber, { negotiation });
@@ -52,26 +80,39 @@ export function startNegotiation(businessId, customerNumber, product) {
  * us to come down, but hasn't named a price). We make the move ourselves: an
  * opening offer below the list price, then a deeper cut each time they press —
  * always strictly below our previous quote and never below the hidden floor.
- * Once there's no room left to move without breaching the floor, the floor is
- * surfaced as the take-it-or-leave-it FINAL price.
+ * After MAX_CONCEDE_ROUNDS cuts (or when there's no room left to move without
+ * breaching the floor), we stop dropping and hold the LAST price we quoted as the
+ * take-it-or-leave-it FINAL price — never a deeper, freshly-revealed number.
  *
  *   outcome 'counter' → quote counterPrice (model justifies with real qualities)
- *   outcome 'final'   → quote finalPrice (the floor) as the final price
+ *   outcome 'final'   → quote finalPrice (the last counter) as the final price
  */
 export function concede(negotiation) {
+  // Already final — restate the same price, never drop further.
+  if (negotiation.stage === 'final' && Number.isFinite(negotiation.lastCounter)) {
+    return holdFinal(negotiation, NaN);
+  }
+
   const list = negotiation.originalPrice;
   const floor = negotiation.minPrice;
   const rounds = (negotiation.rounds || 0) + 1;
-  const base = { ...negotiation, rounds };
+  const concedeRounds = (negotiation.concedeRounds || 0) + 1;
+  const base = { ...negotiation, rounds, concedeRounds };
   const lastQuoted = Number.isFinite(negotiation.lastCounter) ? negotiation.lastCounter : null;
 
+  // Hold the last price we quoted as final; fall back to the floor only if we
+  // never managed to quote a counter at all.
+  const finalPrice = lastQuoted !== null ? lastQuoted : floor;
   const finalDecision = {
     outcome: 'final',
-    finalPrice: floor,
-    negotiation: { ...base, lastCounter: floor, stage: 'final' },
+    finalPrice,
+    negotiation: { ...base, lastCounter: finalPrice, stage: 'final' },
   };
 
-  // No meaningful room between list and floor — just hold the floor.
+  // Pressed past the concession budget — hold the last quote as final.
+  if (concedeRounds > MAX_CONCEDE_ROUNDS) return finalDecision;
+
+  // No meaningful room between list and floor — just hold firm.
   if (list - floor <= PRICE_STEP) return finalDecision;
 
   // Step down from wherever we last stood (the list price on the first press)
@@ -107,6 +148,12 @@ export function concede(negotiation) {
  */
 export function evaluateOffer(negotiation, rawOffer) {
   const offer = Number(rawOffer);
+
+  // Already final — the price is locked. Meet it to close, otherwise hold firm.
+  if (negotiation.stage === 'final' && Number.isFinite(negotiation.lastCounter)) {
+    return holdFinal(negotiation, offer);
+  }
+
   const list = negotiation.originalPrice;
   const floor = negotiation.minPrice;
   const prevOffer = Number.isFinite(negotiation.currentOffer) ? negotiation.currentOffer : null;
@@ -179,13 +226,14 @@ export function evaluateOffer(negotiation, rawOffer) {
   // 3. Below the floor → cannot accept at their number.
   const belowFloorRounds = (negotiation.belowFloorRounds || 0) + 1;
 
-  // The floor becomes the open, take-it-or-leave-it final price — capped at
-  // anything we already quoted: a stated price is a commitment and the final
-  // price must NEVER be higher than a number the customer has already seen.
+  // The LAST price we quoted becomes the take-it-or-leave-it final price — we hold
+  // it firm rather than revealing a deeper floor. A stated price is a commitment,
+  // so the final price is exactly that number (always at or above the hidden
+  // floor); only if we never quoted a counter does the floor itself stand in.
   // lastCounter is set to it so a plain "ok" afterwards checks out at exactly
   // this price.
   const standingQuote = Number.isFinite(negotiation.lastCounter) ? negotiation.lastCounter : null;
-  const finalPrice = standingQuote !== null ? Math.min(floor, standingQuote) : floor;
+  const finalPrice = standingQuote !== null ? standingQuote : floor;
   const finalDecision = {
     outcome: 'final',
     finalPrice,
