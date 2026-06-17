@@ -91,9 +91,16 @@ async function handleOrderPaid(business, data) {
   }
 
   const amountText = naira(order?.amount ?? data.amount);
-  const msg =
-    `✅ Payment confirmed! Your order for *${productName}*${amountText ? ` (${amountText})` : ''} ` +
-    `has been received. Thank you for shopping with ${business.name}!`;
+  const trackingUrl = typeof data.trackingUrl === 'string' ? data.trackingUrl : null;
+
+  let msg =
+    `✅ *Payment confirmed!*\n\n` +
+    `Your order for *${productName}*${amountText ? ` (${amountText})` : ''} has been received ` +
+    `and is now being processed.`;
+  if (trackingUrl) {
+    msg += `\n\nView or track your order here:\n${trackingUrl}`;
+  }
+  msg += `\n\nThank you for shopping with ${business.name}!`;
 
   await sendCustomerMessage(business, to, msg);
 }

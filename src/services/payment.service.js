@@ -21,9 +21,11 @@ function appendQueryParam(url, key, value) {
  *
  * The real, displayable link is the merchant's own velte PaymentLink — the
  * `url` field of their record in the shared `paymentlinks` collection, keyed by
- * the business's velteUserId. We still create a Staffly order so the payment
- * webhook and the abandoned-checkout follow-up have something to track, and we
- * return its id as the order reference to show the customer alongside the link.
+ * the business's velteUserId. We prefer an OPEN-AMOUNT link so the exact (and
+ * possibly negotiated) checkout `amount` is what gets charged; a fixed-amount
+ * link is only a last resort and is flagged. We still create a Staffly order so
+ * the payment webhook and the abandoned-checkout follow-up have something to
+ * track, and we return its id as the order reference to show the customer.
  *
  * The merchant's velte PaymentLink is STATIC (one link, reused for every
  * customer), so on its own it carries no order context. We attach our order id
@@ -50,16 +52,38 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
   if (velteUserId) {
     try {
       // The merchant's own velte payment link: active, not deleted, and not past
-      // its expiry (a null expiresAt never expires). Newest active link wins.
-      const link = await PaymentLink.findOne({
+      // its expiry (a null expiresAt never expires).
+      const activeFilter = {
         userId: velteUserId,
         isActive: true,
         deletedAt: null,
         $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
-      })
+      };
+
+      // Prefer an OPEN-AMOUNT link (amount null/missing). The amount we charge is
+      // this checkout's exact total — which carries any NEGOTIATED price — and
+      // velte resolves it from the StafflyOrder via `ref`. Only an open-amount
+      // link can take that per-order amount; a FIXED-amount link would charge its
+      // own preset price and silently override what the customer agreed. So we
+      // only fall back to a fixed-amount link when the merchant has no open one,
+      // and flag it loudly. Newest qualifying link wins.
+      const openLink = await PaymentLink.findOne({ ...activeFilter, amount: null })
         .sort({ createdAt: -1 })
         .lean();
-      if (link?.url) paymentLink = link.url;
+      const link =
+        openLink ||
+        (await PaymentLink.findOne(activeFilter).sort({ createdAt: -1 }).lean());
+      if (link?.url) {
+        paymentLink = link.url;
+        if (link.amount != null) {
+          logger.warn(
+            `[Payment] Business ${businessId}: only a FIXED-amount velte PaymentLink ` +
+              `(₦${Number(link.amount).toLocaleString()}) is available — the agreed checkout ` +
+              `amount ₦${Number(amount).toLocaleString()} may NOT be charged at pay time. ` +
+              `Ask the merchant to add an open-amount payment link.`,
+          );
+        }
+      }
 
       // Development aid: dump every PaymentLink this merchant has (with the
       // fields that decide selection) plus the one we picked, so you can see why
