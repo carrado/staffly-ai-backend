@@ -5,6 +5,18 @@ import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
 
 /**
+ * Append a query param to a URL, picking `?` vs `&` correctly and leaving any
+ * existing query/fragment intact. Kept dependency-free (no URL parsing) so it
+ * works for the bare velte link and the internal placeholder alike.
+ */
+function appendQueryParam(url, key, value) {
+  const [base, hash = ''] = String(url).split('#');
+  const sep = base.includes('?') ? '&' : '?';
+  const qs = `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+  return `${base}${sep}${qs}${hash ? `#${hash}` : ''}`;
+}
+
+/**
  * Resolve the payment link a customer should be sent for a checkout.
  *
  * The real, displayable link is the merchant's own velte PaymentLink — the
@@ -12,6 +24,14 @@ import { logger } from '../utils/logger.js';
  * the business's velteUserId. We still create a Staffly order so the payment
  * webhook and the abandoned-checkout follow-up have something to track, and we
  * return its id as the order reference to show the customer alongside the link.
+ *
+ * The merchant's velte PaymentLink is STATIC (one link, reused for every
+ * customer), so on its own it carries no order context. We attach our order id
+ * as a `ref` query param — the velte pay page reads it and the velte initialize
+ * endpoint looks up this checkout (amount, items, buyer) to build the Paystack
+ * `metadata.stafflyOrderId`, which flows through to the `order.paid` webhook and
+ * back to us. `ref` is an opaque pointer only; amount/PII stay server-side (in
+ * the StafflyOrder), never in the URL where a customer could tamper with them.
  */
 export async function generatePaymentLink(businessId, customerNumber, productName, amount, buyer = {}) {
   const order = await createOrder({
@@ -104,5 +124,11 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
     }
   }
 
-  return { paymentLink, orderId: order.id };
+  // Attach our order id so the velte pay page / initialize endpoint can resolve
+  // exactly which checkout this payment is for. The placeholder already encodes
+  // order.id in its path, but tagging `ref` uniformly keeps the pay-page logic
+  // (read linkId from path, ref from query) the same for both link shapes.
+  const paymentLinkWithRef = appendQueryParam(paymentLink, 'ref', order.id);
+
+  return { paymentLink: paymentLinkWithRef, orderId: order.id };
 }

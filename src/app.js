@@ -2,6 +2,7 @@ import express from 'express';
 import webhookRoutes from './routes/webhook.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import paymentRoutes from './routes/payment.routes.js';
+import velteRoutes from './routes/velte.routes.js';
 import { errorHandler } from './middleware/error.handler.js';
 
 const app = express();
@@ -32,6 +33,9 @@ app.use('/auth', authRoutes);
 
 // Payment gateway webhook
 app.use('/api', paymentRoutes);
+
+// Signed webhooks from velte-backend (order.paid → WhatsApp confirmation, etc.)
+app.use('/api', velteRoutes);
 
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));

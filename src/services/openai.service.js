@@ -115,6 +115,16 @@ function extractCheckoutData(data = {}) {
     location: toNullableString(data.location),
     selectedSize: toNullableString(data.selectedSize),
     selectedColor: toNullableString(data.selectedColor),
+    // Generic variant picks for ANY product attribute the customer chose
+    // (Storage, Material, Flavour, …), each a { name, value } pair.
+    selectedAttributes: Array.isArray(data.selectedAttributes)
+      ? data.selectedAttributes
+          .map((a) => ({
+            name: toNullableString(a?.name),
+            value: toNullableString(a?.value),
+          }))
+          .filter((a) => a.name && a.value)
+      : [],
     selectedModifiers: Array.isArray(data.selectedModifiers)
       ? data.selectedModifiers.map((m) => toNullableString(m)).filter(Boolean)
       : [],
@@ -569,8 +579,8 @@ CHOOSING THE ACTION:
 - start_negotiation — asks for a discount/"last price"/reduction WITHOUT a number ("how much last?", "you fit reduce am?", "e too cost", "abeg do am for me").
 - make_offer — proposes a specific price, any phrasing: "I fit do 25k", "can you do 18000?", "make I run am 26", "20k last", "oya collect 22", "na 25 I get", "I no fit pass 25". Put the resolved amount in data.offer. NEVER stall, "check", "confirm" or "get back to them" — pricing is resolved instantly; the system gives you the counter/acceptance/final price to deliver.
 - accept_offer — clearly agrees to the price YOU last offered ("ok", "deal", "I'll take it").
-- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), email, customerName, location, selectedSize, selectedColor, selectedModifiers:[] }. To place an order the system needs the buyer's name, email, and delivery location, plus a chosen size/colour when the product lists them and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; selectedSize; selectedColor; selectedModifiers = chosen option names). Do NOT invent or guess any of these — leave a field null if they haven't said it; the system replies asking for exactly what's still missing. Always use this action for buy/checkout intent even when details are incomplete.
-- CHECKOUT FOLLOW-UP: once you've asked the customer for order details (name, email, delivery location, size, colour, or a modifier choice), treat their next message that supplies any of those as continuing the SAME purchase → action generate_payment_link, with productName = the item being bought (from context) and every detail they just gave mapped into data. A bare reply like "John Doe, john@example.com, 12 Allen Avenue Ikeja" is name + email + location for the pending order — parse each part into customerName, email, and location. Never restart a search or answer "none" when the customer is clearly answering your checkout questions.
+- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), email, customerName, location, selectedSize, selectedColor, selectedAttributes:[{name,value}], selectedModifiers:[] }. To place an order the system needs the buyer's name, email, and delivery location, plus a chosen value for every variant the product lists (size, colour, or ANY other attribute like storage, material, flavour) and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; selectedModifiers = chosen option names). For variant picks: put size in selectedSize and colour in selectedColor as before, and put any OTHER attribute choice in selectedAttributes as { name, value } using the attribute's exact name from the product (e.g. { "name": "Storage", "value": "256GB" }). Do NOT invent, guess, auto-fill, or assume any of these — and NEVER copy the example values shown anywhere in these instructions (names, emails, addresses, option values) into data. They are format illustrations, not customer data. A field goes into data ONLY when the customer actually typed that value in this conversation; otherwise leave it null/empty. The system then replies asking for exactly what's still missing, so it is always correct to leave a field out — it is never correct to fill it with a placeholder to "complete" the order. Always use this action for buy/checkout intent even when details are incomplete.
+- CHECKOUT FOLLOW-UP: once you've asked the customer for order details (name, email, delivery location, size, colour, or a modifier choice), treat their next message that supplies any of those as continuing the SAME purchase → action generate_payment_link, with productName = the item being bought (from context) and every detail they just gave mapped into data. When the customer sends a bare reply that is clearly their details — a name, an email, and an address run together (e.g. "<their name>, <their email>, <their address>") — parse each part into customerName, email, and location respectively, using ONLY what they actually wrote (never a placeholder). Never restart a search or answer "none" when the customer is clearly answering your checkout questions.
 - send_product_image — wants to SEE a product (picture/photo/"what does it look like?"). The ONLY way to send a photo.
 - find_similar_negotiable — agrees to see similar items they can bargain on, or asks for them directly.
 - list_categories — explicitly asks for category/department names.
@@ -640,14 +650,13 @@ Guidelines:
 - For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
   - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
 - For payment links: the order is confirmed — present a short, friendly order summary, THEN the link. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). The price is the single, all-in figure — present it simply as the price; never mention tax, VAT, or any breakdown. For the link itself, write the EXACT literal placeholder {{PAYMENT_LINK}} (those exact characters, double curly braces) on its own line where the link should appear — do NOT write, guess, copy, complete, or "fix" any actual URL yourself (the system substitutes the real payment link for that placeholder). Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. Only mention details that are actually present in the result; never invent any. (The price already includes any modifier extra cost.)
-- If the result has "needsInfo": true, the order is NOT placed yet and NO payment link exists — do not share or invent a link. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. Ask ONLY for the items listed in actionResult.missing, in ONE warm, natural message, and DON'T re-ask for anything in actionResult.collected (those are already provided — you may briefly acknowledge them). Map each missing entry by its "field":
-    - "size": ask which size they want and list the available ones from its "options".
-    - "color": ask which colour and list the available ones from its "options".
+- If the result has "needsInfo": true, the order is NOT placed yet and NO payment link exists — do not share or invent a link. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. The system gathers these in stages, so actionResult.missing holds only the items to ask for RIGHT NOW — ask for EXACTLY those, all together in ONE warm, natural message, and nothing else. DON'T re-ask for anything in actionResult.collected (already provided — collected.attributes holds chosen variants, plus name/email/location; you may briefly acknowledge them). Map each missing entry by its "field":
+    - "attribute": ask which "name" they want (e.g. Size, Colour, Storage) and list the available choices from its "options".
     - "modifiers": for each group in "groups", ask them to choose, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"); never invent options.
     - "name": ask for the name the order should be under.
     - "email": ask for the email address for the order/receipt (if they gave one that looked wrong, say it didn't look valid and ask again).
     - "location": ask for their delivery address/location.
-  Keep it friendly and conversational, not a stiff form. Once they reply with the details, the order is completed and the link is sent automatically.
+  When "name" and "email" appear together, ask for both in the same breath ("Can I get your name and email for the order?"). Keep it friendly and conversational, not a stiff form. Once they reply, the next detail (or the payment link) follows automatically.
 - For price negotiation (the action result has a "negotiation" object):
   - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
   - PRICES ONLY MOVE DOWN: never state a counter or final price HIGHER than any price you already offered this customer for this product earlier in the conversation. The price in the action result is the standing commitment — quote exactly that number, and never resurrect an older, higher number from the chat history.
@@ -704,6 +713,18 @@ const ACTION_DATA_PROPERTIES = {
   location: nullable({ type: "string" }),
   selectedSize: nullable({ type: "string" }),
   selectedColor: nullable({ type: "string" }),
+  selectedAttributes: nullable({
+    type: "array",
+    items: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name", "value"],
+      properties: {
+        name: { type: "string" },
+        value: { type: "string" },
+      },
+    },
+  }),
   selectedModifiers: nullable({ type: "array", items: { type: "string" } }),
 };
 

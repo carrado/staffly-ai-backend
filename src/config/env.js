@@ -19,6 +19,11 @@ export const env = {
   // default — it adds a one-time (cached) vision call per product.
   productVision: process.env.PRODUCT_VISION === 'true',
 
+  // Shared secret for verifying webhooks dispatched by velte-backend
+  // (HMAC-SHA256 over the raw body, sent as the `x-velte-signature` header).
+  // Must match velte-backend's VELTE_WEBHOOK_SECRET.
+  velteWebhookSecret: process.env.VELTE_WEBHOOK_SECRET,
+
   // Meta / WhatsApp Platform credentials (YOUR app's credentials, not the businesses')
   metaAppId: process.env.META_APP_ID,
   metaAppSecret: process.env.META_APP_SECRET,

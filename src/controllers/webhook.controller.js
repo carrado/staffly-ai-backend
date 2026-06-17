@@ -237,6 +237,36 @@ function resolveSelectedModifiers(product, selectedNames = []) {
 // out what's still missing, and only place the order once nothing is.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Buyer-detail sanitisers. The checkout gate trusts these fields as proof the
+// customer supplied them, so a value the model GUESSED or copied from the
+// instruction examples (rather than read from the customer) must be rejected —
+// otherwise the order proceeds on phantom data. Each returns null for an absent
+// or placeholder value, which keeps the gate asking. RFC 2606 reserves
+// example/test domains, so any email there is never a real customer address.
+const PLACEHOLDER_EMAIL_DOMAINS = /@(?:example|test|sample|email|domain|mail|acme)\.(?:com|org|net)$/i;
+const PLACEHOLDER_NAMES = new Set([
+  "john doe", "jane doe", "john smith", "jane smith",
+  "full name", "your name", "customer name", "name", "first last",
+]);
+
+function cleanCheckoutName(value) {
+  const t = (value ?? "").toString().trim();
+  if (t.length < 2) return null;
+  if (PLACEHOLDER_NAMES.has(t.toLowerCase())) return null;
+  return t;
+}
+function cleanCheckoutEmail(value) {
+  const t = (value ?? "").toString().trim();
+  if (!EMAIL_RE.test(t)) return null;
+  if (PLACEHOLDER_EMAIL_DOMAINS.test(t)) return null;
+  return t;
+}
+function cleanCheckoutLocation(value) {
+  const t = (value ?? "").toString().trim();
+  if (t.length < 3) return null;
+  return t;
+}
+
 // Resolve a customer-typed value to the product's canonical option (case-
 // insensitive). Returns null when the value isn't one of the real options, so a
 // typo or a not-offered choice is treated as "still needs a valid pick".
@@ -253,13 +283,25 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
   const modifiers = Array.isArray(data.selectedModifiers)
     ? data.selectedModifiers.filter(Boolean)
     : [];
+  // Generic attribute picks relayed as [{ name, value }] fold into a
+  // case-preserving map, new picks overriding earlier ones for the same name.
+  const attrMap = { ...(prior.selectedAttributes || {}) };
+  if (Array.isArray(data.selectedAttributes)) {
+    for (const a of data.selectedAttributes) {
+      if (a && a.name && a.value) attrMap[a.name] = a.value;
+    }
+  }
   return {
     productName: resolvedProductName || prior.productName || null,
-    email: data.email || prior.email || null,
-    customerName: data.customerName || prior.customerName || null,
-    location: data.location || prior.location || null,
+    // Sanitise THIS turn's values (prior values were already cleaned when
+    // stored), so a guessed/placeholder name, email or address never counts as
+    // "provided" and the gate keeps asking for the real one.
+    email: cleanCheckoutEmail(data.email) || prior.email || null,
+    customerName: cleanCheckoutName(data.customerName) || prior.customerName || null,
+    location: cleanCheckoutLocation(data.location) || prior.location || null,
     selectedSize: data.selectedSize || prior.selectedSize || null,
     selectedColor: data.selectedColor || prior.selectedColor || null,
+    selectedAttributes: attrMap,
     selectedModifiers: modifiers.length ? modifiers : prior.selectedModifiers || [],
     // A price agreed via negotiation overrides the list price; carried across
     // turns so a checkout completed later still closes at the agreed number.
@@ -267,28 +309,71 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
   };
 }
 
+// Flatten an attribute's stored values into the distinct options a buyer can
+// choose from. Velte may store a variant as several rows (["S","M","L"]) or as
+// one comma/slash-joined row (["S, M, L"]) — both collapse to ["S","M","L"].
+// Case-insensitive dedupe, first-seen casing kept.
+function normalizeAttrOptions(rawValues = []) {
+  const out = [];
+  const seen = new Set();
+  for (const v of rawValues) {
+    for (const part of String(v).split(/[,/]/)) {
+      const t = part.trim();
+      if (!t) continue;
+      const k = t.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(t);
+      }
+    }
+  }
+  return out;
+}
+
+// The value the customer chose for a given attribute, looked up across the
+// generic selectedAttributes map (case-insensitive on the attribute name) and
+// the legacy selectedSize/selectedColor fields, so existing model output still
+// resolves for size/colour attributes.
+function pickSelectedAttr(checkout, attrName) {
+  const sel = checkout.selectedAttributes || {};
+  const key = Object.keys(sel).find(
+    (k) => k.toLowerCase() === String(attrName).toLowerCase(),
+  );
+  if (key && sel[key]) return sel[key];
+  const lname = String(attrName).toLowerCase();
+  if (/size/.test(lname) && checkout.selectedSize) return checkout.selectedSize;
+  if (/colou?r/.test(lname) && checkout.selectedColor) return checkout.selectedColor;
+  return null;
+}
+
 // Everything still required before this product can become an order. `missing`
 // is empty when the checkout is complete; otherwise each entry names a field the
-// reply must ask for (size/color/modifiers carry their valid options).
+// reply must ask for (attributes/modifiers carry their valid options). Asks are
+// PHASED so the buyer isn't handed a long form: product variant choices first
+// (they also settle the price), then name + email together, then delivery
+// location. Accumulation across turns means a buyer who volunteers everything at
+// once still completes — phasing only governs what we ASK when something's left.
 function computeCheckoutGaps(product, checkout) {
-  const attrs = product.attributes || {};
-  const missing = [];
+  const variantMissing = [];
+  const resolvedAttributes = {};
 
-  let size = null;
-  if (attrs.sizes?.length) {
-    size = resolveOption(checkout.selectedSize, attrs.sizes);
-    if (!size) missing.push({ field: "size", options: attrs.sizes });
+  // Generic product attributes: any attribute the product lists with 2+ distinct
+  // options is a real variant the buyer must pick (a single-value attribute is
+  // just a spec — nothing to choose). Works for Size, Colour, Storage, Material,
+  // Flavour, etc. with no per-attribute code.
+  const attrGroups = product.attributes || {};
+  for (const [name, rawValues] of Object.entries(attrGroups)) {
+    const options = normalizeAttrOptions(rawValues);
+    if (options.length < 2) continue; // informational spec, not a choice
+    const chosen = resolveOption(pickSelectedAttr(checkout, name), options);
+    if (chosen) resolvedAttributes[name] = chosen;
+    else variantMissing.push({ field: "attribute", name, options });
   }
 
-  let color = null;
-  if (attrs.colors?.length) {
-    color = resolveOption(checkout.selectedColor, attrs.colors);
-    if (!color) missing.push({ field: "color", options: attrs.colors });
-  }
-
+  // Required food modifier groups.
   const modifierCheck = resolveSelectedModifiers(product, checkout.selectedModifiers);
   if (modifierCheck.missingRequired.length > 0) {
-    missing.push({
+    variantMissing.push({
       field: "modifiers",
       groups: modifierCheck.missingRequired.map((group) => ({
         name: group.name,
@@ -301,17 +386,52 @@ function computeCheckoutGaps(product, checkout) {
     });
   }
 
-  if (!checkout.customerName) missing.push({ field: "name" });
-  if (!checkout.email || !EMAIL_RE.test(checkout.email)) missing.push({ field: "email" });
-  if (!checkout.location) missing.push({ field: "location" });
+  const needName = !checkout.customerName;
+  const needEmail = !checkout.email || !EMAIL_RE.test(checkout.email);
+  const needLocation = !checkout.location;
+
+  let missing;
+  if (variantMissing.length > 0) {
+    missing = variantMissing;
+  } else if (needName || needEmail) {
+    missing = [];
+    if (needName) missing.push({ field: "name" });
+    if (needEmail) missing.push({ field: "email" });
+  } else if (needLocation) {
+    missing = [{ field: "location" }];
+  } else {
+    missing = [];
+  }
 
   return {
     missing,
     selections: modifierCheck.selections,
     extraTotal: modifierCheck.extraTotal,
-    size,
-    color,
+    attributes: resolvedAttributes,
   };
+}
+
+// The price a buy should close at when the customer has been haggling. Prefer a
+// price already locked into the in-progress checkout, then the standing number
+// from an active negotiation for THIS product (our last counter, then their
+// offer), clamped to [floor, list]. Returns null when nothing was negotiated, so
+// the list price applies. Lets a "send me the link" / "I'll take it" that the
+// model routes to generate_payment_link still honour the agreed price instead of
+// reverting to the list price.
+function resolveAgreedPrice(session, product) {
+  const checkout = session.checkout;
+  if (checkout?.negotiatedPrice != null && checkout.productName === product.name) {
+    return checkout.negotiatedPrice;
+  }
+  const negotiation = session.negotiation;
+  if (negotiation && negotiation.productId === product.id) {
+    const agreed = negotiation.lastCounter ?? negotiation.currentOffer ?? null;
+    if (agreed != null) {
+      const floor = negotiation.minPrice ?? 0;
+      return Math.min(Math.max(agreed, floor), product.price);
+    }
+  }
+  return null;
 }
 
 /**
@@ -350,8 +470,8 @@ async function gatherCheckoutOrAsk({
       negotiated,
       missing: gaps.missing,
       collected: {
-        size: checkout.selectedSize || null,
-        color: checkout.selectedColor || null,
+        // What's already been gathered, so the reply doesn't re-ask for it.
+        attributes: gaps.attributes,
         name: checkout.customerName || null,
         email: checkout.email || null,
         location: checkout.location || null,
@@ -367,8 +487,7 @@ async function gatherCheckoutOrAsk({
     email: checkout.email,
     customerName: checkout.customerName,
     location: checkout.location,
-    selectedSize: gaps.size,
-    selectedColor: gaps.color,
+    selectedAttributes: gaps.attributes,
     selectedModifiers: gaps.selections,
   });
 
@@ -393,16 +512,27 @@ async function runCheckout({
   email,
   customerName,
   location,
-  selectedSize,
-  selectedColor,
+  selectedAttributes = {},
   selectedModifiers = [],
 }) {
   setLastProduct(businessId, customerNumber, product);
 
-  // E.g. "Jollof Rice (Chicken, Extra Plantain)" on the payment link/invoice.
-  const itemLabel = selectedModifiers.length
-    ? `${product.name} (${selectedModifiers.map((m) => m.name).join(', ')})`
+  // E.g. "T-Shirt (L, Red)" or "Jollof Rice (Chicken, Extra Plantain)" on the
+  // payment link/invoice — chosen variants first, then modifier add-ons.
+  const labelExtras = [
+    ...Object.values(selectedAttributes),
+    ...selectedModifiers.map((m) => m.name),
+  ];
+  const itemLabel = labelExtras.length
+    ? `${product.name} (${labelExtras.join(', ')})`
     : product.name;
+
+  // Derive size/colour from the chosen attributes for the reply summary, which
+  // reads them back to the customer.
+  const findAttr = (re) => {
+    const k = Object.keys(selectedAttributes).find((n) => re.test(n.toLowerCase()));
+    return k ? selectedAttributes[k] : null;
+  };
 
   // `amount` is already VAT-inclusive (tax is folded in at the product mapper),
   // so it's charged as-is — the customer only ever sees a single "Price".
@@ -446,8 +576,12 @@ async function runCheckout({
     customerName: customerName || null,
     location: location || null,
     email: email || null,
-    selectedSize: selectedSize || null,
-    selectedColor: selectedColor || null,
+    selectedAttributes: Object.entries(selectedAttributes).map(([name, value]) => ({
+      name,
+      value,
+    })),
+    selectedSize: findAttr(/size/) || null,
+    selectedColor: findAttr(/colou?r/) || null,
     selectedModifiers: selectedModifiers.map((m) => ({
       group: m.group,
       name: m.name,
@@ -926,7 +1060,15 @@ async function executeAction({
         break;
       }
 
-      // Gather size/colour, required modifiers, name, email and location —
+      // If the customer haggled on this item, the order must close at the agreed
+      // price, not the list price — even when the model routes the "I'll take it"
+      // to generate_payment_link rather than accept_offer.
+      const negotiatedPrice = resolveAgreedPrice(
+        getSession(businessId, customerNumber),
+        product,
+      );
+
+      // Gather variant choices, required modifiers, name, email and location —
       // asking for whatever's still missing — and only place the order once the
       // checkout is complete.
       actionResult = await gatherCheckoutOrAsk({
@@ -934,6 +1076,7 @@ async function executeAction({
         customerNumber,
         product,
         data: action.data,
+        negotiatedPrice,
       });
 
       break;
@@ -1061,14 +1204,24 @@ async function executeAction({
       const decision = evaluateOffer(activeNegotiation, offer);
       setNegotiation(businessId, customerNumber, decision.negotiation);
 
-      // Rule F — accepted price: hand off to the existing checkout flow.
+      // Rule F — accepted price: hand off to the same checkout gate as a direct
+      // buy, at the agreed price, so variant choices and buyer details are still
+      // gathered before the order is placed. If anything's missing this returns
+      // needsInfo and the negotiation stays alive until it's complete.
       if (decision.outcome === "accept") {
-        const checkout = await runCheckout({
+        const checkout = await gatherCheckoutOrAsk({
           businessId,
           customerNumber,
           product,
-          amount: decision.acceptedPrice,
+          data: action.data,
+          negotiatedPrice: decision.acceptedPrice,
         });
+
+        if (checkout.needsInfo) {
+          actionResult = checkout;
+          break;
+        }
+
         clearNegotiation(businessId, customerNumber);
 
         actionResult = {
