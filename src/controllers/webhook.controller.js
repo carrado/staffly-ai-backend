@@ -541,7 +541,13 @@ async function runCheckout({
     customerNumber,
     itemLabel,
     amount,
-    { customerName, customerEmail: email, location },
+    {
+      customerName,
+      customerEmail: email,
+      location,
+      productId: product?.id ? String(product.id) : null,
+      productImage: product?.image_url || null,
+    },
   );
 
   // Arm an abandoned-checkout follow-up. If the customer pays (payment webhook)

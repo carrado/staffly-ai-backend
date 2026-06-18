@@ -20,6 +20,10 @@ const StafflyOrderSchema = new mongoose.Schema(
     businessId: { type: String, required: true, index: true },
     customerNumber: { type: String, required: true },
     product: { type: String },
+    // The underlying product so velte can snapshot its photo onto the real order.
+    // `product` above stays the human label (incl. chosen variants/modifiers).
+    productId: { type: String, default: null },
+    productImage: { type: String, default: null }, // Product.mainImageUrl at checkout
     amount: { type: Number },
     status: { type: String, default: 'pending' }, // pending | paid | failed
     // Buyer details gathered during the WhatsApp checkout, used to fulfil the

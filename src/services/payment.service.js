@@ -40,6 +40,10 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
     businessId,
     customerNumber,
     product: productName,
+    // Underlying product identity + photo, so the real velte order can show the
+    // product image. `productName` stays the human label with variants/modifiers.
+    productId: buyer.productId || null,
+    productImage: buyer.productImage || null,
     amount,
     customerName: buyer.customerName || null,
     customerEmail: buyer.customerEmail || null,
