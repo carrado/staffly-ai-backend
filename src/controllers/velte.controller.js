@@ -23,6 +23,7 @@ const naira = (amount) =>
  *                           confirmation. (This closes the WhatsApp payment loop.)
  *   - order.created       → notify the customer their order was placed.
  *   - order.status_changed→ notify the customer of the new fulfilment status.
+ *   - receipt.ready       → send the customer the generated receipt PDF link.
  */
 export async function handleVelteWebhook(req, res) {
   try {
@@ -51,6 +52,9 @@ export async function handleVelteWebhook(req, res) {
         break;
       case 'order.status_changed':
         await handleOrderStatusChanged(business, data);
+        break;
+      case 'receipt.ready':
+        await handleReceiptReady(business, data);
         break;
       default:
         logger.info(`[Velte] Unhandled event "${event}" — acknowledged`);
@@ -98,7 +102,9 @@ async function handleOrderPaid(business, data) {
     `Your order for *${productName}*${amountText ? ` (${amountText})` : ''} has been received ` +
     `and is now being processed.`;
   if (trackingUrl) {
-    msg += `\n\nView or track your order here:\n${trackingUrl}`;
+    msg +=
+      `\n\n📦 Track your order here:\n${trackingUrl}\n\n` +
+      `Enter the tracking key we emailed you to view your order's progress.`;
   }
   msg += `\n\nThank you for shopping with ${business.name}!`;
 
@@ -156,6 +162,29 @@ async function handleOrderStatusChanged(business, data) {
   if (data.newStatus === 'Cancelled' && data.cancellationReason) {
     msg += `\n\nReason: ${data.cancellationReason}`;
   }
+
+  await sendCustomerMessage(business, to, msg);
+}
+
+/**
+ * A receipt PDF was generated for a paid order (velte uploaded it to the CDN).
+ * Send the customer the download link.
+ */
+async function handleReceiptReady(business, data) {
+  const to = data.customerPhone;
+  const receiptUrl = typeof data.receiptUrl === 'string' ? data.receiptUrl : null;
+  if (!to || !receiptUrl) {
+    logger.warn('[Velte] receipt.ready missing customerPhone or receiptUrl');
+    return;
+  }
+
+  const amountText = naira(data.amount);
+  const orderRef = data.orderId ? ` for order ${data.orderId}` : '';
+
+  const msg =
+    `🧾 *Your receipt is ready!*\n\n` +
+    `Here's your receipt${orderRef}${amountText ? ` (${amountText})` : ''}:\n${receiptUrl}\n\n` +
+    `Thank you for shopping with ${business.name}!`;
 
   await sendCustomerMessage(business, to, msg);
 }
