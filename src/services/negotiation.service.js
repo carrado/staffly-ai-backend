@@ -1,4 +1,5 @@
 import { setSession } from '../models/ConversationState.js';
+import { logger } from '../utils/logger.js';
 
 // ─── Tunables ───────────────────────────────────────────────────────────────
 const PRICE_STEP = 500;            // round counters to a clean, human number
@@ -18,10 +19,31 @@ const DEFAULT_FLOOR_RATIO = 0.9;
 
 const roundToStep = (n) => Math.round(n / PRICE_STEP) * PRICE_STEP;
 
-function resolveFloor(product) {
+// The hidden floor: the lowest price the engine may ever quote. Both inputs are
+// already tax-inclusive (toStafflyProduct folds VAT into price AND min_price), so
+// the whole band is in the same all-in terms the customer sees.
+//
+// Prefer the merchant's explicit minimum, but ONLY when it is genuinely below the
+// list price — that is the band we haggle inside, and we never go under it. When
+// no minimum is set we fall back to a ratio of the list. When a minimum IS set
+// but is not below the list (a contradictory config for a "negotiable" product —
+// e.g. a discount that dipped beneath the minimum, or a minimum left equal to the
+// price), we also fall back to the ratio floor and warn, so a negotiable item can
+// still move instead of silently behaving like a fixed-price one.
+export function resolveFloor(product) {
+  const list = Number(product.price);
+  const ratioFloor = roundToStep(list * DEFAULT_FLOOR_RATIO);
   const explicit = Number(product.min_price);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
-  return roundToStep(Number(product.price) * DEFAULT_FLOOR_RATIO);
+
+  if (Number.isFinite(explicit) && explicit > 0) {
+    if (explicit < list) return explicit; // valid minimum — honour it exactly
+    logger.warn(
+      `[Negotiation] "${product.name}" minimum ₦${explicit.toLocaleString()} is not below list ₦${list.toLocaleString()} — ` +
+        `falling back to floor ₦${ratioFloor.toLocaleString()} so a negotiable item can still come down. ` +
+        `Check this product's minimum price (and discount) in Velte.`,
+    );
+  }
+  return ratioFloor;
 }
 
 // When the customer asks for a discount WITHOUT naming a number ("abeg reduce
@@ -57,13 +79,14 @@ function holdFinal(negotiation, offer) {
 }
 
 export function startNegotiation(businessId, customerNumber, product) {
+  const minPrice = resolveFloor(product);
   const negotiation = {
     productId: product.id,
     productName: product.name,
     originalPrice: product.price,
     // Hidden floor — the minimum acceptable price. NEVER surface this to the
     // model or the customer. Only the server's algorithm may read it.
-    minPrice: resolveFloor(product),
+    minPrice,
     currentOffer: null,
     lastCounter: null,
     rounds: 0,
@@ -71,6 +94,14 @@ export function startNegotiation(businessId, customerNumber, product) {
     concedeRounds: 0,
     stage: 'started',
   };
+  // Server-side only (the floor is secret). Makes "it won't come down" instantly
+  // diagnosable: if room is ~0 here, the product's price/minimum config is the
+  // cause, not the haggling engine.
+  const room = Number(product.price) - minPrice;
+  logger.info(
+    `[Negotiation] start "${product.name}" — list ₦${Number(product.price).toLocaleString()}, ` +
+      `floor ₦${minPrice.toLocaleString()}, room ₦${room.toLocaleString()}`,
+  );
   setSession(businessId, customerNumber, { negotiation });
   return negotiation;
 }

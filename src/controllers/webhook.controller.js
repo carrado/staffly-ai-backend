@@ -26,7 +26,6 @@ import * as whatsapp from "../services/whatsapp.service.js";
 import * as openaiService from "../services/openai.service.js";
 import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
-import * as emailService from "../services/email.service.js";
 import { startNegotiation, evaluateOffer, concede } from "../services/negotiation.service.js";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
@@ -56,6 +55,16 @@ const STRINGS = {
       `Great choice! 😊 Would you like to order *${name}* now${mins ? ` — it'll be ready in ~${mins} mins` : ""}?`,
     pickedRetail: (name) =>
       `Great choice! 😊 Would you like to buy *${name}*, check a size or color, or negotiate the price?`,
+    negCounter: (name, price) =>
+      `For *${name}*, the best I can do right now is ₦${price}. Want me to package it for you at that price?`,
+    // A SECOND (or later) reduction — never repeat the round-1 line. Frame it as a
+    // fresh cut made specially for the customer, justified by the product's quality.
+    negCounterAgain: (name, price, round) =>
+      (round >= 3
+        ? `Tell you what — *${name}* is one of my best pieces and built to last, but I'll shave off a little more just for you: ₦${price}. Shall I package it?`
+        : `Okay, let me come down a bit more for you — *${name}* is genuinely good quality, so I'll do ₦${price}. Want me to package it?`),
+    negFinal: (name, price) =>
+      `I've come down as far as I can on *${name}* — ₦${price} is honestly the lowest I can let it go for. Shall I package it for you?`,
     notUnderstood:
       "Sorry, I could not understand that message. Please send text or a clear voice note.",
     somethingWrong:
@@ -72,6 +81,16 @@ const STRINGS = {
       `Correct choice! 😊 You wan order *${name}* now${mins ? ` — e go ready in ~${mins} mins` : ""}?`,
     pickedRetail: (name) =>
       `Correct choice! 😊 You wan buy *${name}*, check size or color, or you wan price am small?`,
+    negCounter: (name, price) =>
+      `For *${name}*, the best wey I fit do now na ₦${price}. Make I package am for you for that price?`,
+    // A SECOND (or later) reduction — no need to repeat the round-1 line. Frame it
+    // as a fresh cut made because of the customer, backed by the product quality.
+    negCounterAgain: (name, price, round) =>
+      (round >= 3
+        ? `Make I tell you — *${name}* na one of my best goods wey strong well well, but I go cut am small more just for you: ₦${price}. Make I package am?`
+        : `Okay, make I reduce am small more for you — *${name}* quality good well well, so I go do ₦${price}. Make I package am?`),
+    negFinal: (name, price) =>
+      `I don try reach my limit for *${name}* — ₦${price} na the last price wey I fit sell am give you. Make I package am?`,
     notUnderstood:
       "Sorry, I no understand that message. Abeg send text or clear voice note.",
     somethingWrong:
@@ -89,6 +108,31 @@ async function tr(language, pick) {
   const table = STRINGS[language];
   if (table) return pick(table);
   return openaiService.translateUiString(pick(STRINGS.english), language);
+}
+
+// A negotiation counter/final price is money-critical and ALREADY decided by the
+// engine. The reply model (gpt-4o-mini) has been observed to ignore the engine's
+// number and refuse the customer ("it's priced at ₦X, I can't go down to ₦Y"),
+// restating the list price — so we compose these two outcomes deterministically
+// and never let the model pick the figure (same stance as enforcePaymentLink).
+// Returns the ready-to-send reply, or null to defer to the model (accept/needsInfo
+// outcomes carry a checkout summary + payment link, so those still go through it).
+async function composeNegotiationReply(language, neg) {
+  if (!neg) return null;
+  if (neg.outcome === "counter" && Number.isFinite(neg.counterPrice)) {
+    const price = neg.counterPrice.toLocaleString();
+    // Round 1 is the opening counter ("best I can do right now"); every later
+    // reduction uses a distinct, quality-justified phrasing so we never repeat it.
+    const round = Number(neg.round) || 1;
+    if (round >= 2) {
+      return tr(language, (s) => s.negCounterAgain(neg.product, price, round));
+    }
+    return tr(language, (s) => s.negCounter(neg.product, price));
+  }
+  if (neg.outcome === "final" && Number.isFinite(neg.finalPrice)) {
+    return tr(language, (s) => s.negFinal(neg.product, neg.finalPrice.toLocaleString()));
+  }
+  return null;
 }
 
 // Internal grounding markers we write into the conversation history — e.g.
@@ -231,6 +275,35 @@ function resolveSelectedModifiers(product, selectedNames = []) {
   return { selections, missingRequired, extraTotal };
 }
 
+// Modifier/add-on names the customer asked for that the product does NOT offer in
+// ANY group — e.g. "extra plantain" on a dish without that add-on. These are
+// otherwise silently dropped by resolveSelectedModifiers, so we surface them to
+// flag back to the customer instead of quietly ignoring the request (it matters
+// most at the payment step, where the order would otherwise complete without the
+// item they asked for). Only judged for products that actually HAVE modifier
+// groups — with none, there's nothing to validate against and the classifier may
+// have mis-tagged an ordinary word as a modifier.
+function unavailableModifierRequests(product, names = []) {
+  const offered = new Set();
+  for (const group of product.modifiers || []) {
+    for (const o of group.options || []) offered.add(String(o.name).toLowerCase());
+  }
+  if (offered.size === 0) return [];
+
+  const seen = new Set();
+  const out = [];
+  for (const raw of names || []) {
+    const t = String(raw ?? "").trim();
+    if (!t) continue;
+    const key = t.toLowerCase();
+    if (!offered.has(key) && !seen.has(key)) {
+      seen.add(key);
+      out.push(t); // preserve the customer's original casing for the reply
+    }
+  }
+  return out;
+}
+
 // A perfect order needs more than the product: a chosen size/colour when the
 // product lists them, every required food modifier, and the buyer's name, email
 // and delivery location. The next three helpers gather those across turns, work
@@ -265,6 +338,27 @@ function cleanCheckoutLocation(value) {
   const t = (value ?? "").toString().trim();
   if (t.length < 3) return null;
   return t;
+}
+
+// Detect buyer-detail values the customer ACTUALLY supplied this turn that failed
+// validation — a malformed email, a one-letter "name", a too-short address. We
+// only flag a field that's still unfilled (no valid value carried from a prior
+// turn), so the reply can tell the customer their entry didn't look right and ask
+// again, instead of silently re-asking the same question. Returns the raw bad
+// value per field (so the reply can quote it back), keyed by the gap field name.
+function rejectedCheckoutInputs(prior = {}, data = {}) {
+  const raw = (v) => (v ?? "").toString().trim();
+  const rejected = {};
+  if (raw(data.email) && !cleanCheckoutEmail(data.email) && !prior.email) {
+    rejected.email = raw(data.email);
+  }
+  if (raw(data.customerName) && !cleanCheckoutName(data.customerName) && !prior.customerName) {
+    rejected.name = raw(data.customerName);
+  }
+  if (raw(data.location) && !cleanCheckoutLocation(data.location) && !prior.location) {
+    rejected.location = raw(data.location);
+  }
+  return rejected;
 }
 
 // Resolve a customer-typed value to the product's canonical option (case-
@@ -365,9 +459,19 @@ function computeCheckoutGaps(product, checkout) {
   for (const [name, rawValues] of Object.entries(attrGroups)) {
     const options = normalizeAttrOptions(rawValues);
     if (options.length < 2) continue; // informational spec, not a choice
-    const chosen = resolveOption(pickSelectedAttr(checkout, name), options);
-    if (chosen) resolvedAttributes[name] = chosen;
-    else variantMissing.push({ field: "attribute", name, options });
+    const provided = pickSelectedAttr(checkout, name);
+    const chosen = resolveOption(provided, options);
+    if (chosen) {
+      resolvedAttributes[name] = chosen;
+    } else {
+      // `invalidValue` is added ONLY when the customer actually picked something
+      // for this attribute that isn't a real option (a typo or a not-offered
+      // choice) — so the reply can point that out instead of asking from scratch.
+      // Omitted entirely when they simply haven't chosen yet.
+      const entry = { field: "attribute", name, options };
+      if (provided) entry.invalidValue = provided;
+      variantMissing.push(entry);
+    }
   }
 
   // Required food modifier groups.
@@ -458,6 +562,21 @@ async function gatherCheckoutOrAsk({
   const amount = baseAmount + gaps.extraTotal;
   const negotiated = checkout.negotiatedPrice != null;
 
+  // Tag the name/email/location gaps with anything the customer just typed that
+  // failed validation, so the reply flags the bad entry rather than re-asking
+  // blankly. (Attribute gaps already carry their own `invalidValue`.)
+  const rejected = rejectedCheckoutInputs(prior, data);
+  for (const m of gaps.missing) {
+    if (m.field === "email" && rejected.email) m.invalidValue = rejected.email;
+    if (m.field === "name" && rejected.name) m.invalidValue = rejected.name;
+    if (m.field === "location" && rejected.location) m.invalidValue = rejected.location;
+  }
+
+  // Add-ons the customer asked for THIS turn that the product doesn't offer.
+  // Surfaced on every checkout result (whether more info is needed or the order
+  // completes) so the reply flags them rather than silently dropping the request.
+  const unavailableModifiers = unavailableModifierRequests(product, data.selectedModifiers);
+
   if (gaps.missing.length > 0) {
     // Keep this product in focus and remember what we've gathered so far.
     setLastProduct(businessId, customerNumber, product);
@@ -476,6 +595,7 @@ async function gatherCheckoutOrAsk({
         email: checkout.email || null,
         location: checkout.location || null,
       },
+      ...(unavailableModifiers.length ? { unavailableModifiers } : {}),
     };
   }
 
@@ -496,7 +616,19 @@ async function gatherCheckoutOrAsk({
   clearNegotiation(businessId, customerNumber);
   const s = getSession(businessId, customerNumber);
   setSession(businessId, customerNumber, { ...s, checkout: null });
-  return { ...result, negotiated };
+  // At the payment step, flag against EVERYTHING gathered (not just this turn), so
+  // an add-on the customer requested on an earlier turn — while we were still
+  // collecting their details — is still surfaced on the final summary instead of
+  // being charged silently for less.
+  const unavailableAtCheckout = unavailableModifierRequests(
+    product,
+    checkout.selectedModifiers,
+  );
+  return {
+    ...result,
+    negotiated,
+    ...(unavailableAtCheckout.length ? { unavailableModifiers: unavailableAtCheckout } : {}),
+  };
 }
 
 /**
@@ -565,13 +697,8 @@ async function runCheckout({
     },
   });
 
-  await emailService.sendInvoiceEmail(email || `${customerNumber}@staffly.app`, {
-    product,
-    orderId,
-    amount,
-    customerName,
-    location,
-  });
+  // Note: the receipt is emailed by velte-backend after payment settles (it owns
+  // the order + receipt PDF). Staffly does not send any email itself.
 
   return {
     paymentLink,
@@ -1106,6 +1233,11 @@ async function executeAction({
 
       // Rule B — fixed-price product: don't haggle, offer alternatives instead.
       if (!product.allow_negotiation) {
+        logger.warn(
+          `[Negotiation] "${product.name}" resolved as NON-negotiable (allow_negotiation=${product.allow_negotiation}, ` +
+            `price=₦${product.price}, min_price=${product.min_price ?? "none"}). ` +
+            `If this product IS negotiable in Velte, its negotiable flag isn't reaching us (field/value mismatch).`,
+        );
         clearNegotiation(businessId, customerNumber);
         actionResult = {
           nonNegotiable: true,
@@ -1131,6 +1263,10 @@ async function executeAction({
 
       const decision = concede(negotiation);
       setNegotiation(businessId, customerNumber, decision.negotiation);
+      logger.info(
+        `[Negotiation] start_negotiation press "${product.name}" → ${decision.outcome} ` +
+          `₦${(decision.counterPrice ?? decision.finalPrice ?? 0).toLocaleString()} (list ₦${product.price.toLocaleString()})`,
+      );
 
       if (decision.outcome === "final") {
         actionResult = {
@@ -1166,8 +1302,15 @@ async function executeAction({
       const freshSession = getSession(businessId, customerNumber);
       let activeNegotiation = freshSession.negotiation;
 
+      // The offer is about the product currently in focus. Prefer lastProduct so a
+      // FINISHED/stale negotiation on a PREVIOUS product (e.g. one that reached its
+      // "final" price and was never cleared) can't hijack a fresh offer on a new
+      // item. During a normal ongoing negotiation these are the same product
+      // (make_offer/start_negotiation keep lastProduct in sync), so this only
+      // changes behaviour once the customer has moved on. Fall back to the active
+      // negotiation's product only when there's no current focus.
       const productName =
-        activeNegotiation?.productName || freshSession.lastProduct?.name || null;
+        freshSession.lastProduct?.name || activeNegotiation?.productName || null;
 
       const product = productName
         ? await productService.getProductByName(businessId, productName)
@@ -1184,6 +1327,11 @@ async function executeAction({
 
       // Rule B — fixed-price product: explain and offer alternatives.
       if (!product.allow_negotiation) {
+        logger.warn(
+          `[Negotiation] "${product.name}" resolved as NON-negotiable (allow_negotiation=${product.allow_negotiation}, ` +
+            `price=₦${product.price}, min_price=${product.min_price ?? "none"}). ` +
+            `If this product IS negotiable in Velte, its negotiable flag isn't reaching us (field/value mismatch).`,
+        );
         clearNegotiation(businessId, customerNumber);
         actionResult = {
           nonNegotiable: true,
@@ -1209,6 +1357,11 @@ async function executeAction({
 
       const decision = evaluateOffer(activeNegotiation, offer);
       setNegotiation(businessId, customerNumber, decision.negotiation);
+      logger.info(
+        `[Negotiation] make_offer "${product.name}" offer=₦${Number(offer).toLocaleString()} → ${decision.outcome} ` +
+          `₦${(decision.counterPrice ?? decision.acceptedPrice ?? decision.finalPrice ?? 0).toLocaleString()} ` +
+          `(list ₦${product.price.toLocaleString()})`,
+      );
 
       // Rule F — accepted price: hand off to the same checkout gate as a direct
       // buy, at the agreed price, so variant choices and buyer details are still
@@ -1609,8 +1762,12 @@ export async function handleIncomingMessage(req, res) {
     let activeSession = session;
     let greetingWasSent = false;
 
-    // The AI-config welcome message is reserved for the very first chat. Any
-    // return after an hour+ of silence gets an AI-constructed "welcome back".
+    // The AI-config welcome message is reserved for the very first chat. The
+    // "welcome back" for a returning customer is deferred until AFTER we know
+    // what they said (handled post-classification, below): it is sent only when
+    // their return message isn't itself a request. A return that asks for
+    // something skips the greeting entirely and flows straight to the answer —
+    // no filler "I'm pulling it up" bubble.
     let greeting = null;
 
     if (isFirstVisit) {
@@ -1619,13 +1776,6 @@ export async function handleIncomingMessage(req, res) {
       greeting =
         business.aiConfig?.greetingMessage?.trim() ||
         (await openaiService.generateGreeting("first_visit", business, session.language, userMessage));
-    } else if (isReturningAfterAbsence) {
-      greeting = await openaiService.generateGreeting(
-        "welcome_back",
-        business,
-        session.language,
-        userMessage,
-      );
     }
 
     if (greeting) {
@@ -1680,6 +1830,16 @@ export async function handleIncomingMessage(req, res) {
     );
 
     let responseText = stripInternalMarkers(aiOutput.response);
+
+    // Returning after a long absence: greet only when the message isn't itself a
+    // request. A bare return ("hi", "you dey?") gets a warm welcome-back as the
+    // whole reply; a return that asks for something falls through to the answer
+    // below with no separate greeting bubble. Uses this turn's detected language.
+    if (isReturningAfterAbsence && action.type === "none") {
+      responseText =
+        (await openaiService.generateGreeting("welcome_back", business, language)) ||
+        responseText;
+    }
 
     if (action.type !== "none") {
       const { actionResult, productsToShow, asPickableCards } = await executeAction({
@@ -1751,21 +1911,33 @@ export async function handleIncomingMessage(req, res) {
           .map((p) => p.name)
           .join(", ")}]${moreItemsHint ? ` ${moreItemsHint}` : ""}`;
       } else {
-        // The stored session still has last turn's language — inject this
-        // turn's detection so the reply switches languages without lag.
-        const finalAiOutput =
-          await openaiService.generateResponseWithActionResult(
-            userMessage,
-            { ...freshSession, language },
-            actionResult,
-            business,
-          );
+        // Counter/final negotiation prices are decided by the engine and sent
+        // verbatim — the reply model has been seen to override them and refuse
+        // the customer, so it never gets to pick the number.
+        const negReply = await composeNegotiationReply(
+          language,
+          actionResult?.negotiation,
+        );
 
-        responseText = stripInternalMarkers(finalAiOutput.response);
+        if (negReply) {
+          responseText = negReply;
+        } else {
+          // The stored session still has last turn's language — inject this
+          // turn's detection so the reply switches languages without lag.
+          const finalAiOutput =
+            await openaiService.generateResponseWithActionResult(
+              userMessage,
+              { ...freshSession, language },
+              actionResult,
+              business,
+            );
 
-        // Force the exact payment URL in (the model isn't trusted to render it).
-        if (actionResult?.paymentLink) {
-          responseText = enforcePaymentLink(responseText, actionResult.paymentLink);
+          responseText = stripInternalMarkers(finalAiOutput.response);
+
+          // Force the exact payment URL in (the model isn't trusted to render it).
+          if (actionResult?.paymentLink) {
+            responseText = enforcePaymentLink(responseText, actionResult.paymentLink);
+          }
         }
 
         if (moreItemsHint) {

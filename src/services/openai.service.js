@@ -563,6 +563,7 @@ LANGUAGE:
 - Match the customer turn by turn: if THIS message is in English, set "english" and reply in English; if it's in Pidgin, set "pidgin"; same for any other language. Do NOT carry over an earlier language when the current message is clearly in a different one — if they were chatting in Pidgin and now write a plain English sentence, switch to english (and vice-versa). Never mix two languages in one reply.
 - The established preference shown in "Current context" is a fallback ONLY: use it when the current message is too short or neutral to tell its language — a bare "ok"/"yes"/"thanks", a number like "40000", a lone emoji, or just a product name. Any real sentence sets the language from itself, even a short one.
 - Be careful distinguishing English from Pidgin: real Pidgin markers are words like "wetin", "abeg", "dey", "wan", "na", "fit", "make", "una", "sef", "o". A grammatically standard English sentence with none of these is english, not pidgin.
+- EXAMPLES (the language is decided by THIS message alone, regardless of earlier turns): "How much is this dress?" → english; "Abeg how much be this dress?" / "Wetin be the price?" → pidgin; "Do you have it in red?" → english; "You get am for red?" → pidgin; "I want to buy it" → english; "I wan buy am" → pidgin. So if they spoke Pidgin before but THIS message is plain English, set english and reply in English; if they spoke English before but THIS message is Pidgin, set pidgin and reply in Pidgin.
 - Write "response" ENTIRELY in the language you set, warm and natural like real WhatsApp chat (never a caricature). Keep product names, prices (₦) and links unchanged.
 
 CORE RULES:
@@ -654,9 +655,11 @@ Guidelines:
     - "attribute": ask which "name" they want (e.g. Size, Colour, Storage) and list the available choices from its "options".
     - "modifiers": for each group in "groups", ask them to choose, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"); never invent options.
     - "name": ask for the name the order should be under.
-    - "email": ask for the email address for the order/receipt (if they gave one that looked wrong, say it didn't look valid and ask again).
+    - "email": ask for the email address for the order/receipt.
     - "location": ask for their delivery address/location.
+  WRONG INPUT — if a missing entry has an "invalidValue", the customer DID send that detail this turn but it isn't valid (a malformed email like "john@gmail" with no domain, a not-a-real-name, a too-short address, or — for an attribute — a choice that isn't offered). Don't silently re-ask: gently and specifically tell them that what they sent (quote the invalidValue back to them) doesn't look like a valid name / email / delivery address, or for an attribute that it isn't one of the available options, and ask them to send a correct one. Keep it warm, not robotic (e.g. "Hmm, 'joegmail.com' doesn't look like a complete email — could you double-check and resend it?"). For an attribute, restate the real choices from "options".
   When "name" and "email" appear together, ask for both in the same breath ("Can I get your name and email for the order?"). Keep it friendly and conversational, not a stiff form. Once they reply, the next detail (or the payment link) follows automatically.
+- UNAVAILABLE ADD-ONS — this applies to BOTH the payment-link and needsInfo results above: if actionResult.unavailableModifiers is present (a list), the customer asked for add-ons / options / toppings this product does NOT offer (e.g. an extra or side that isn't on the menu). You MUST flag each one by name and say it isn't available for this product — never silently ignore the request or pretend it was added. If the order is otherwise complete (a payment link is present), still share the link, but make clear those specific item(s) weren't included and the price reflects only what IS available. If you're still collecting details, mention the unavailable item(s) up front, then continue asking for what's missing. When the product genuinely has other add-ons, you may point them to the real ones.
 - For price negotiation (the action result has a "negotiation" object):
   - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
   - PRICES ONLY MOVE DOWN: never state a counter or final price HIGHER than any price you already offered this customer for this product earlier in the conversation. The price in the action result is the standing commitment — quote exactly that number, and never resurrect an older, higher number from the chat history.
@@ -805,7 +808,13 @@ export async function processMessage(userMessage, session = {}, business) {
   try {
     const completion = await anthropic.messages.create({
       model: "claude-haiku-4-5",
-      max_tokens: 1024,
+      // The structured response carries a free-form `response` draft PLUS the full
+      // action.data object (every field required). A checkout/order turn is the
+      // largest output the classifier emits, and 1024 truncated it mid-JSON —
+      // safeJsonParse then failed and the customer got the generic error. Give it
+      // real headroom; the model still stops at the end of the JSON, so this only
+      // raises the ceiling, not the normal token spend.
+      max_tokens: 4096,
       temperature: 0,
       system: buildActionDecisionSystem(business, session, catalogSummary),
       messages: toClaudeMessages(conversationHistory, userMessage),
@@ -834,7 +843,17 @@ export async function processMessage(userMessage, session = {}, business) {
     const parsed = safeJsonParse(rawContent);
 
     if (!parsed) {
-      logger.warn(`processMessage returned invalid JSON: ${rawContent}`);
+      // A `max_tokens` stop means the JSON was cut off mid-stream (the usual cause
+      // of unparseable output) — call it out so it's not mistaken for a model
+      // formatting bug. Anything else is genuinely malformed output.
+      if (completion.stop_reason === "max_tokens") {
+        logger.warn(
+          `processMessage hit max_tokens — response truncated and unparseable. ` +
+            `Raise max_tokens. Partial: ${rawContent}`,
+        );
+      } else {
+        logger.warn(`processMessage returned invalid JSON: ${rawContent}`);
+      }
       return fallback;
     }
 

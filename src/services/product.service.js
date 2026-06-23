@@ -3,6 +3,7 @@ import {
   searchProductsFromList,
   searchProductsFromListScored,
   formatAttributesForAI,
+  isTypeConflict,
 } from '../models/Products.js';
 import { getBusinessById } from '../models/Business.js';
 import { Product } from '../models/mongoose/Product.js';
@@ -487,6 +488,27 @@ export async function searchProducts(businessId, query, limit = 50) {
   // Re-resolve ids against the CURRENT available set, so anything that sold out
   // since the ranking was cached drops out naturally.
   const byId = new Map(available.map((p) => [p.id, p]));
+
+  // Deterministic wrong-TYPE guard. The semantic ranker occasionally promotes an
+  // item of a different product TYPE than the query named (a handbag for a
+  // "sneakers" search). Drop any ranked item that POSITIVELY belongs to another
+  // type; items whose type can't be read (thin copy) are kept, so genuine
+  // recoveries still stand. General across the catalog, not tied to any product.
+  const typeOk = (id) => {
+    const p = byId.get(id);
+    return p ? !isTypeConflict(p, query) : true;
+  };
+  const strongIds = ranking.strong.filter(typeOk);
+  const partialIds = ranking.partial.filter(typeOk);
+  const droppedByType =
+    ranking.strong.length - strongIds.length +
+    (ranking.partial.length - partialIds.length);
+  if (droppedByType > 0) {
+    logger.info(
+      `[Search] type guard dropped ${droppedByType} wrong-type item(s) for "${query}"`,
+    );
+  }
+
   const keywordRank = new Map(keywordMatches.map((p, i) => [p.id, i]));
   // Within a tier, keep keyword hits first (in their score order); semantic-only
   // recoveries follow.
@@ -503,8 +525,8 @@ export async function searchProducts(businessId, query, limit = 50) {
       .map((p) => ({ ...p, matchPercent: score }));
 
   const products = [
-    ...build(ranking.strong, STRONG_SCORE),
-    ...build(ranking.partial, PARTIAL_SCORE),
+    ...build(strongIds, STRONG_SCORE),
+    ...build(partialIds, PARTIAL_SCORE),
   ].slice(0, limit);
 
   return { products, specificity: ranking.specificity || 'specific' };

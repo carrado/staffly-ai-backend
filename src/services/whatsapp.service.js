@@ -393,40 +393,54 @@ export async function sendProductCard(phoneNumberId, accessToken, to, product, f
 const INTERACTIVE_BODY_LIMIT = 1024;
 
 /**
- * Send one product as two bubbles:
- *   1. The photo with the FULL details as its caption. WhatsApp shows an image
- *      caption in full, whereas it collapses a long interactive `body` behind a
- *      "Read more" — so putting the details in the caption keeps everything
- *      visible without a tap.
- *   2. A compact interactive "Pick this one" reply button whose id encodes the
- *      product (`select_product:<id>`) so the webhook can resolve the tap back to
- *      the exact product. Its body is just the name + price (short on purpose, so
- *      nothing here gets collapsed) — the full details are already in (1) above.
+ * Send one product as a SINGLE interactive message:
+ *   • an image header (the product photo),
+ *   • a body carrying the FULL details, and
+ *   • a "Pick this one" reply button whose id encodes the product
+ *     (`select_product:<id>`) so the webhook can resolve the tap.
  *
- * The caption falls back to a text card when there's no usable image. If only the
- * button send fails, the details have already gone out, so we just log it.
+ * Because it's one message, the photo is ALWAYS rendered above the button — Meta
+ * can't reorder a single message the way it can two separate bubbles. The
+ * trade-off is that WhatsApp may collapse a long body behind a "Read more" tap
+ * (an image caption stays fully visible); guaranteed ordering is worth that.
+ *
+ * Robust degradation: prefer an already-uploaded media id for the header, fall
+ * back to the raw image link, then — if the image fails the whole message —
+ * retry with no header (details + button still land), and finally a plain text
+ * card so the customer always gets something.
  */
 export async function sendProductButtonCard(phoneNumberId, accessToken, to, product, language = 'english') {
   const caption = await buildProductCaption(product, language);
   const labels = await getCaptionStrings(language);
 
-  // 1) Full details — image + caption (or a text card when there's no image).
-  // Sent by media id so the photo lands BEFORE the button below, not after it.
-  await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
+  // Full details live in the interactive body (capped at Meta's limit).
+  const body = caption.slice(0, INTERACTIVE_BODY_LIMIT);
 
-  // 2) Compact interactive button so the customer can still tap to pick. The body
-  // ties the button to its product (name + price) without repeating every detail.
-  const buttonBody = `*${product.name}*\n${labels.price(product.price.toLocaleString())}`.slice(
-    0,
-    INTERACTIVE_BODY_LIMIT,
-  );
-  const payload = {
+  // Resolve the photo into an image header. Prefer a media id (pre-uploaded,
+  // reliable); fall back to a raw link; with no usable image, send no header.
+  let header = null;
+  const imageUrl = sendableImageUrl(product);
+  if (imageUrl) {
+    try {
+      const mediaId = await resolveMediaId(phoneNumberId, accessToken, imageUrl);
+      header = { type: 'image', image: { id: mediaId } };
+    } catch (err) {
+      mediaIdCache.delete(mediaCacheKey(phoneNumberId, imageUrl));
+      logger.warn(
+        `[WhatsApp] media-id upload failed for "${product.name}", using image link in header: ${err.response?.data?.error?.message || err.message}`,
+      );
+      header = { type: 'image', image: { link: imageUrl } };
+    }
+  }
+
+  const buildPayload = (withHeader) => ({
     messaging_product: 'whatsapp',
     to,
     type: 'interactive',
     interactive: {
       type: 'button',
-      body: { text: buttonBody },
+      ...(withHeader && header ? { header } : {}),
+      body: { text: body },
       action: {
         buttons: [
           {
@@ -436,22 +450,37 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
         ],
       },
     },
-  };
+  });
 
-  try {
-    await axios.post(`${GRAPH_URL}/${phoneNumberId}/messages`, payload, {
+  const post = (payload) =>
+    axios.post(`${GRAPH_URL}/${phoneNumberId}/messages`, payload, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       timeout: SEND_TIMEOUT_MS,
     });
+
+  try {
+    await post(buildPayload(true));
   } catch (err) {
-    // The details already went out as the caption above — only the tap button
-    // failed, so there's nothing more to resend.
-    logger.warn(
-      `[WhatsApp] Pick button failed for product "${product.name}" (details already sent): ${err.response?.data?.error?.message || err.message}`,
-    );
+    // A bad image header can reject the whole message. Retry once without it so
+    // the details + Pick button still reach the customer.
+    if (header) {
+      logger.warn(
+        `[WhatsApp] interactive card with image failed for "${product.name}", retrying without image: ${err.response?.data?.error?.message || err.message}`,
+      );
+      try {
+        await post(buildPayload(false));
+        return;
+      } catch (err2) {
+        logger.warn(
+          `[WhatsApp] interactive card retry failed for "${product.name}", falling back to text: ${err2.response?.data?.error?.message || err2.message}`,
+        );
+      }
+    }
+    // Last resort: a plain text card so the customer at least gets the details.
+    await sendTextMessage(phoneNumberId, accessToken, to, caption);
   }
 }
 

@@ -77,6 +77,9 @@ const SEARCH_SYNONYMS = {
     'bags',
   ],
   shoes: ['shoe', 'shoes', 'sneaker', 'sneakers', 'footwear'],
+  sneaker: ['shoe', 'shoes', 'sneaker', 'sneakers', 'footwear'],
+  sneakers: ['shoe', 'shoes', 'sneaker', 'sneakers', 'footwear'],
+  trainers: ['shoe', 'shoes', 'sneaker', 'sneakers', 'trainers', 'footwear'],
   clothes: ['clothes', 'clothing', 'shirt', 'tshirt', 't-shirt', 'jacket', 'wear'],
   bags: ['bag', 'bags', 'tote', 'handbag', 'purse'],
   electronics: ['electronics', 'device', 'gadgets', 'charger', 'speaker', 'phone', 'usb'],
@@ -287,6 +290,127 @@ const matchesProductIdentity = (index, normalizedQuery) => {
       tokenize(word).some((s) => identityText.includes(s)),
     );
   });
+};
+
+// ─── Coarse product-TYPE taxonomy (deterministic wrong-type guard) ─────────────
+//
+// Mutually-exclusive product TYPES, used as a back-stop for the semantic ranker,
+// which occasionally promotes an item of the WRONG type to a strong match (a
+// handbag surfacing for a "sneakers" search). Only CLEARLY separable types live
+// here — anything ambiguous is deliberately omitted so a genuine match is never
+// demoted. This is data-driven and general: it works for every product the
+// taxonomy can type, not any one item. (Most dishes are intentionally left
+// untyped — solid foods are too varied to separate safely — but drinks vs the
+// rest is clean enough to gate.)
+const TYPE_GROUPS = {
+  // NB: only UNAMBIGUOUS type words belong here. Generic words that collide with
+  // other types or with food are deliberately excluded — e.g. "top" (a sneaker
+  // "high top"), "ring(s)" ("onion rings"), "tie"/"short"/"slide" — so the guard
+  // never demotes a real match on a coincidental word.
+  footwear: [
+    'shoe', 'shoes', 'sneaker', 'sneakers', 'trainer', 'trainers', 'heel',
+    'heels', 'boot', 'boots', 'sandal', 'sandals', 'slipper', 'slippers',
+    'slides', 'loafer', 'loafers', 'brogue', 'brogues', 'oxford', 'oxfords',
+    'footwear',
+  ],
+  bag: [
+    'bag', 'bags', 'handbag', 'handbags', 'tote', 'totes', 'purse', 'purses',
+    'backpack', 'backpacks', 'clutch', 'clutches', 'satchel', 'satchels',
+    'duffel', 'duffle',
+  ],
+  garment: [
+    'shirt', 'shirts', 'tshirt', 'tshirts', 'dress', 'dresses',
+    'trouser', 'trousers', 'jean', 'jeans', 'shorts', 'skirt', 'skirts',
+    'jacket', 'jackets', 'gown', 'gowns', 'hoodie', 'hoodies',
+    'sweater', 'sweaters', 'blouse', 'blouses', 'kaftan',
+    'agbada', 'senator',
+  ],
+  accessory: [
+    'belt', 'belts', 'cap', 'caps', 'hat', 'hats', 'watch', 'watches',
+    'jewellery', 'jewelry', 'necklace', 'necklaces', 'bracelet', 'bracelets',
+    'earring', 'earrings', 'sunglasses', 'eyewear', 'scarf', 'scarves',
+    'wallet', 'wallets',
+  ],
+  drinks: [
+    'drink', 'drinks', 'juice', 'juices', 'smoothie', 'smoothies', 'soda',
+    'sodas', 'water', 'wine', 'wines', 'beer', 'beers', 'cocktail', 'cocktails',
+    'tea', 'coffee', 'beverage', 'beverages', 'zobo', 'chapman',
+  ],
+};
+
+// token → type group, for O(1) lookup.
+const TOKEN_TYPE_GROUP = new Map(
+  Object.entries(TYPE_GROUPS).flatMap(([group, words]) =>
+    words.map((word) => [word, group]),
+  ),
+);
+
+const typeGroupsIn = (text) => {
+  const groups = new Set();
+  for (const token of tokenize(text)) {
+    const group = TOKEN_TYPE_GROUP.get(token);
+    if (group) groups.add(group);
+  }
+  return groups;
+};
+
+// Umbrella words that name a type FAMILY only when a customer SAYS them — applied
+// to the query side, never to a product's own text. Vendors routinely mis-tag
+// bags and shoes with umbrella words like "clothing"/"fashion", so we must never
+// type a PRODUCT from them; but when a SHOPPER asks for "clothes", that genuinely
+// means garments, so we can gate non-garments out. ("fashion" is intentionally
+// absent — it spans shoes, bags AND clothes, so it can't gate anything.)
+const QUERY_TYPE_UMBRELLAS = {
+  clothes: ['garment'],
+  clothing: ['garment'],
+  clothe: ['garment'],
+  wear: ['garment'],
+  apparel: ['garment'],
+  outfit: ['garment'],
+  outfits: ['garment'],
+  garment: ['garment'],
+  garments: ['garment'],
+};
+
+const queryTypeGroups = (query) => {
+  const groups = typeGroupsIn(query);
+  for (const token of tokenize(query)) {
+    const families = QUERY_TYPE_UMBRELLAS[token];
+    if (families) families.forEach((g) => groups.add(g));
+  }
+  return groups;
+};
+
+/**
+ * True when `product` clearly belongs to a DIFFERENT product type than the one
+ * `query` names — e.g. a handbag for a "sneakers" search. A deterministic
+ * back-stop for the semantic ranker's occasional wrong-type promotion.
+ *
+ * Conservative by design — returns false (no conflict) when:
+ *  - the query names no recognised type (nothing to gate against), or
+ *  - the product's own type can't be read from its name/category/tags/use-cases
+ *    (a thinly described item) — so genuine matches and legitimate recoveries
+ *    (a "Chuck Taylor High Top" with no "sneaker" in its copy) are never dropped.
+ * It fires ONLY when both sides have a known type and they don't overlap.
+ */
+export const isTypeConflict = (product, query) => {
+  const queryGroups = queryTypeGroups(query);
+  if (!queryGroups.size) return false;
+
+  const index = buildSearchIndex(product);
+  const identityText = [
+    index.nameText,
+    index.categoryText,
+    index.tagsText,
+    index.useCasesText,
+  ].join(' ');
+  const productGroups = typeGroupsIn(identityText);
+  if (!productGroups.size) return false;
+
+  for (const group of productGroups) {
+    if (queryGroups.has(group)) return false; // shares the asked-for type
+  }
+  return true; // product is typed, but never as the type asked for
 };
 
 /**
