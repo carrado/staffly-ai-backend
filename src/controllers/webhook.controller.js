@@ -421,20 +421,73 @@ function resolveOption(value, options = []) {
   return options.find((o) => String(o).toLowerCase().trim() === v) || null;
 }
 
-// Merge the details supplied this turn with everything gathered on earlier turns
-// so checkout info accumulates instead of resetting when the customer answers
-// one question at a time. New non-null values win; prior values are kept.
-function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
-  const modifiers = Array.isArray(data.selectedModifiers)
-    ? data.selectedModifiers.filter(Boolean)
-    : [];
-  // Generic attribute picks relayed as [{ name, value }] fold into a
-  // case-preserving map, new picks overriding earlier ones for the same name.
-  const attrMap = { ...(prior.selectedAttributes || {}) };
-  if (Array.isArray(data.selectedAttributes)) {
-    for (const a of data.selectedAttributes) {
+// A blank variant line in canonical form: variant choices as a case-preserving
+// { attrName: value } map, modifier names, and a unit count.
+function defaultLine() {
+  return {
+    selectedSize: null,
+    selectedColor: null,
+    selectedAttributes: {},
+    selectedModifiers: [],
+    quantity: null,
+  };
+}
+
+// Normalise one extracted item ({ quantity, selectedSize, selectedColor,
+// selectedAttributes:[{name,value}], selectedModifiers:[] }) into a canonical line.
+function toLine(item = {}) {
+  const attrMap = {};
+  if (Array.isArray(item.selectedAttributes)) {
+    for (const a of item.selectedAttributes) {
       if (a && a.name && a.value) attrMap[a.name] = a.value;
     }
+  }
+  return {
+    selectedSize: item.selectedSize || null,
+    selectedColor: item.selectedColor || null,
+    selectedAttributes: attrMap,
+    selectedModifiers: Array.isArray(item.selectedModifiers)
+      ? item.selectedModifiers.filter(Boolean)
+      : [],
+    quantity: normalizeQuantity(item.quantity) ?? null,
+  };
+}
+
+// Accumulate one line's choices across turns (new picks win, earlier ones kept)
+// so a buyer answering one question at a time still completes that line.
+function mergeLine(prev = {}, next = {}) {
+  return {
+    selectedSize: next.selectedSize || prev.selectedSize || null,
+    selectedColor: next.selectedColor || prev.selectedColor || null,
+    selectedAttributes: {
+      ...(prev.selectedAttributes || {}),
+      ...(next.selectedAttributes || {}),
+    },
+    selectedModifiers:
+      next.selectedModifiers && next.selectedModifiers.length
+        ? next.selectedModifiers
+        : prev.selectedModifiers || [],
+    quantity: next.quantity ?? prev.quantity ?? null,
+  };
+}
+
+// Merge the details supplied this turn with everything gathered on earlier turns
+// so checkout info accumulates instead of resetting when the customer answers one
+// question at a time. Buyer details are shared; the variant/quantity breakdown is
+// a list of lines (one per distinct variant). A turn that restates the breakdown
+// replaces it; a turn that supplies only buyer details keeps the prior lines. When
+// the line count is unchanged, lines merge by position so a single line's choices
+// still accumulate across turns. New non-null values win; prior values are kept.
+function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
+  const incoming = Array.isArray(data.items) ? data.items.map(toLine) : [];
+  const priorLines = prior.lines || [];
+  let lines;
+  if (!incoming.length) {
+    lines = priorLines;
+  } else if (priorLines.length === incoming.length) {
+    lines = incoming.map((ln, i) => mergeLine(priorLines[i], ln));
+  } else {
+    lines = incoming;
   }
   return {
     productName: resolvedProductName || prior.productName || null,
@@ -445,15 +498,12 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
     customerName:
       cleanCheckoutName(data.customerName) || prior.customerName || null,
     location: cleanCheckoutLocation(data.location) || prior.location || null,
-    selectedSize: data.selectedSize || prior.selectedSize || null,
-    selectedColor: data.selectedColor || prior.selectedColor || null,
-    selectedAttributes: attrMap,
-    selectedModifiers: modifiers.length
-      ? modifiers
-      : prior.selectedModifiers || [],
-    // Unit count the customer asked for; carried across turns so a quantity given
-    // early (before the buyer's details) still applies when the order closes.
-    quantity: normalizeQuantity(data.quantity) ?? prior.quantity ?? null,
+    lines,
+    // A single count stated on an earlier turn (recovered by the quantity safety
+    // net), used as the default for a one-line order that never got an explicit
+    // per-line quantity. Carried across turns; ignored for multi-line orders.
+    pendingQuantity:
+      normalizeQuantity(data.pendingQuantity) ?? prior.pendingQuantity ?? null,
     // A price agreed via negotiation overrides the list price; carried across
     // turns so a checkout completed later still closes at the agreed number.
     negotiatedPrice: prior.negotiatedPrice ?? null,
@@ -504,58 +554,93 @@ function pickSelectedAttr(checkout, attrName) {
   return null;
 }
 
-// Everything still required before this product can become an order. `missing`
-// is empty when the checkout is complete; otherwise each entry names a field the
-// reply must ask for (attributes/modifiers carry their valid options). Asks are
-// PHASED so the buyer isn't handed a long form: product variant choices first
-// (they also settle the price), then name + email together, then delivery
-// location. Accumulation across turns means a buyer who volunteers everything at
-// once still completes — phasing only governs what we ASK when something's left.
+// Everything still required before this product can become an order. Validates
+// EACH variant line (every line needs a value for every multi-option attribute
+// and every required modifier group), then the shared buyer details. `missing` is
+// empty when the checkout is complete; otherwise each entry names a field the
+// reply must ask for (attributes/modifiers carry their valid options). A per-line
+// variant gap is tagged with a `line` descriptor — only when the order has more
+// than one line — so the reply can ask about the right item. Asks are PHASED so
+// the buyer isn't handed a long form: product variant choices first (they also
+// settle the price), then name + email together, then delivery location.
+// Accumulation across turns means a buyer who volunteers everything at once still
+// completes — phasing only governs what we ASK when something's left.
 function computeCheckoutGaps(product, checkout) {
-  const variantMissing = [];
-  const resolvedAttributes = {};
-
-  // Generic product attributes: any attribute the product lists with 2+ distinct
-  // options is a real variant the buyer must pick (a single-value attribute is
-  // just a spec — nothing to choose). Works for Size, Colour, Storage, Material,
-  // Flavour, etc. with no per-attribute code.
+  const lines =
+    checkout.lines && checkout.lines.length ? checkout.lines : [defaultLine()];
   const attrGroups = product.attributes || {};
-  for (const [name, rawValues] of Object.entries(attrGroups)) {
-    const options = normalizeAttrOptions(rawValues);
-    if (options.length < 2) continue; // informational spec, not a choice
-    const provided = pickSelectedAttr(checkout, name);
-    const chosen = resolveOption(provided, options);
-    if (chosen) {
-      resolvedAttributes[name] = chosen;
-    } else {
-      // `invalidValue` is added ONLY when the customer actually picked something
-      // for this attribute that isn't a real option (a typo or a not-offered
-      // choice) — so the reply can point that out instead of asking from scratch.
-      // Omitted entirely when they simply haven't chosen yet.
-      const entry = { field: "attribute", name, options };
-      if (provided) entry.invalidValue = provided;
-      variantMissing.push(entry);
-    }
-  }
+  const variantMissing = [];
+  const resolvedLines = [];
 
-  // Required food modifier groups.
-  const modifierCheck = resolveSelectedModifiers(
-    product,
-    checkout.selectedModifiers,
-  );
-  if (modifierCheck.missingRequired.length > 0) {
-    variantMissing.push({
-      field: "modifiers",
-      groups: modifierCheck.missingRequired.map((group) => ({
-        name: group.name,
-        multiSelect: group.multiSelect,
-        options: group.options.map((o) => ({
-          name: o.name,
-          additionalPrice: o.additionalPrice,
+  lines.forEach((line, index) => {
+    const resolvedAttributes = {};
+    const lineMissing = [];
+
+    // Generic product attributes: any attribute the product lists with 2+ distinct
+    // options is a real variant the buyer must pick (a single-value attribute is
+    // just a spec — nothing to choose). Works for Size, Colour, Storage, Material,
+    // Flavour, etc. with no per-attribute code.
+    for (const [name, rawValues] of Object.entries(attrGroups)) {
+      const options = normalizeAttrOptions(rawValues);
+      if (options.length < 2) continue; // informational spec, not a choice
+      const provided = pickSelectedAttr(line, name);
+      const chosen = resolveOption(provided, options);
+      if (chosen) {
+        resolvedAttributes[name] = chosen;
+      } else {
+        // `invalidValue` is added ONLY when the customer actually picked something
+        // for this attribute that isn't a real option (a typo or a not-offered
+        // choice) — so the reply can point that out instead of asking from scratch.
+        // Omitted entirely when they simply haven't chosen yet.
+        const entry = { field: "attribute", name, options };
+        if (provided) entry.invalidValue = provided;
+        lineMissing.push(entry);
+      }
+    }
+
+    // Required food modifier groups, per line.
+    const modifierCheck = resolveSelectedModifiers(
+      product,
+      line.selectedModifiers,
+    );
+    if (modifierCheck.missingRequired.length > 0) {
+      lineMissing.push({
+        field: "modifiers",
+        groups: modifierCheck.missingRequired.map((group) => ({
+          name: group.name,
+          multiSelect: group.multiSelect,
+          options: group.options.map((o) => ({
+            name: o.name,
+            additionalPrice: o.additionalPrice,
+          })),
         })),
-      })),
+      });
+    }
+
+    // Tag each gap with the line it belongs to, so a multi-line order can ask for
+    // the right item ("for the 1 in black, which size?"). Single-line orders need
+    // no tag — there's only one item to ask about.
+    for (const m of lineMissing) {
+      if (lines.length > 1) {
+        m.line = {
+          index,
+          quantity: normalizeQuantity(line.quantity) ?? 1,
+          chosen: resolvedAttributes,
+        };
+      }
+      variantMissing.push(m);
+    }
+
+    resolvedLines.push({
+      selectedSize: line.selectedSize,
+      selectedColor: line.selectedColor,
+      selectedAttributes: line.selectedAttributes,
+      quantity: line.quantity,
+      resolvedAttributes,
+      selections: modifierCheck.selections,
+      extraTotal: modifierCheck.extraTotal,
     });
-  }
+  });
 
   const needName = !checkout.customerName;
   const needEmail = !checkout.email || !EMAIL_RE.test(checkout.email);
@@ -574,12 +659,7 @@ function computeCheckoutGaps(product, checkout) {
     missing = [];
   }
 
-  return {
-    missing,
-    selections: modifierCheck.selections,
-    extraTotal: modifierCheck.extraTotal,
-    attributes: resolvedAttributes,
-  };
+  return { missing, lines: resolvedLines };
 }
 
 // The price a buy should close at when the customer has been haggling. Prefer a
@@ -608,13 +688,41 @@ function resolveAgreedPrice(session, product) {
   return null;
 }
 
+// The human variant text for one resolved line, e.g. "Red, L" or "Chicken, Extra
+// Plantain" — chosen attribute values first, then modifier add-on names. Empty
+// string when the line has no variant/modifier choices.
+function lineVariantText(item) {
+  return [
+    ...Object.values(item.attributes || {}),
+    ...(item.modifiers || []).map((m) => m.name),
+  ].join(", ");
+}
+
+// The order's display label on the link/invoice. A single line keeps the familiar
+// "T-Shirt (L, Red) ×2" form; multiple lines list each variant with its count:
+// "T-Shirt (Red ×3, Black ×1)".
+function buildOrderLabel(product, items) {
+  if (items.length <= 1) {
+    const it = items[0];
+    const variant = it ? lineVariantText(it) : "";
+    const base = variant ? `${product.name} (${variant})` : product.name;
+    return it && it.quantity > 1 ? `${base} ×${it.quantity}` : base;
+  }
+  const parts = items.map((it) => {
+    const variant = lineVariantText(it);
+    return variant ? `${variant} ×${it.quantity}` : `×${it.quantity}`;
+  });
+  return `${product.name} (${parts.join(", ")})`;
+}
+
 /**
  * The single gate every checkout passes through. Accumulates the buyer details,
  * and EITHER returns a `needsInfo` result (so the reply asks for exactly what's
  * left, and the gathered details persist to the session for the next turn) OR,
  * when nothing is missing, places the order via runCheckout and clears the
  * gathered state. `negotiatedPrice` (when set) is the agreed unit price that
- * overrides the list price.
+ * overrides the list price. The order is one product with one or more variant
+ * lines; the amount sums each line's (unit price + its modifier add-ons) × count.
  */
 async function gatherCheckoutOrAsk({
   businessId,
@@ -627,13 +735,32 @@ async function gatherCheckoutOrAsk({
   const checkout = mergeCheckout(prior, data, product.name);
   if (negotiatedPrice != null) checkout.negotiatedPrice = negotiatedPrice;
 
+  // A one-line order with no explicit per-line count inherits a quantity stated on
+  // an earlier turn (the safety net stashes it as pendingQuantity).
+  if (checkout.lines.length <= 1 && checkout.pendingQuantity != null) {
+    const ln = checkout.lines[0] || defaultLine();
+    if (ln.quantity == null) ln.quantity = checkout.pendingQuantity;
+    checkout.lines = [ln];
+  }
+
   const gaps = computeCheckoutGaps(product, checkout);
-  const quantity = normalizeQuantity(checkout.quantity) ?? 1;
-  // Per-unit price (negotiated price or list, plus chosen modifier add-ons),
-  // then multiplied by quantity for the amount actually charged.
-  const unitAmount =
-    (checkout.negotiatedPrice ?? product.price) + gaps.extraTotal;
-  const amount = unitAmount * quantity;
+
+  // Per-line pricing: one shared unit price (negotiated or list) plus THAT line's
+  // modifier add-ons, times the line's quantity; the order total sums the lines.
+  const baseUnit = checkout.negotiatedPrice ?? product.price;
+  const items = gaps.lines.map((line) => {
+    const quantity = normalizeQuantity(line.quantity) ?? 1;
+    const unitPrice = baseUnit + line.extraTotal;
+    return {
+      quantity,
+      unitPrice,
+      lineTotal: unitPrice * quantity,
+      attributes: line.resolvedAttributes,
+      modifiers: line.selections,
+    };
+  });
+  const amount = items.reduce((sum, it) => sum + it.lineTotal, 0);
+  const totalQuantity = items.reduce((sum, it) => sum + it.quantity, 0);
   const negotiated = checkout.negotiatedPrice != null;
 
   // Tag the name/email/location gaps with anything the customer just typed that
@@ -647,13 +774,24 @@ async function gatherCheckoutOrAsk({
       m.invalidValue = rejected.location;
   }
 
-  // Add-ons the customer asked for THIS turn that the product doesn't offer.
-  // Surfaced on every checkout result (whether more info is needed or the order
-  // completes) so the reply flags them rather than silently dropping the request.
+  // Add-ons the customer asked for THIS turn that the product doesn't offer,
+  // gathered across every line in the turn's breakdown. Surfaced on every checkout
+  // result so the reply flags them rather than silently dropping the request.
+  const turnModifiers = Array.isArray(data.items)
+    ? data.items.flatMap((i) => i.selectedModifiers || [])
+    : [];
   const unavailableModifiers = unavailableModifierRequests(
     product,
-    data.selectedModifiers,
+    turnModifiers,
   );
+
+  // A compact, reply-facing view of the lines (variant text + count + line total).
+  const resultItems = items.map((it) => ({
+    variant: lineVariantText(it),
+    quantity: it.quantity,
+    unitPrice: it.unitPrice,
+    lineTotal: it.lineTotal,
+  }));
 
   if (gaps.missing.length > 0) {
     // Keep this product in focus and remember what we've gathered so far.
@@ -664,12 +802,17 @@ async function gatherCheckoutOrAsk({
       needsInfo: true,
       product: product.name,
       price: amount,
-      quantity,
+      quantity: totalQuantity,
+      items: resultItems,
+      multiLine: resultItems.length > 1,
       negotiated,
       missing: gaps.missing,
       collected: {
-        // What's already been gathered, so the reply doesn't re-ask for it.
-        attributes: gaps.attributes,
+        // What's already been gathered, so the reply doesn't re-ask for it. For a
+        // single line this is its chosen attributes; multi-line asks carry their
+        // own per-line `chosen`, so the shared map is left empty.
+        attributes:
+          resultItems.length === 1 ? gaps.lines[0].resolvedAttributes : {},
         name: checkout.customerName || null,
         email: checkout.email || null,
         location: checkout.location || null,
@@ -683,12 +826,11 @@ async function gatherCheckoutOrAsk({
     customerNumber,
     product,
     amount,
-    quantity,
+    quantity: totalQuantity,
+    items,
     email: checkout.email,
     customerName: checkout.customerName,
     location: checkout.location,
-    selectedAttributes: gaps.attributes,
-    selectedModifiers: gaps.selections,
   });
 
   // Order placed — clear the gathered checkout (and any finished negotiation) so
@@ -696,13 +838,14 @@ async function gatherCheckoutOrAsk({
   clearNegotiation(businessId, customerNumber);
   const s = getSession(businessId, customerNumber);
   setSession(businessId, customerNumber, { ...s, checkout: null });
-  // At the payment step, flag against EVERYTHING gathered (not just this turn), so
-  // an add-on the customer requested on an earlier turn — while we were still
-  // collecting their details — is still surfaced on the final summary instead of
-  // being charged silently for less.
+  // At the payment step, flag against EVERYTHING gathered (every line, not just
+  // this turn), so an add-on the customer requested on an earlier turn — while we
+  // were still collecting their details — is still surfaced on the final summary
+  // instead of being charged silently for less.
+  const allModifiers = checkout.lines.flatMap((l) => l.selectedModifiers || []);
   const unavailableAtCheckout = unavailableModifierRequests(
     product,
-    checkout.selectedModifiers,
+    allModifiers,
   );
   return {
     ...result,
@@ -724,33 +867,58 @@ async function runCheckout({
   product,
   amount,
   quantity = 1,
+  items = [],
   email,
   customerName,
   location,
-  selectedAttributes = {},
-  selectedModifiers = [],
 }) {
   setLastProduct(businessId, customerNumber, product);
 
-  // E.g. "T-Shirt (L, Red)" or "Jollof Rice (Chicken, Extra Plantain)" on the
-  // payment link/invoice — chosen variants first, then modifier add-ons.
-  const labelExtras = [
-    ...Object.values(selectedAttributes),
-    ...selectedModifiers.map((m) => m.name),
-  ];
-  const baseLabel = labelExtras.length
-    ? `${product.name} (${labelExtras.join(", ")})`
-    : product.name;
-  // Show the count on the payment link / invoice label, e.g. "T-Shirt (L) ×2".
-  const itemLabel = quantity > 1 ? `${baseLabel} ×${quantity}` : baseLabel;
+  // Fall back to a single, variant-less line so a plain order still has one item.
+  const lines = items.length
+    ? items
+    : [
+        {
+          quantity,
+          unitPrice: amount,
+          lineTotal: amount,
+          attributes: {},
+          modifiers: [],
+        },
+      ];
 
-  // Derive size/colour from the chosen attributes for the reply summary, which
-  // reads them back to the customer.
+  // E.g. "T-Shirt (L, Red) ×2" for a single line, or "T-Shirt (Red ×3, Black ×1)"
+  // for a multi-variant order, on the payment link / invoice.
+  const itemLabel = buildOrderLabel(product, lines);
+
+  // The per-line breakdown carried to velte: stored on the order, flows into the
+  // Paystack metadata and the fulfilment order. Each line is self-describing.
+  const orderItems = lines.map((it) => {
+    const variant = lineVariantText(it);
+    return {
+      name: variant ? `${product.name} (${variant})` : product.name,
+      variant: variant || null,
+      quantity: it.quantity,
+      unitPrice: it.unitPrice,
+      lineTotal: it.lineTotal,
+      attributes: Object.entries(it.attributes || {}).map(([name, value]) => ({
+        name,
+        value,
+      })),
+      modifiers: (it.modifiers || []).map((m) => ({
+        group: m.group,
+        name: m.name,
+        additionalPrice: m.additionalPrice,
+      })),
+    };
+  });
+
+  // Derive size/colour from the first line's chosen attributes for the reply
+  // summary, which reads them back to the customer (single-line orders).
+  const firstAttrs = lines[0]?.attributes || {};
   const findAttr = (re) => {
-    const k = Object.keys(selectedAttributes).find((n) =>
-      re.test(n.toLowerCase()),
-    );
-    return k ? selectedAttributes[k] : null;
+    const k = Object.keys(firstAttrs).find((n) => re.test(n.toLowerCase()));
+    return k ? firstAttrs[k] : null;
   };
 
   // `amount` is already VAT-inclusive (tax is folded in at the product mapper),
@@ -765,6 +933,7 @@ async function runCheckout({
       customerEmail: email,
       location,
       quantity,
+      items: orderItems,
       productId: product?.id ? String(product.id) : null,
       productImage: product?.image_url || null,
     },
@@ -793,20 +962,26 @@ async function runCheckout({
     orderId,
     product: product.name,
     quantity,
-    // VAT-inclusive total (unit price × quantity), shown to the customer as "Price".
+    // VAT-inclusive total (Σ line totals), shown to the customer as "Price".
     price: amount,
+    multiLine: orderItems.length > 1,
+    // The variant breakdown for the reply to read back on a multi-variant order.
+    items: orderItems.map((it) => ({
+      variant: it.variant,
+      quantity: it.quantity,
+      unitPrice: it.unitPrice,
+      lineTotal: it.lineTotal,
+    })),
     customerName: customerName || null,
     location: location || null,
     email: email || null,
-    selectedAttributes: Object.entries(selectedAttributes).map(
-      ([name, value]) => ({
-        name,
-        value,
-      }),
-    ),
+    selectedAttributes: Object.entries(firstAttrs).map(([name, value]) => ({
+      name,
+      value,
+    })),
     selectedSize: findAttr(/size/) || null,
     selectedColor: findAttr(/colou?r/) || null,
-    selectedModifiers: selectedModifiers.map((m) => ({
+    selectedModifiers: (lines[0]?.modifiers || []).map((m) => ({
       group: m.group,
       name: m.name,
       additionalPrice: m.additionalPrice,
@@ -1969,26 +2144,35 @@ export async function handleIncomingMessage(req, res) {
 
     // Quantity safety net. The model frequently omits the unit count even when
     // the customer clearly stated one ("I want 3"), which silently bills and
-    // stores the order as a single unit. Trust the model's count when it set
-    // one; otherwise recover it deterministically from the raw message. Fill it
-    // into this turn's checkout action when the model under-specified it, and
-    // persist it to the checkout session so a count given on an EARLIER turn
-    // (while browsing, negotiating, or giving details) still applies when the
-    // order finally closes. In a confirmed checkout turn even a bare "3" is a
-    // quantity (the intent disambiguates it); elsewhere an explicit cue is
-    // required, and pure browse/search turns never overwrite the remembered qty.
+    // stores the order as a single unit. This only ever second-guesses a SINGLE
+    // -line order — a multi-variant breakdown ("3 red + 1 black") is the model's
+    // to split into items, and extractQuantity already declines ambiguous multi
+    // -count messages. Trust the model's per-line count when it set one; otherwise
+    // recover it from the raw message: fill it into this turn's single line, and
+    // persist it as pendingQuantity so a count given on an EARLIER turn (while
+    // browsing, negotiating, or giving details) still applies when the order
+    // closes. In a confirmed checkout turn even a bare "3" is a quantity (the
+    // intent disambiguates it); elsewhere an explicit cue is required, and pure
+    // browse/search turns never overwrite the remembered quantity.
     const isCheckoutAction = CHECKOUT_ACTIONS.has(action.type);
-    const modelQuantity = isCheckoutAction
-      ? normalizeQuantity(action.data?.quantity)
+    const lineItems =
+      isCheckoutAction && Array.isArray(action.data?.items)
+        ? action.data.items
+        : [];
+    const singleLine = lineItems.length <= 1;
+    const modelQuantity = singleLine
+      ? normalizeQuantity(lineItems[0]?.quantity)
       : null;
-    const statedQuantity =
-      modelQuantity ??
-      openaiService.extractQuantity(userMessage, {
-        allowBare: isCheckoutAction,
-      });
+    const statedQuantity = singleLine
+      ? (modelQuantity ??
+        openaiService.extractQuantity(userMessage, {
+          allowBare: isCheckoutAction,
+        }))
+      : null;
     if (statedQuantity != null) {
       if (isCheckoutAction && modelQuantity == null) {
-        action.data = { ...action.data, quantity: statedQuantity };
+        const line = { ...(lineItems[0] || {}), quantity: statedQuantity };
+        action.data = { ...action.data, items: [line] };
         logger.info(
           `[${business.name}] Quantity fallback: recovered ×${statedQuantity} from message`,
         );
@@ -1997,7 +2181,7 @@ export async function handleIncomingMessage(req, res) {
         const s = getSession(businessId, customerNumber);
         setSession(businessId, customerNumber, {
           ...s,
-          checkout: { ...(s.checkout || {}), quantity: statedQuantity },
+          checkout: { ...(s.checkout || {}), pendingQuantity: statedQuantity },
         });
       }
     }

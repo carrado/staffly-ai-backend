@@ -1,8 +1,8 @@
-import { createOrder } from '../models/Order.js';
-import { getBusinessById } from '../models/Business.js';
-import { PaymentLink } from '../models/mongoose/PaymentLink.js';
-import { env } from '../config/env.js';
-import { logger } from '../utils/logger.js';
+import { createOrder } from "../models/Order.js";
+import { getBusinessById } from "../models/Business.js";
+import { PaymentLink } from "../models/mongoose/PaymentLink.js";
+import { env } from "../config/env.js";
+import { logger } from "../utils/logger.js";
 
 /**
  * Append a query param to a URL, picking `?` vs `&` correctly and leaving any
@@ -10,10 +10,10 @@ import { logger } from '../utils/logger.js';
  * works for the bare velte link and the internal placeholder alike.
  */
 function appendQueryParam(url, key, value) {
-  const [base, hash = ''] = String(url).split('#');
-  const sep = base.includes('?') ? '&' : '?';
+  const [base, hash = ""] = String(url).split("#");
+  const sep = base.includes("?") ? "&" : "?";
   const qs = `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-  return `${base}${sep}${qs}${hash ? `#${hash}` : ''}`;
+  return `${base}${sep}${qs}${hash ? `#${hash}` : ""}`;
 }
 
 /**
@@ -35,7 +35,13 @@ function appendQueryParam(url, key, value) {
  * back to us. `ref` is an opaque pointer only; amount/PII stay server-side (in
  * the StafflyOrder), never in the URL where a customer could tamper with them.
  */
-export async function generatePaymentLink(businessId, customerNumber, productName, amount, buyer = {}) {
+export async function generatePaymentLink(
+  businessId,
+  customerNumber,
+  productName,
+  amount,
+  buyer = {},
+) {
   const order = await createOrder({
     businessId,
     customerNumber,
@@ -46,6 +52,9 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
     productImage: buyer.productImage || null,
     amount,
     quantity: buyer.quantity || 1,
+    // Per-variant line breakdown (one entry for a plain order, several for a
+    // multi-variant one), so the pay page and fulfilment order show each line.
+    items: Array.isArray(buyer.items) ? buyer.items : [],
     customerName: buyer.customerName || null,
     customerEmail: buyer.customerEmail || null,
     location: buyer.location || null,
@@ -72,12 +81,17 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
       // own preset price and silently override what the customer agreed. So we
       // only fall back to a fixed-amount link when the merchant has no open one,
       // and flag it loudly. Newest qualifying link wins.
-      const openLink = await PaymentLink.findOne({ ...activeFilter, amount: null })
+      const openLink = await PaymentLink.findOne({
+        ...activeFilter,
+        amount: null,
+      })
         .sort({ createdAt: -1 })
         .lean();
       const link =
         openLink ||
-        (await PaymentLink.findOne(activeFilter).sort({ createdAt: -1 }).lean());
+        (await PaymentLink.findOne(activeFilter)
+          .sort({ createdAt: -1 })
+          .lean());
       if (link?.url) {
         paymentLink = link.url;
         if (link.amount != null) {
@@ -93,10 +107,10 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
       // Development aid: dump every PaymentLink this merchant has (with the
       // fields that decide selection) plus the one we picked, so you can see why
       // a given link was or wasn't chosen.
-      if (env.nodeEnv === 'development') {
+      if (env.nodeEnv === "development") {
         const all = await PaymentLink.find({ userId: velteUserId })
           .sort({ createdAt: -1 })
-          .select('linkId url isActive deletedAt expiresAt amount')
+          .select("linkId url isActive deletedAt expiresAt amount")
           .lean();
         logger.info(
           `[Payment][dev] velteUserId ${velteUserId} has ${all.length} PaymentLink(s): ` +
@@ -112,7 +126,7 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
             ),
         );
         logger.info(
-          `[Payment][dev] order ${order.id} → selected link: ${link?.url || '(none — placeholder will be used)'}`,
+          `[Payment][dev] order ${order.id} → selected link: ${link?.url || "(none — placeholder will be used)"}`,
         );
       }
     } catch (err) {
@@ -135,7 +149,7 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
         `[Payment] Business ${businessId} has NO velteUserId — can't map to a velte PaymentLink; using placeholder. (Was it connected via the OAuth callback instead of loaded from AISetup?)`,
       );
     } else {
-      let diag = '';
+      let diag = "";
       try {
         const total = await PaymentLink.countDocuments({ userId: velteUserId });
         const active = await PaymentLink.countDocuments({
@@ -157,7 +171,7 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
   // exactly which checkout this payment is for. The placeholder already encodes
   // order.id in its path, but tagging `ref` uniformly keeps the pay-page logic
   // (read linkId from path, ref from query) the same for both link shapes.
-  const paymentLinkWithRef = appendQueryParam(paymentLink, 'ref', order.id);
+  const paymentLinkWithRef = appendQueryParam(paymentLink, "ref", order.id);
 
   return { paymentLink: paymentLinkWithRef, orderId: order.id };
 }

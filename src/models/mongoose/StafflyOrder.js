@@ -1,4 +1,4 @@
-import mongoose from 'mongoose';
+import mongoose from "mongoose";
 
 /**
  * StafflyOrder — the durable backing store for the lightweight checkout records
@@ -24,17 +24,45 @@ const StafflyOrderSchema = new mongoose.Schema(
     // `product` above stays the human label (incl. chosen variants/modifiers).
     productId: { type: String, default: null },
     productImage: { type: String, default: null }, // Product.mainImageUrl at checkout
-    amount: { type: Number }, // grand total = unit price × quantity
-    quantity: { type: Number, default: 1, min: 1 },
-    status: { type: String, default: 'pending' }, // pending | paid | failed
+    amount: { type: Number }, // grand total = Σ line totals
+    quantity: { type: Number, default: 1, min: 1 }, // total units = Σ line quantities
+    // Per-variant breakdown of the order. One entry for a plain order; several for
+    // a multi-variant order (e.g. 3 red + 1 black). Stored loosely (no _id) since
+    // it's a snapshot the pay page and fulfilment order read back.
+    items: {
+      type: [
+        new mongoose.Schema(
+          {
+            name: { type: String }, // display label, e.g. "T-Shirt (Red)"
+            variant: { type: String, default: null }, // "Red, L" (null = no variant)
+            quantity: { type: Number, default: 1, min: 1 },
+            unitPrice: { type: Number }, // per-unit price incl. modifier add-ons
+            lineTotal: { type: Number }, // unitPrice × quantity
+            attributes: [{ name: String, value: String, _id: false }],
+            modifiers: [
+              {
+                group: String,
+                name: String,
+                additionalPrice: Number,
+                _id: false,
+              },
+            ],
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    status: { type: String, default: "pending" }, // pending | paid | failed
     // Buyer details gathered during the WhatsApp checkout, used to fulfil the
     // order (name on the order, receipt email, delivery location).
     customerName: { type: String, default: null },
     customerEmail: { type: String, default: null },
     location: { type: String, default: null },
   },
-  { collection: 'staffly_orders', timestamps: true },
+  { collection: "staffly_orders", timestamps: true },
 );
 
 export const StafflyOrder =
-  mongoose.models.StafflyOrder || mongoose.model('StafflyOrder', StafflyOrderSchema);
+  mongoose.models.StafflyOrder ||
+  mongoose.model("StafflyOrder", StafflyOrderSchema);

@@ -10,7 +10,7 @@
  * for why this is kept apart from the platform `orders` collection).
  */
 
-import { StafflyOrder } from './mongoose/StafflyOrder.js';
+import { StafflyOrder } from "./mongoose/StafflyOrder.js";
 
 const toOrder = (doc) =>
   doc
@@ -22,6 +22,8 @@ const toOrder = (doc) =>
         productId: doc.productId || null,
         productImage: doc.productImage || null,
         amount: doc.amount,
+        quantity: doc.quantity ?? 1,
+        items: Array.isArray(doc.items) ? doc.items : [],
         status: doc.status,
         customerName: doc.customerName || null,
         customerEmail: doc.customerEmail || null,
@@ -38,7 +40,8 @@ export const createOrder = async ({
   productImage = null,
   amount,
   quantity = 1,
-  status = 'pending',
+  items = [],
+  status = "pending",
   customerName = null,
   customerEmail = null,
   location = null,
@@ -54,6 +57,7 @@ export const createOrder = async ({
     productImage,
     amount,
     quantity,
+    items,
     status,
     customerName,
     customerEmail,
@@ -77,6 +81,8 @@ export const getOrderById = async (id) => {
 };
 
 export const getOrdersByBusiness = async (businessId) => {
-  const docs = await StafflyOrder.find({ businessId }).sort({ createdAt: -1 }).lean();
+  const docs = await StafflyOrder.find({ businessId })
+    .sort({ createdAt: -1 })
+    .lean();
   return docs.map(toOrder);
 };

@@ -140,32 +140,66 @@ function toPositiveInt(value) {
   return Number.isFinite(n) && n >= 1 ? n : null;
 }
 
-// The buyer/order details any checkout action may carry. Shared by
-// generate_payment_link, accept_offer, and make_offer so a customer can supply
-// them at any point (e.g. alongside an offer, or in a later reply) and the
-// controller accumulates them until the order has everything it needs.
-function extractCheckoutData(data = {}) {
+// One variant line of an order: a distinct combination of variant choices with
+// its own unit count. A multi-variant order (e.g. 3 red + 1 black) is several of
+// these; a plain order is a single line. Pulled from either an `items[]` entry
+// or the legacy flat fields, so both model shapes normalise to the same thing.
+function extractLineItem(raw = {}) {
   return {
-    email: toNullableString(data.email),
-    customerName: toNullableString(data.customerName),
-    location: toNullableString(data.location),
-    // How many units the customer wants (null = not stated → defaults to 1).
-    quantity: toPositiveInt(data.quantity),
-    selectedSize: toNullableString(data.selectedSize),
-    selectedColor: toNullableString(data.selectedColor),
+    // How many units of THIS variant (null = not stated → defaults to 1 later).
+    quantity: toPositiveInt(raw.quantity),
+    selectedSize: toNullableString(raw.selectedSize),
+    selectedColor: toNullableString(raw.selectedColor),
     // Generic variant picks for ANY product attribute the customer chose
     // (Storage, Material, Flavour, …), each a { name, value } pair.
-    selectedAttributes: Array.isArray(data.selectedAttributes)
-      ? data.selectedAttributes
+    selectedAttributes: Array.isArray(raw.selectedAttributes)
+      ? raw.selectedAttributes
           .map((a) => ({
             name: toNullableString(a?.name),
             value: toNullableString(a?.value),
           }))
           .filter((a) => a.name && a.value)
       : [],
-    selectedModifiers: Array.isArray(data.selectedModifiers)
-      ? data.selectedModifiers.map((m) => toNullableString(m)).filter(Boolean)
+    selectedModifiers: Array.isArray(raw.selectedModifiers)
+      ? raw.selectedModifiers.map((m) => toNullableString(m)).filter(Boolean)
       : [],
+  };
+}
+
+// A line carries information only if it states a count or any variant/modifier
+// choice; an empty line (e.g. a turn that only supplied buyer details) is dropped
+// so it never clobbers what was gathered on an earlier turn.
+function isMeaningfulLine(line) {
+  return (
+    line.quantity != null ||
+    line.selectedSize != null ||
+    line.selectedColor != null ||
+    line.selectedAttributes.length > 0 ||
+    line.selectedModifiers.length > 0
+  );
+}
+
+// The buyer/order details any checkout action may carry. Shared by
+// generate_payment_link, accept_offer, and make_offer so a customer can supply
+// them at any point (e.g. alongside an offer, or in a later reply) and the
+// controller accumulates them until the order has everything it needs. Buyer
+// details are shared across the whole order; the variant/quantity breakdown is
+// normalised to an `items` array (one entry per distinct variant) whether the
+// model sent a multi-variant `items[]` or the legacy single-variant flat fields.
+function extractCheckoutData(data = {}) {
+  let items = [];
+  if (Array.isArray(data.items) && data.items.length) {
+    items = data.items.map(extractLineItem).filter(isMeaningfulLine);
+  }
+  if (!items.length) {
+    const single = extractLineItem(data);
+    if (isMeaningfulLine(single)) items = [single];
+  }
+  return {
+    email: toNullableString(data.email),
+    customerName: toNullableString(data.customerName),
+    location: toNullableString(data.location),
+    items,
   };
 }
 
@@ -300,6 +334,10 @@ const clampQuantity = (n) =>
  * With `allowBare`, a message that is essentially just a number (e.g. a reply to
  * "how many?") also counts — only safe when the caller already knows the turn is
  * a checkout, where the intent disambiguates the bare number.
+ *
+ * Returns null on an ambiguous multi-count message ("3 red and 1 black"): that's
+ * a multi-variant breakdown for the model to split into `items`, not a single
+ * total to guess — collapsing it here is exactly the bug this guards against.
  */
 export function extractQuantity(message, { allowBare = false } = {}) {
   if (typeof message !== "string") return null;
@@ -310,6 +348,17 @@ export function extractQuantity(message, { allowBare = false } = {}) {
   if (/\b(?:a|one)\s+pair\b/.test(text)) return 2;
   if (/\b(?:a|one)\s+couple\b/.test(text)) return 2;
   if (/\b(?:a|one)\s+dozen\b/.test(text)) return 12;
+
+  // Two or more distinct small numbers signal a multi-variant split — bail and
+  // let the model produce one item per variant rather than collapse to a wrong
+  // single total. (A phone number / address number tripping this just means we
+  // safely decline to guess a quantity.)
+  const distinctCounts = new Set(
+    (text.match(/\b\d{1,2}\b/g) || [])
+      .map(Number)
+      .filter((n) => n >= 1 && n <= 99),
+  );
+  if (distinctCounts.size >= 2) return null;
 
   const numericPatterns = [
     // buy/quantity verb + count: "I want 3", "buy 2", "give me 4", "make it 5"
@@ -792,7 +841,7 @@ CHOOSING THE ACTION:
 - start_negotiation — asks for a discount/"last price"/reduction WITHOUT a number ("how much last?", "you fit reduce am?", "e too cost", "abeg do am for me").
 - make_offer — proposes a specific price, any phrasing: "I fit do 25k", "can you do 18000?", "make I run am 26", "20k last", "oya collect 22", "na 25 I get", "I no fit pass 25". Put the resolved amount in data.offer. NEVER stall, "check", "confirm" or "get back to them" — pricing is resolved instantly; the system gives you the counter/acceptance/final price to deliver.
 - accept_offer — clearly agrees to the price YOU last offered ("ok", "deal", "I'll take it").
-- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), quantity, email, customerName, location, selectedSize, selectedColor, selectedAttributes:[{name,value}], selectedModifiers:[] }. quantity = how many units of this product the customer wants, as a whole number — set it whenever they say a count ("two", "2", "3 of them", "a pair" = 2, "a dozen" = 12); leave it out (defaults to 1) when they don't state one. The price the system charges already multiplies by quantity, so never do that maths yourself. To place an order the system needs the buyer's name, email, and delivery location, plus a chosen value for every variant the product lists (size, colour, or ANY other attribute like storage, material, flavour) and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; selectedModifiers = chosen option names). For variant picks: put size in selectedSize and colour in selectedColor as before, and put any OTHER attribute choice in selectedAttributes as { name, value } using the attribute's exact name from the product (e.g. { "name": "Storage", "value": "256GB" }). Do NOT invent, guess, auto-fill, or assume any of these — and NEVER copy the example values shown anywhere in these instructions (names, emails, addresses, option values) into data. They are format illustrations, not customer data. A field goes into data ONLY when the customer actually typed that value in this conversation; otherwise leave it null/empty. The system then replies asking for exactly what's still missing, so it is always correct to leave a field out — it is never correct to fill it with a placeholder to "complete" the order. Always use this action for buy/checkout intent even when details are incomplete.
+- generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), items:[{ quantity, selectedSize, selectedColor, selectedAttributes:[{name,value}], selectedModifiers:[] }], email, customerName, location }. The order is for ONE product (productName); 'items' is its breakdown into variant lines. Use ONE item per DISTINCT variant combination the customer asked for, each with its own quantity: "3 in red and 1 in black" → items:[{quantity:3,selectedColor:"red"},{quantity:1,selectedColor:"black"}]; a plain "I want 2" with no variant split → items:[{quantity:2}]. quantity on a line = how many of THAT variant, as a whole number — set it whenever they say a count ("two", "2", "3 of them", "a pair" = 2, "a dozen" = 12); leave it out (defaults to 1) when they don't state one. The price the system charges already multiplies each line by its quantity and sums the lines, so never do that maths yourself. ALWAYS include the COMPLETE current breakdown in 'items' on every checkout turn (every variant line, not just the newest) — the system replaces the breakdown each turn, so a line you omit is dropped. email, customerName and location are SHARED across the whole order (one buyer), so keep them at the top level of data, NOT inside items. To place an order the system needs the buyer's name, email, and delivery location, plus — for EACH item line — a chosen value for every variant the product lists (size, colour, or ANY other attribute like storage, material, flavour) and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; per line: selectedModifiers = chosen option names). For variant picks on a line: put size in selectedSize and colour in selectedColor, and put any OTHER attribute choice in selectedAttributes as { name, value } using the attribute's exact name from the product (e.g. { "name": "Storage", "value": "256GB" }). Do NOT invent, guess, auto-fill, or assume any of these — and NEVER copy the example values shown anywhere in these instructions (names, emails, addresses, option values) into data. They are format illustrations, not customer data. A field goes into data ONLY when the customer actually typed that value in this conversation; otherwise leave it null/empty. The system then replies asking for exactly what's still missing, so it is always correct to leave a field out — it is never correct to fill it with a placeholder to "complete" the order. Always use this action for buy/checkout intent even when details are incomplete.
 - CHECKOUT FOLLOW-UP: once you've asked the customer for order details (name, email, delivery location, size, colour, or a modifier choice), treat their next message that supplies any of those as continuing the SAME purchase → action generate_payment_link, with productName = the item being bought (from context) and every detail they just gave mapped into data. When the customer sends a bare reply that is clearly their details — a name, an email, and an address run together (e.g. "<their name>, <their email>, <their address>") — parse each part into customerName, email, and location respectively, using ONLY what they actually wrote (never a placeholder). Never restart a search or answer "none" when the customer is clearly answering your checkout questions.
 - send_product_image — wants to SEE a product (picture/photo/"what does it look like?"). The ONLY way to send a photo.
 - find_similar_negotiable — agrees to see similar items they can bargain on, or asks for them directly.
@@ -862,9 +911,9 @@ Guidelines:
   - Never confirm a size/color/variant that is not in the result.
 - For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
   - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
-- For payment links: the order is confirmed — present a short, friendly order summary, THEN the link. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). The price is the single, all-in figure — present it simply as the price; never mention tax, VAT, or any breakdown. For the link itself, write the EXACT literal placeholder {{PAYMENT_LINK}} (those exact characters, double curly braces) on its own line where the link should appear — do NOT write, guess, copy, complete, or "fix" any actual URL yourself (the system substitutes the real payment link for that placeholder). Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. Only mention details that are actually present in the result; never invent any. (The price already includes any modifier extra cost.)
+- For payment links: the order is confirmed — present a short, friendly order summary, THEN the link. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). MULTI-VARIANT ORDERS: when actionResult.multiLine is true, the order has several variant lines in actionResult.items — list EACH line on its own (its variant text and quantity, e.g. "Red ×3", "Black ×1"), so the customer sees the full breakdown, then give the single all-in total (actionResult.price). Read the lines back EXACTLY as given; never merge, drop, or invent a line, and never collapse different variants into one. The price is the single, all-in figure — present it simply as the price; never mention tax, VAT, or any breakdown. For the link itself, write the EXACT literal placeholder {{PAYMENT_LINK}} (those exact characters, double curly braces) on its own line where the link should appear — do NOT write, guess, copy, complete, or "fix" any actual URL yourself (the system substitutes the real payment link for that placeholder). Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. Only mention details that are actually present in the result; never invent any. (The price already includes any modifier extra cost.)
 - If the result has "needsInfo": true, the order is NOT placed yet and NO payment link exists — do not share or invent a link. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. The system gathers these in stages, so actionResult.missing holds only the items to ask for RIGHT NOW — ask for EXACTLY those, all together in ONE warm, natural message, and nothing else. DON'T re-ask for anything in actionResult.collected (already provided — collected.attributes holds chosen variants, plus name/email/location; you may briefly acknowledge them). Map each missing entry by its "field":
-    - "attribute": ask which "name" they want (e.g. Size, Colour, Storage) and list the available choices from its "options".
+    - "attribute": ask which "name" they want (e.g. Size, Colour, Storage) and list the available choices from its "options". If the entry has a "line" object, this is a MULTI-ITEM order and the question is about ONE specific item — identify it for the customer by its line.quantity and any already-chosen attributes in line.chosen (e.g. "for the 3 you want in red, which size?" / "and for the 1 in black?") so it's clear which item each question is for. Ask the questions for every missing line together in the one message.
     - "modifiers": for each group in "groups", ask them to choose, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"); never invent options.
     - "name": ask for the name the order should be under.
     - "email": ask for the email address for the order/receipt.
