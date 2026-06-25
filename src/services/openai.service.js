@@ -9,26 +9,30 @@
 import { openai } from "../config/openai.js";
 import { anthropic } from "../config/anthropic.js";
 import { logger } from "../utils/logger.js";
-import { buildProductContext, getCatalogSummary, getCatalogVocabulary } from "../services/product.service.js";
-import fs from 'fs';
-import { promisify } from 'util';
+import {
+  buildProductContext,
+  getCatalogSummary,
+  getCatalogVocabulary,
+} from "../services/product.service.js";
+import fs from "fs";
+import { promisify } from "util";
 import { toFile } from "openai/uploads";
 
 const writeFile = promisify(fs.writeFile);
 const unlink = promisify(fs.unlink);
 
 const VALID_ACTION_TYPES = new Set([
-  'none',
-  'search_products',
-  'show_more_products',
-  'check_attribute',
-  'start_negotiation',
-  'make_offer',
-  'accept_offer',
-  'find_similar_negotiable',
-  'send_product_image',
-  'generate_payment_link',
-  'list_categories',
+  "none",
+  "search_products",
+  "show_more_products",
+  "check_attribute",
+  "start_negotiation",
+  "make_offer",
+  "accept_offer",
+  "find_similar_negotiable",
+  "send_product_image",
+  "generate_payment_link",
+  "list_categories",
 ]);
 
 // Each rule collapses a BARE, generic browse to a canonical broad query the
@@ -56,11 +60,39 @@ const BROAD_SEARCH_KEYWORDS = [
 // fashion" as a department name and showing the whole catalog. Product-neutral:
 // works for fashion, food, electronics, anything.
 const AUDIENCE_TERMS = [
-  { terms: ["women", "woman", "ladies", "lady", "female", "females", "girl", "girls", "womens"], label: "women" },
-  { terms: ["men", "man", "male", "males", "boys", "boy", "mens", "gentlemen"], label: "men" },
-  { terms: ["kids", "kid", "children", "child", "baby", "babies", "toddler", "toddlers", "infant"], label: "kids" },
+  {
+    terms: [
+      "women",
+      "woman",
+      "ladies",
+      "lady",
+      "female",
+      "females",
+      "girl",
+      "girls",
+      "womens",
+    ],
+    label: "women",
+  },
+  {
+    terms: ["men", "man", "male", "males", "boys", "boy", "mens", "gentlemen"],
+    label: "men",
+  },
+  {
+    terms: [
+      "kids",
+      "kid",
+      "children",
+      "child",
+      "baby",
+      "babies",
+      "toddler",
+      "toddlers",
+      "infant",
+    ],
+    label: "kids",
+  },
 ];
-
 
 function getAudioExtension(mimeType = "") {
   if (mimeType.includes("ogg")) return "ogg";
@@ -75,8 +107,6 @@ function getAudioExtension(mimeType = "") {
 
   return "ogg";
 }
-
-
 
 function safeJsonParse(value) {
   try {
@@ -144,7 +174,10 @@ function extractCheckoutData(data = {}) {
 // languages need no code change. Normalize casing/spacing and fold the common
 // aliases for Nigerian Pidgin so it stays one canonical value.
 function normalizeLanguageName(value) {
-  const cleaned = String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const cleaned = String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
   if (!cleaned) return null;
   if (/\bpidgin\b/.test(cleaned) || cleaned === "naija") return "pidgin";
   return cleaned;
@@ -175,13 +208,16 @@ function parsePossibleNumber(value) {
       .match(/^₦?\s*([\d,]+(?:\.\d+)?)\s*(k|m)?$/);
     if (shorthand) {
       const amount = Number(shorthand[1].replace(/,/g, ""));
-      const multiplier = shorthand[2] === "k" ? 1000 : shorthand[2] === "m" ? 1e6 : 1;
+      const multiplier =
+        shorthand[2] === "k" ? 1000 : shorthand[2] === "m" ? 1e6 : 1;
       if (Number.isFinite(amount) && amount > 0) return amount * multiplier;
     }
 
     const numericValue = Number(value.replace(/[^\d.]/g, ""));
     // 0 / empty means "no usable amount", not a free product.
-    return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : null;
+    return Number.isFinite(numericValue) && numericValue > 0
+      ? numericValue
+      : null;
   }
 
   return null;
@@ -219,9 +255,101 @@ export function extractOfferAmount(text, referencePrice = null) {
   if (!tokens) return null;
 
   const amounts = tokens
-    .map((t) => scaleOfferToContext(parsePossibleNumber(t.trim()), referencePrice))
+    .map((t) =>
+      scaleOfferToContext(parsePossibleNumber(t.trim()), referencePrice),
+    )
     .filter((n) => n !== null && n >= 100);
   return amounts.length ? Math.max(...amounts) : null;
+}
+
+// Spelled-out counts we recognise inside buy phrases ("two", "a dozen").
+const WORD_QUANTITIES = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  dozen: 12,
+};
+const QTY_WORDS = Object.keys(WORD_QUANTITIES).join("|");
+// Units/anaphora that mark a preceding number as a count ("3 pieces", "2 of them").
+const QTY_UNITS =
+  "pcs?|pieces?|pairs?|units?|packs?|sets?|qty|of\\s+(?:them|it|these|those)";
+// A 1–2 digit count NOT immediately part of a money amount (avoid "3k", "30 naira").
+const QTY_NUM = "(\\d{1,2})(?!\\s*(?:k\\b|m\\b|naira|ngn|₦))";
+const QTY_VERBS =
+  "want|buy|order|get|take|need|grab|cop|purchase|add|gimme|give me|make it";
+
+const clampQuantity = (n) =>
+  Number.isFinite(n) && n >= 1 && n <= 99 ? Math.floor(n) : null;
+
+/**
+ * Best-effort extraction of an explicit unit count from a buyer's message, used
+ * to recover `quantity` when the model omits it on a checkout action. Conservative
+ * by design: it keys off explicit quantity cues (buy verbs, "N of them", "N
+ * pieces", "xN", "a pair/dozen") so prices, sizes, phone numbers and search
+ * counts aren't misread as a quantity. Returns a whole number ≥1, or null.
+ *
+ * With `allowBare`, a message that is essentially just a number (e.g. a reply to
+ * "how many?") also counts — only safe when the caller already knows the turn is
+ * a checkout, where the intent disambiguates the bare number.
+ */
+export function extractQuantity(message, { allowBare = false } = {}) {
+  if (typeof message !== "string") return null;
+  const text = message.toLowerCase();
+
+  // Fixed quantity phrases.
+  if (/\bhalf\s+a\s+dozen\b/.test(text)) return 6;
+  if (/\b(?:a|one)\s+pair\b/.test(text)) return 2;
+  if (/\b(?:a|one)\s+couple\b/.test(text)) return 2;
+  if (/\b(?:a|one)\s+dozen\b/.test(text)) return 12;
+
+  const numericPatterns = [
+    // buy/quantity verb + count: "I want 3", "buy 2", "give me 4", "make it 5"
+    new RegExp(`\\b(?:${QTY_VERBS})\\s+${QTY_NUM}\\b`),
+    // count + unit/anaphora: "3 pieces", "2 pairs", "5 units", "3 of them"
+    new RegExp(`\\b${QTY_NUM}\\s*(?:${QTY_UNITS})\\b`),
+    // explicit qty markers: "qty 3", "quantity: 3"
+    new RegExp(`\\b(?:qty|quantity)\\s*[:=]?\\s*${QTY_NUM}\\b`),
+    // shorthand "x3" / "×3"
+    /[x×]\s*(\d{1,2})\b/,
+  ];
+  for (const re of numericPatterns) {
+    const m = text.match(re);
+    if (m) {
+      const n = clampQuantity(Number(m[1]));
+      if (n) return n;
+    }
+  }
+
+  // Spelled-out counts in a buy phrase: "buy two", "two of them", "three pairs".
+  const wordRe = new RegExp(
+    `\\b(?:${QTY_VERBS})\\s+(${QTY_WORDS})\\b` +
+      `|\\b(${QTY_WORDS})\\s+(?:${QTY_UNITS})\\b`,
+  );
+  const wm = text.match(wordRe);
+  if (wm) {
+    const n = clampQuantity(WORD_QUANTITIES[wm[1] || wm[2]]);
+    if (n) return n;
+  }
+
+  // A message that is essentially just a number — only trusted in checkout context.
+  if (allowBare) {
+    const trimmed = text.trim();
+    const bare = trimmed.match(/^(\d{1,2})$/);
+    if (bare) return clampQuantity(Number(bare[1]));
+    if (WORD_QUANTITIES[trimmed] != null)
+      return clampQuantity(WORD_QUANTITIES[trimmed]);
+  }
+
+  return null;
 }
 
 function buildContextString(session) {
@@ -261,15 +389,85 @@ function buildContextString(session) {
 // no product type of their own, so a gender/type word left beside them still
 // counts as a bare browse.
 const BROAD_QUERY_FILLER = new Set([
-  "i", "a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "is", "it",
-  "my", "me", "you", "your", "we", "our", "for", "with", "this", "that", "these",
-  "do", "does", "have", "has", "there", "some", "any", "please", "pls", "want",
-  "need", "buy", "get", "purchase", "order", "find", "show", "see", "looking",
-  "look", "search", "available", "sell", "nice", "fine", "good", "great", "best",
-  "quality", "original", "cheap", "affordable", "new",
-  "product", "products", "item", "items", "something", "anything", "stuff",
-  "thing", "things", "one", "ones",
-  "wan", "wetin", "abeg", "make", "una", "dey", "na", "am", "sef", "go", "fit",
+  "i",
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "of",
+  "in",
+  "on",
+  "at",
+  "to",
+  "is",
+  "it",
+  "my",
+  "me",
+  "you",
+  "your",
+  "we",
+  "our",
+  "for",
+  "with",
+  "this",
+  "that",
+  "these",
+  "do",
+  "does",
+  "have",
+  "has",
+  "there",
+  "some",
+  "any",
+  "please",
+  "pls",
+  "want",
+  "need",
+  "buy",
+  "get",
+  "purchase",
+  "order",
+  "find",
+  "show",
+  "see",
+  "looking",
+  "look",
+  "search",
+  "available",
+  "sell",
+  "nice",
+  "fine",
+  "good",
+  "great",
+  "best",
+  "quality",
+  "original",
+  "cheap",
+  "affordable",
+  "new",
+  "product",
+  "products",
+  "item",
+  "items",
+  "something",
+  "anything",
+  "stuff",
+  "thing",
+  "things",
+  "one",
+  "ones",
+  "wan",
+  "wetin",
+  "abeg",
+  "make",
+  "una",
+  "dey",
+  "na",
+  "am",
+  "sef",
+  "go",
+  "fit",
 ]);
 
 // Collapse a query to a canonical broad term ONLY when it is a bare product
@@ -301,11 +499,13 @@ export function reframeAudienceQuery(query) {
 
   // Whatever product type is left, minus filler, becomes "<type> for <audience>".
   const typeWords = rest.filter((word) => !BROAD_QUERY_FILLER.has(word));
-  return typeWords.length ? `${typeWords.join(" ")} for ${audience}` : `for ${audience}`;
+  return typeWords.length
+    ? `${typeWords.join(" ")} for ${audience}`
+    : `for ${audience}`;
 }
 
 export function normalizeBroadSearchQuery(rawQuery) {
-  if (rawQuery?.trim() === '*') return '*';
+  if (rawQuery?.trim() === "*") return "*";
 
   const query = normalizeText(rawQuery);
   if (!query) return "";
@@ -359,7 +559,8 @@ function normalizeActionData(type, rawData = {}, session = {}) {
       // to whatever the customer was already browsing so we never drift to an
       // unrelated category. A budget alone must never trigger a blank/"cheap"
       // catalog-wide search.
-      const BUDGET_ONLY = /^(cheap(er)?|affordable|budget|lower|cheaper ones?|less|reduced?|inexpensive|pocket[- ]?friendly)$/i;
+      const BUDGET_ONLY =
+        /^(cheap(er)?|affordable|budget|lower|cheaper ones?|less|reduced?|inexpensive|pocket[- ]?friendly)$/i;
       if ((!query || BUDGET_ONLY.test(query)) && query !== "*") {
         const anchor =
           toCleanString(session.lastSearch?.query) ||
@@ -435,8 +636,8 @@ function normalizeActionData(type, rawData = {}, session = {}) {
     case "show_more_products":
       return {};
 
-      case 'list_categories':
-        return {};
+    case "list_categories":
+      return {};
     case "none":
     default:
       return {};
@@ -490,7 +691,10 @@ export function normalizeAiOutput(aiOutput, session = {}) {
   const { type: _type, data: rawData, ...flattenedFields } = rawAction;
   const data = normalizeActionData(
     type,
-    { ...flattenedFields, ...(rawData && typeof rawData === "object" ? rawData : {}) },
+    {
+      ...flattenedFields,
+      ...(rawData && typeof rawData === "object" ? rawData : {}),
+    },
     session,
   );
 
@@ -555,7 +759,7 @@ function buildActionDecisionSystem(business, session, catalogSummary = null) {
   const contextStr = buildContextString(session);
   const catalogSnapshot = buildCatalogSnapshot(catalogSummary);
   const tone = business.aiConfig?.businessTone;
-  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : "";
 
   // Static instruction body — byte-identical across every call and every
   // business, so it can serve as a cached system prefix (Anthropic prompt
@@ -618,7 +822,7 @@ Current context is provided below.`;
 function buildActionResultPrompt(business, session, actionResult) {
   const contextStr = buildContextString(session);
   const tone = business.aiConfig?.businessTone;
-  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : "";
 
   return `You are an AI sales assistant for "${business.name}".${toneInstruction}
 You just executed an action for a customer. Use the action result below to craft a natural, helpful WhatsApp reply.
@@ -941,7 +1145,7 @@ export async function translateDescriptions(products, language) {
   const pending = [];
 
   for (const product of products) {
-    const description = (product.description || '').trim();
+    const description = (product.description || "").trim();
     if (!description) continue;
 
     const cacheKey = `${lang}:${product.id}:${description}`;
@@ -963,13 +1167,15 @@ ${JSON.stringify(pending)}`;
 
     try {
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: prompt }],
-        response_format: { type: 'json_object' },
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
         temperature: 0.3,
       });
 
-      const parsed = safeJsonParse(completion.choices?.[0]?.message?.content || '{}');
+      const parsed = safeJsonParse(
+        completion.choices?.[0]?.message?.content || "{}",
+      );
       const translations = parsed?.translations || {};
 
       for (const { id, description } of pending) {
@@ -1006,7 +1212,12 @@ ${JSON.stringify(pending)}`;
  * `asSuggestions` true → frame the items as close-but-not-exact alternatives;
  * false → frame them as more matches. Returns a string, or null on failure.
  */
-export async function generateMoreItemsNote({ count, asSuggestions, language, business }) {
+export async function generateMoreItemsNote({
+  count,
+  asSuggestions,
+  language,
+  business,
+}) {
   const lang = normalizeLanguageName(language) || "english";
   const tone = business?.aiConfig?.businessTone;
   const toneInstruction = tone ? ` Match this tone: ${tone}.` : "";
@@ -1027,12 +1238,17 @@ export async function generateMoreItemsNote({ count, asSuggestions, language, bu
       temperature: 0.7, // a little variety so it doesn't read canned
       messages: [
         { role: "system", content: system },
-        { role: "user", content: `Compose the line. Number of other items: ${count}.` },
+        {
+          role: "user",
+          content: `Compose the line. Number of other items: ${count}.`,
+        },
       ],
     });
     return completion.choices?.[0]?.message?.content?.trim() || null;
   } catch (error) {
-    logger.warn(`[MoreItemsNote] generation failed (template used): ${error.message}`);
+    logger.warn(
+      `[MoreItemsNote] generation failed (template used): ${error.message}`,
+    );
     return null;
   }
 }
@@ -1070,7 +1286,9 @@ export async function translateUiString(text, language) {
     uiStringCache.set(key, result);
     return result;
   } catch (error) {
-    logger.warn(`[i18n] UI string translation to ${lang} failed; using English: ${error.message}`);
+    logger.warn(
+      `[i18n] UI string translation to ${lang} failed; using English: ${error.message}`,
+    );
     return text;
   }
 }
@@ -1099,7 +1317,9 @@ async function buildTranscriptionPrompt(business) {
       `Transcribe product/brand names, places and amounts accurately, and capture every detail the speaker gives.`
     );
   } catch (error) {
-    logger.warn(`[Transcribe] vocabulary context unavailable: ${error.message}`);
+    logger.warn(
+      `[Transcribe] vocabulary context unavailable: ${error.message}`,
+    );
     return null;
   }
 }
@@ -1142,15 +1362,15 @@ export async function transcribeAudio(audioData, business = null) {
 // evening" to local time rather than the server clock.
 function getTimeOfDay() {
   const hour = Number(
-    new Intl.DateTimeFormat('en-US', {
-      hour: 'numeric',
+    new Intl.DateTimeFormat("en-US", {
+      hour: "numeric",
       hour12: false,
-      timeZone: 'Africa/Lagos',
+      timeZone: "Africa/Lagos",
     }).format(new Date()),
   );
-  if (hour < 12) return 'morning';
-  if (hour < 17) return 'afternoon';
-  return 'evening';
+  if (hour < 12) return "morning";
+  if (hour < 17) return "afternoon";
+  return "evening";
 }
 
 // gpt-4o-mini tends to format greetings like a formal letter — a "Dear
@@ -1158,20 +1378,22 @@ function getTimeOfDay() {
 // regards, The X Team" sign-off. We never have the buyer's name and this is a
 // live WhatsApp chat, so strip any of that the prompt didn't prevent.
 function sanitizeGreeting(text) {
-  if (!text) return '';
-  return text
-    // [Customer's Name], {name}, {{ store }} and similar placeholders
-    .replace(/\[[^\]]*\]/g, '')
-    .replace(/\{\{?[^}]*\}?\}/g, '')
-    // a leading "Dear ...," salutation line
-    .replace(/^\s*dear\b[^\n,]*,?[ \t]*\n?/i, '')
-    // a letter-style closing ("Warm regards," / "Best," …) and everything after
-    .replace(
-      /\n+[ \t]*(warm regards|kind regards|best regards|regards|sincerely|cheers|best wishes|warmly|yours truly|best)\b[\s\S]*$/i,
-      '',
-    )
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  if (!text) return "";
+  return (
+    text
+      // [Customer's Name], {name}, {{ store }} and similar placeholders
+      .replace(/\[[^\]]*\]/g, "")
+      .replace(/\{\{?[^}]*\}?\}/g, "")
+      // a leading "Dear ...," salutation line
+      .replace(/^\s*dear\b[^\n,]*,?[ \t]*\n?/i, "")
+      // a letter-style closing ("Warm regards," / "Best," …) and everything after
+      .replace(
+        /\n+[ \t]*(warm regards|kind regards|best regards|regards|sincerely|cheers|best wishes|warmly|yours truly|best)\b[\s\S]*$/i,
+        "",
+      )
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
 }
 
 // We never know the customer's name, and these go out as a WhatsApp bubble, not
@@ -1180,9 +1402,14 @@ function sanitizeGreeting(text) {
 const SHORT_MESSAGE_CONSTRAINTS =
   ' Write it as ONE short, friendly WhatsApp line (two at most). Do NOT address the customer by name or use any placeholder such as [Customer\'s Name] or [Name] — you do not know their name. Do NOT add a sign-off, signature, or team name (no "Warm regards", no "The Team"). No subject line, no letter formatting.';
 
-export async function generateGreeting(type, business, language = 'english', userMessage = '') {
+export async function generateGreeting(
+  type,
+  business,
+  language = "english",
+  userMessage = "",
+) {
   const tone = business.aiConfig?.businessTone;
-  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : "";
   const languageInstruction = languageWritingInstruction(language);
 
   const formatConstraints = SHORT_MESSAGE_CONSTRAINTS;
@@ -1193,8 +1420,9 @@ export async function generateGreeting(type, business, language = 'english', use
   // visit. A returning customer (records already exist) gets a well-articulated,
   // time-aware "welcome back" — it must never reuse the configured greeting.
   const fallback =
-    type === 'first_visit'
-      ? business.aiConfig?.greetingMessage?.trim() || `Welcome to ${business.name}! 👋 How can I help you today?`
+    type === "first_visit"
+      ? business.aiConfig?.greetingMessage?.trim() ||
+        `Welcome to ${business.name}! 👋 How can I help you today?`
       : `Good ${timeOfDay}! Welcome back to ${business.name} 👋 How can I help you today?`;
 
   try {
@@ -1205,28 +1433,30 @@ export async function generateGreeting(type, business, language = 'english', use
     // or list products).
     const bridge = userMessage
       ? ` The customer's message also asks for something specific: "${userMessage}". In the SAME greeting, briefly acknowledge that request and say you're pulling it up for them — but do NOT answer it, name prices, or list any products here (that follows immediately after). Just make the greeting flow naturally into it.`
-      : '';
+      : "";
 
     const userPrompt =
-      type === 'first_visit'
+      type === "first_visit"
         ? `Write a warm, engaging welcome message for a brand-new customer chatting with us for the first time. Keep it short and WhatsApp-friendly.${bridge} Plain text only, no JSON, no markdown.${formatConstraints}`
-        : `Write a short, warm "welcome back" message for a returning customer who was away for a while. It is currently ${timeOfDay} for them, so open with the matching time-of-day greeting (e.g. "Good ${timeOfDay}").${bridge || ' Make it feel personal and inviting.'} Plain text only, no JSON, no markdown.${formatConstraints}`;
+        : `Write a short, warm "welcome back" message for a returning customer who was away for a while. It is currently ${timeOfDay} for them, so open with the matching time-of-day greeting (e.g. "Good ${timeOfDay}").${bridge || " Make it feel personal and inviting."} Plain text only, no JSON, no markdown.${formatConstraints}`;
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: "gpt-4o-mini",
       messages: [
         {
-          role: 'system',
+          role: "system",
           content: `You are an AI sales assistant for "${business.name}".${toneInstruction}${languageInstruction}`,
         },
-        { role: 'user', content: userPrompt },
+        { role: "user", content: userPrompt },
       ],
       temperature: 0.7,
     });
 
-    return sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback;
+    return (
+      sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback
+    );
   } catch (error) {
-    logger.error('generateGreeting failed:', error);
+    logger.error("generateGreeting failed:", error);
     return fallback;
   }
 }
@@ -1236,42 +1466,53 @@ export async function generateGreeting(type, business, language = 'english', use
  * roughly an hour after a payment link was sent and the customer went quiet
  * without paying. Warm and no-pressure — never pushy or guilt-trippy.
  */
-export async function generatePaymentFollowUp(business, productName, amount, language = 'english') {
+export async function generatePaymentFollowUp(
+  business,
+  productName,
+  amount,
+  language = "english",
+) {
   const tone = business.aiConfig?.businessTone;
-  const toneInstruction = tone ? ` Your communication style is ${tone}.` : '';
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : "";
   const languageInstruction = languageWritingInstruction(language);
 
-  const priceText = typeof amount === 'number' ? `₦${amount.toLocaleString()}` : null;
+  const priceText =
+    typeof amount === "number" ? `₦${amount.toLocaleString()}` : null;
 
   const fallback =
-    language === 'pidgin'
-      ? `Hello! 👋 I still keep your ${productName}${priceText ? ` (${priceText})` : ''} ready for you. You wan make we complete the order? I dey here if you get any question.`
-      : `Hi! 👋 Just checking in — your ${productName}${priceText ? ` (${priceText})` : ''} is still reserved for you. Would you like to complete your order? I'm happy to help if you have any questions.`;
+    language === "pidgin"
+      ? `Hello! 👋 I still keep your ${productName}${priceText ? ` (${priceText})` : ""} ready for you. You wan make we complete the order? I dey here if you get any question.`
+      : `Hi! 👋 Just checking in — your ${productName}${priceText ? ` (${priceText})` : ""} is still reserved for you. Would you like to complete your order? I'm happy to help if you have any questions.`;
 
   try {
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: "gpt-4o-mini",
       messages: [
         {
-          role: 'system',
+          role: "system",
           content: `You are an AI sales assistant for "${business.name}".${toneInstruction}${languageInstruction}`,
         },
         {
-          role: 'user',
-          content: `A customer began checking out "${productName}"${priceText ? ` for ${priceText}` : ''} — a payment link was sent — but they did not complete payment and have been quiet for about an hour. Write a SHORT, warm, no-pressure follow-up: gently let them know the item is still available/reserved and invite them to complete the order or ask any question. Do NOT be pushy, do NOT guilt them, and do NOT mention any discount unless told to. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
+          role: "user",
+          content: `A customer began checking out "${productName}"${priceText ? ` for ${priceText}` : ""} — a payment link was sent — but they did not complete payment and have been quiet for about an hour. Write a SHORT, warm, no-pressure follow-up: gently let them know the item is still available/reserved and invite them to complete the order or ask any question. Do NOT be pushy, do NOT guilt them, and do NOT mention any discount unless told to. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
         },
       ],
       temperature: 0.7,
     });
 
-    return sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback;
+    return (
+      sanitizeGreeting(completion.choices?.[0]?.message?.content) || fallback
+    );
   } catch (error) {
-    logger.error('generatePaymentFollowUp failed:', error);
+    logger.error("generatePaymentFollowUp failed:", error);
     return fallback;
   }
 }
 
-export async function generateVoiceErrorMessage(business, language = "english") {
+export async function generateVoiceErrorMessage(
+  business,
+  language = "english",
+) {
   const fallback =
     language === "pidgin"
       ? "Sorry o, I no fit process your voice note. Abeg type your message as text 🙏"

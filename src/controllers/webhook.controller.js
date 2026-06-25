@@ -12,7 +12,10 @@
  * - payment link generation
  */
 
-import { getBusinessByPhoneNumberId, getBusinessById } from "../models/Business.js";
+import {
+  getBusinessByPhoneNumberId,
+  getBusinessById,
+} from "../models/Business.js";
 import {
   getSession,
   setSession,
@@ -26,19 +29,41 @@ import * as whatsapp from "../services/whatsapp.service.js";
 import * as openaiService from "../services/openai.service.js";
 import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
-import { startNegotiation, evaluateOffer, concede } from "../services/negotiation.service.js";
+import {
+  startNegotiation,
+  evaluateOffer,
+  concede,
+} from "../services/negotiation.service.js";
 import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
-const SEARCH_PAGE_SIZE = 3;      // image cards per page for a specific search
+const SEARCH_PAGE_SIZE = 3; // image cards per page for a specific search
 const SEARCH_MAX_CARD_PAGES = 2; // card pages in chat before handing off to the online store
 const STORE_URL_BASE = "https://velte.ng/stores";
 const SEARCH_LIMIT = 50;
-const BROWSE_PAGE_SIZE = 10;     // numbered text entries per page for a broad "*" browse
-const BROWSE_LIMIT = 200;        // broad browse pages through the whole catalog
-const SIMILAR_PAGE_SIZE = 4;     // text-only "similar negotiable" alternatives
-const LOW_STOCK_THRESHOLD = 5;   // used to justify counter-offers ("only N left")
+const BROWSE_PAGE_SIZE = 10; // numbered text entries per page for a broad "*" browse
+const BROWSE_LIMIT = 200; // broad browse pages through the whole catalog
+const SIMILAR_PAGE_SIZE = 4; // text-only "similar negotiable" alternatives
+const LOW_STOCK_THRESHOLD = 5; // used to justify counter-offers ("only N left")
 const STRONG_MATCH_PERCENT = 90; // matchPercent at/above this = what the customer asked for
+
+// Actions that can carry buyer/checkout details (see extractCheckoutData) and so
+// a unit quantity we may need to recover when the model omits it on this turn.
+const CHECKOUT_ACTIONS = new Set([
+  "generate_payment_link",
+  "accept_offer",
+  "make_offer",
+]);
+// Browse/search turns where a number means "how many results", not order qty —
+// never let one of those overwrite the remembered checkout quantity.
+const QUANTITY_PERSIST_BLOCKED = new Set([
+  "search_products",
+  "show_more_products",
+  "list_categories",
+  "send_product_image",
+  "find_similar_negotiable",
+  "check_attribute",
+]);
 
 // Fixed, code-composed strings the customer can see. AI-written replies mirror
 // the customer's language on their own; these cover everything written in code.
@@ -60,9 +85,9 @@ const STRINGS = {
     // A SECOND (or later) reduction — never repeat the round-1 line. Frame it as a
     // fresh cut made specially for the customer, justified by the product's quality.
     negCounterAgain: (name, price, round) =>
-      (round >= 3
+      round >= 3
         ? `Tell you what — *${name}* is one of my best pieces and built to last, but I'll shave off a little more just for you: ₦${price}. Shall I package it?`
-        : `Okay, let me come down a bit more for you — *${name}* is genuinely good quality, so I'll do ₦${price}. Want me to package it?`),
+        : `Okay, let me come down a bit more for you — *${name}* is genuinely good quality, so I'll do ₦${price}. Want me to package it?`,
     negFinal: (name, price) =>
       `I've come down as far as I can on *${name}* — ₦${price} is honestly the lowest I can let it go for. Shall I package it for you?`,
     notUnderstood:
@@ -86,9 +111,9 @@ const STRINGS = {
     // A SECOND (or later) reduction — no need to repeat the round-1 line. Frame it
     // as a fresh cut made because of the customer, backed by the product quality.
     negCounterAgain: (name, price, round) =>
-      (round >= 3
+      round >= 3
         ? `Make I tell you — *${name}* na one of my best goods wey strong well well, but I go cut am small more just for you: ₦${price}. Make I package am?`
-        : `Okay, make I reduce am small more for you — *${name}* quality good well well, so I go do ₦${price}. Make I package am?`),
+        : `Okay, make I reduce am small more for you — *${name}* quality good well well, so I go do ₦${price}. Make I package am?`,
     negFinal: (name, price) =>
       `I don try reach my limit for *${name}* — ₦${price} na the last price wey I fit sell am give you. Make I package am?`,
     notUnderstood:
@@ -130,7 +155,9 @@ async function composeNegotiationReply(language, neg) {
     return tr(language, (s) => s.negCounter(neg.product, price));
   }
   if (neg.outcome === "final" && Number.isFinite(neg.finalPrice)) {
-    return tr(language, (s) => s.negFinal(neg.product, neg.finalPrice.toLocaleString()));
+    return tr(language, (s) =>
+      s.negFinal(neg.product, neg.finalPrice.toLocaleString()),
+    );
   }
   return null;
 }
@@ -171,7 +198,12 @@ function enforcePaymentLink(text, link) {
 // it. The result is accepted ONLY if it contains the exact count AND a "show
 // more" cue — otherwise (or on failure) we fall back to the fixed template, so
 // the offer can never carry a wrong count or be dropped.
-async function composeMoreItemsHint({ count, asSuggestions, language, business }) {
+async function composeMoreItemsHint({
+  count,
+  asSuggestions,
+  language,
+  business,
+}) {
   const template = await tr(language, (s) =>
     asSuggestions ? s.otherItems(count) : s.moreItems(count),
   );
@@ -247,7 +279,9 @@ function mapProductForAI(product) {
  * groups, prices, and required rules come from the product itself.
  */
 function resolveSelectedModifiers(product, selectedNames = []) {
-  const picked = (selectedNames || []).map((n) => String(n).toLowerCase().trim());
+  const picked = (selectedNames || []).map((n) =>
+    String(n).toLowerCase().trim(),
+  );
   const selections = [];
   const missingRequired = [];
 
@@ -286,7 +320,8 @@ function resolveSelectedModifiers(product, selectedNames = []) {
 function unavailableModifierRequests(product, names = []) {
   const offered = new Set();
   for (const group of product.modifiers || []) {
-    for (const o of group.options || []) offered.add(String(o.name).toLowerCase());
+    for (const o of group.options || [])
+      offered.add(String(o.name).toLowerCase());
   }
   if (offered.size === 0) return [];
 
@@ -316,10 +351,18 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // otherwise the order proceeds on phantom data. Each returns null for an absent
 // or placeholder value, which keeps the gate asking. RFC 2606 reserves
 // example/test domains, so any email there is never a real customer address.
-const PLACEHOLDER_EMAIL_DOMAINS = /@(?:example|test|sample|email|domain|mail|acme)\.(?:com|org|net)$/i;
+const PLACEHOLDER_EMAIL_DOMAINS =
+  /@(?:example|test|sample|email|domain|mail|acme)\.(?:com|org|net)$/i;
 const PLACEHOLDER_NAMES = new Set([
-  "john doe", "jane doe", "john smith", "jane smith",
-  "full name", "your name", "customer name", "name", "first last",
+  "john doe",
+  "jane doe",
+  "john smith",
+  "jane smith",
+  "full name",
+  "your name",
+  "customer name",
+  "name",
+  "first last",
 ]);
 
 function cleanCheckoutName(value) {
@@ -352,10 +395,18 @@ function rejectedCheckoutInputs(prior = {}, data = {}) {
   if (raw(data.email) && !cleanCheckoutEmail(data.email) && !prior.email) {
     rejected.email = raw(data.email);
   }
-  if (raw(data.customerName) && !cleanCheckoutName(data.customerName) && !prior.customerName) {
+  if (
+    raw(data.customerName) &&
+    !cleanCheckoutName(data.customerName) &&
+    !prior.customerName
+  ) {
     rejected.name = raw(data.customerName);
   }
-  if (raw(data.location) && !cleanCheckoutLocation(data.location) && !prior.location) {
+  if (
+    raw(data.location) &&
+    !cleanCheckoutLocation(data.location) &&
+    !prior.location
+  ) {
     rejected.location = raw(data.location);
   }
   return rejected;
@@ -391,12 +442,15 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
     // stored), so a guessed/placeholder name, email or address never counts as
     // "provided" and the gate keeps asking for the real one.
     email: cleanCheckoutEmail(data.email) || prior.email || null,
-    customerName: cleanCheckoutName(data.customerName) || prior.customerName || null,
+    customerName:
+      cleanCheckoutName(data.customerName) || prior.customerName || null,
     location: cleanCheckoutLocation(data.location) || prior.location || null,
     selectedSize: data.selectedSize || prior.selectedSize || null,
     selectedColor: data.selectedColor || prior.selectedColor || null,
     selectedAttributes: attrMap,
-    selectedModifiers: modifiers.length ? modifiers : prior.selectedModifiers || [],
+    selectedModifiers: modifiers.length
+      ? modifiers
+      : prior.selectedModifiers || [],
     // Unit count the customer asked for; carried across turns so a quantity given
     // early (before the buyer's details) still applies when the order closes.
     quantity: normalizeQuantity(data.quantity) ?? prior.quantity ?? null,
@@ -445,7 +499,8 @@ function pickSelectedAttr(checkout, attrName) {
   if (key && sel[key]) return sel[key];
   const lname = String(attrName).toLowerCase();
   if (/size/.test(lname) && checkout.selectedSize) return checkout.selectedSize;
-  if (/colou?r/.test(lname) && checkout.selectedColor) return checkout.selectedColor;
+  if (/colou?r/.test(lname) && checkout.selectedColor)
+    return checkout.selectedColor;
   return null;
 }
 
@@ -484,7 +539,10 @@ function computeCheckoutGaps(product, checkout) {
   }
 
   // Required food modifier groups.
-  const modifierCheck = resolveSelectedModifiers(product, checkout.selectedModifiers);
+  const modifierCheck = resolveSelectedModifiers(
+    product,
+    checkout.selectedModifiers,
+  );
   if (modifierCheck.missingRequired.length > 0) {
     variantMissing.push({
       field: "modifiers",
@@ -533,7 +591,10 @@ function computeCheckoutGaps(product, checkout) {
 // reverting to the list price.
 function resolveAgreedPrice(session, product) {
   const checkout = session.checkout;
-  if (checkout?.negotiatedPrice != null && checkout.productName === product.name) {
+  if (
+    checkout?.negotiatedPrice != null &&
+    checkout.productName === product.name
+  ) {
     return checkout.negotiatedPrice;
   }
   const negotiation = session.negotiation;
@@ -570,7 +631,8 @@ async function gatherCheckoutOrAsk({
   const quantity = normalizeQuantity(checkout.quantity) ?? 1;
   // Per-unit price (negotiated price or list, plus chosen modifier add-ons),
   // then multiplied by quantity for the amount actually charged.
-  const unitAmount = (checkout.negotiatedPrice ?? product.price) + gaps.extraTotal;
+  const unitAmount =
+    (checkout.negotiatedPrice ?? product.price) + gaps.extraTotal;
   const amount = unitAmount * quantity;
   const negotiated = checkout.negotiatedPrice != null;
 
@@ -581,13 +643,17 @@ async function gatherCheckoutOrAsk({
   for (const m of gaps.missing) {
     if (m.field === "email" && rejected.email) m.invalidValue = rejected.email;
     if (m.field === "name" && rejected.name) m.invalidValue = rejected.name;
-    if (m.field === "location" && rejected.location) m.invalidValue = rejected.location;
+    if (m.field === "location" && rejected.location)
+      m.invalidValue = rejected.location;
   }
 
   // Add-ons the customer asked for THIS turn that the product doesn't offer.
   // Surfaced on every checkout result (whether more info is needed or the order
   // completes) so the reply flags them rather than silently dropping the request.
-  const unavailableModifiers = unavailableModifierRequests(product, data.selectedModifiers);
+  const unavailableModifiers = unavailableModifierRequests(
+    product,
+    data.selectedModifiers,
+  );
 
   if (gaps.missing.length > 0) {
     // Keep this product in focus and remember what we've gathered so far.
@@ -641,7 +707,9 @@ async function gatherCheckoutOrAsk({
   return {
     ...result,
     negotiated,
-    ...(unavailableAtCheckout.length ? { unavailableModifiers: unavailableAtCheckout } : {}),
+    ...(unavailableAtCheckout.length
+      ? { unavailableModifiers: unavailableAtCheckout }
+      : {}),
   };
 }
 
@@ -671,7 +739,7 @@ async function runCheckout({
     ...selectedModifiers.map((m) => m.name),
   ];
   const baseLabel = labelExtras.length
-    ? `${product.name} (${labelExtras.join(', ')})`
+    ? `${product.name} (${labelExtras.join(", ")})`
     : product.name;
   // Show the count on the payment link / invoice label, e.g. "T-Shirt (L) ×2".
   const itemLabel = quantity > 1 ? `${baseLabel} ×${quantity}` : baseLabel;
@@ -679,7 +747,9 @@ async function runCheckout({
   // Derive size/colour from the chosen attributes for the reply summary, which
   // reads them back to the customer.
   const findAttr = (re) => {
-    const k = Object.keys(selectedAttributes).find((n) => re.test(n.toLowerCase()));
+    const k = Object.keys(selectedAttributes).find((n) =>
+      re.test(n.toLowerCase()),
+    );
     return k ? selectedAttributes[k] : null;
   };
 
@@ -728,10 +798,12 @@ async function runCheckout({
     customerName: customerName || null,
     location: location || null,
     email: email || null,
-    selectedAttributes: Object.entries(selectedAttributes).map(([name, value]) => ({
-      name,
-      value,
-    })),
+    selectedAttributes: Object.entries(selectedAttributes).map(
+      ([name, value]) => ({
+        name,
+        value,
+      }),
+    ),
     selectedSize: findAttr(/size/) || null,
     selectedColor: findAttr(/colou?r/) || null,
     selectedModifiers: selectedModifiers.map((m) => ({
@@ -824,7 +896,9 @@ async function handleProductSelection({
   setLastProduct(businessId, customerNumber, product);
 
   const followUpText = product.is_food
-    ? await tr(language, (s) => s.pickedFood(product.name, product.prep_time_mins))
+    ? await tr(language, (s) =>
+        s.pickedFood(product.name, product.prep_time_mins),
+      )
     : await tr(language, (s) => s.pickedRetail(product.name));
 
   const [localized] = await localizeProductsForLanguage([product], language);
@@ -874,7 +948,10 @@ async function extractUserMessage(message, accessToken, business) {
 
       const audioData = await whatsapp.downloadMedia(mediaId, accessToken);
 
-      const transcription = await openaiService.transcribeAudio(audioData, business);
+      const transcription = await openaiService.transcribeAudio(
+        audioData,
+        business,
+      );
 
       if (!transcription) {
         throw new Error("Empty transcription");
@@ -890,7 +967,6 @@ async function extractUserMessage(message, accessToken, business) {
     return "__VOICE_ERROR__";
   }
 }
-
 
 async function executeAction({
   action,
@@ -936,7 +1012,9 @@ async function executeAction({
           ? action.data.maxPrice
           : null;
       const found = maxPrice
-        ? allMatches.filter((p) => typeof p.price === "number" && p.price <= maxPrice)
+        ? allMatches.filter(
+            (p) => typeof p.price === "number" && p.price <= maxPrice,
+          )
         : allMatches;
 
       logger.info(
@@ -966,13 +1044,16 @@ async function executeAction({
       // True when everything left beyond this page is lower-tier — switches
       // the appended hint from "N more items" to "N other items you might like".
       const remainingAreSuggestions =
-        !isBroadBrowse && strongCount > 0 && remainingCount > 0 &&
+        !isBroadBrowse &&
+        strongCount > 0 &&
+        remainingCount > 0 &&
         strongCount <= productsToDisplay.length;
 
       // A partial match (specific search, no strong/exact fit) is NOT shown as
       // cards — we send only an honest text message. Cards are reserved for
       // strong matches; a broad browse stays a numbered text list.
-      const isPartialMatch = !isBroadBrowse && found.length > 0 && strongCount === 0;
+      const isPartialMatch =
+        !isBroadBrowse && found.length > 0 && strongCount === 0;
 
       if (found.length > 0) {
         setLastProduct(businessId, customerNumber, found[0]);
@@ -1006,14 +1087,22 @@ async function executeAction({
         remainingAreSuggestions,
         // "strong": the shown products are what the customer asked for.
         // "partial": nothing matched closely — these are the nearest fits.
-        matchTier: isBroadBrowse ? undefined : strongCount > 0 ? "strong" : "partial",
+        matchTier: isBroadBrowse
+          ? undefined
+          : strongCount > 0
+            ? "strong"
+            : "partial",
         // "broad": bare-type query → present a selection and invite narrowing.
         // "specific": constraints given → match precisely or be honest.
         searchBreadth,
         startNumber: 1,
         // "cards" for strong matches, "text" for a broad browse, "none" for a
         // partial match (message only — no product list, no cards).
-        displayMode: isBroadBrowse ? "text" : strongCount > 0 ? "cards" : "none",
+        displayMode: isBroadBrowse
+          ? "text"
+          : strongCount > 0
+            ? "cards"
+            : "none",
         products: productsToDisplay.map(mapProductForAI),
         // Budget context so the reply can say "here are <category> within your
         // budget" — and, when nothing fits, stay in-category instead of drifting.
@@ -1024,10 +1113,10 @@ async function executeAction({
               noneWithinBudget: found.length === 0 && allMatches.length > 0,
               cheapestInCategory:
                 found.length === 0 && allMatches.length > 0
-                  ? allMatches
+                  ? (allMatches
                       .map((p) => p.price)
                       .filter((n) => typeof n === "number")
-                      .sort((a, b) => a - b)[0] ?? null
+                      .sort((a, b) => a - b)[0] ?? null)
                   : null,
             }
           : {}),
@@ -1045,7 +1134,9 @@ async function executeAction({
         currentSession.similarSearch?.productIds?.length
       ) {
         const similar = currentSession.similarSearch;
-        const allSimilar = await productService.getProductsByIds(similar.productIds);
+        const allSimilar = await productService.getProductsByIds(
+          similar.productIds,
+        );
 
         const start = similar.offset || 0;
         const nextSimilar = allSimilar.slice(start, start + SIMILAR_PAGE_SIZE);
@@ -1082,7 +1173,9 @@ async function executeAction({
         break;
       }
 
-      const allProducts = await productService.getProductsByIds(lastSearch.productIds);
+      const allProducts = await productService.getProductsByIds(
+        lastSearch.productIds,
+      );
 
       // Match the original browse type: numbered text pages of 10 for a broad
       // "*" browse, pickable image cards of 4 for a specific search.
@@ -1117,7 +1210,9 @@ async function executeAction({
       // lower-match tier — keep the "other items you might like" framing.
       const strongCount = lastSearch.strongCount ?? 0;
       const remainingAreSuggestions =
-        !isBroadBrowse && strongCount > 0 && remainingCount > 0 &&
+        !isBroadBrowse &&
+        strongCount > 0 &&
+        remainingCount > 0 &&
         newOffset >= strongCount;
 
       if (nextProducts.length > 0) {
@@ -1329,7 +1424,9 @@ async function executeAction({
       // changes behaviour once the customer has moved on. Fall back to the active
       // negotiation's product only when there's no current focus.
       const productName =
-        freshSession.lastProduct?.name || activeNegotiation?.productName || null;
+        freshSession.lastProduct?.name ||
+        activeNegotiation?.productName ||
+        null;
 
       const product = productName
         ? await productService.getProductByName(businessId, productName)
@@ -1364,7 +1461,11 @@ async function executeAction({
 
       // Start a negotiation lazily if none is active for THIS product.
       if (!activeNegotiation || activeNegotiation.productId !== product.id) {
-        activeNegotiation = startNegotiation(businessId, customerNumber, product);
+        activeNegotiation = startNegotiation(
+          businessId,
+          customerNumber,
+          product,
+        );
       }
 
       // "26" on a ₦30,000 product means ₦26,000 — rescue shorthand the model
@@ -1451,7 +1552,8 @@ async function executeAction({
       const freshSession = getSession(businessId, customerNumber);
       const negotiation = freshSession.negotiation;
 
-      const productName = negotiation?.productName || freshSession.lastProduct?.name || null;
+      const productName =
+        negotiation?.productName || freshSession.lastProduct?.name || null;
       const product = productName
         ? await productService.getProductByName(businessId, productName)
         : null;
@@ -1569,9 +1671,9 @@ async function executeAction({
       break;
     }
 
-    case 'list_categories': {
+    case "list_categories": {
       const categories = await productService.getProductCategories(businessId);
-    
+
       if (!categories.length) {
         actionResult = {
           message: "No products available yet.",
@@ -1579,15 +1681,15 @@ async function executeAction({
         };
         break;
       }
-    
+
       actionResult = {
         message: "Available product categories",
         categories,
         count: categories.length,
       };
-    
+
       productsToShow = []; // no product cards
-    
+
       break;
     }
 
@@ -1650,7 +1752,10 @@ export async function handleIncomingMessage(req, res) {
       for (const status of value.statuses) {
         if (status.status === "failed") {
           const details = (status.errors || [])
-            .map((e) => `${e.code} ${e.title}${e.error_data?.details ? ` — ${e.error_data.details}` : ""}`)
+            .map(
+              (e) =>
+                `${e.code} ${e.title}${e.error_data?.details ? ` — ${e.error_data.details}` : ""}`,
+            )
             .join("; ");
           logger.error(
             `[Webhook] Delivery FAILED to ${status.recipient_id} (message ${status.id}): ${details || "no error details"}`,
@@ -1716,7 +1821,11 @@ export async function handleIncomingMessage(req, res) {
       return;
     }
 
-    const userMessage = await extractUserMessage(message, accessToken, business);
+    const userMessage = await extractUserMessage(
+      message,
+      accessToken,
+      business,
+    );
 
     if (userMessage === "__VOICE_ERROR__") {
       // Generate smart AI fallback message
@@ -1724,14 +1833,14 @@ export async function handleIncomingMessage(req, res) {
         business,
         replyContext.language,
       );
-    
+
       await whatsapp.sendTextMessage(
         phoneNumberId,
         accessToken,
         customerNumber,
-        fallback
+        fallback,
       );
-    
+
       return;
     }
 
@@ -1766,7 +1875,8 @@ export async function handleIncomingMessage(req, res) {
       : null;
 
     const isFirstVisit = !session.lastMessageAt;
-    const isReturningAfterAbsence = absenceMs !== null && absenceMs > ONE_HOUR_MS;
+    const isReturningAfterAbsence =
+      absenceMs !== null && absenceMs > ONE_HOUR_MS;
 
     // A product card (image + full details) is only re-displayed when the buyer
     // turns to a DIFFERENT product. Once a product's card has been shown in this
@@ -1794,11 +1904,21 @@ export async function handleIncomingMessage(req, res) {
       // whatever the customer just asked for so it isn't a disconnected line.
       greeting =
         business.aiConfig?.greetingMessage?.trim() ||
-        (await openaiService.generateGreeting("first_visit", business, session.language, userMessage));
+        (await openaiService.generateGreeting(
+          "first_visit",
+          business,
+          session.language,
+          userMessage,
+        ));
     }
 
     if (greeting) {
-      await whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, greeting);
+      await whatsapp.sendTextMessage(
+        phoneNumberId,
+        accessToken,
+        customerNumber,
+        greeting,
+      );
       await new Promise((r) => setTimeout(r, 600));
 
       // Sending the greeting cleared the typing bubble — re-trigger it (same
@@ -1822,7 +1942,10 @@ export async function handleIncomingMessage(req, res) {
       business,
     );
 
-    const aiOutput = openaiService.normalizeAiOutput(rawAiOutput, activeSession);
+    const aiOutput = openaiService.normalizeAiOutput(
+      rawAiOutput,
+      activeSession,
+    );
     let action = aiOutput.action;
     const language = aiOutput.language;
     replyContext.language = language;
@@ -1844,6 +1967,41 @@ export async function handleIncomingMessage(req, res) {
       }
     }
 
+    // Quantity safety net. The model frequently omits the unit count even when
+    // the customer clearly stated one ("I want 3"), which silently bills and
+    // stores the order as a single unit. Trust the model's count when it set
+    // one; otherwise recover it deterministically from the raw message. Fill it
+    // into this turn's checkout action when the model under-specified it, and
+    // persist it to the checkout session so a count given on an EARLIER turn
+    // (while browsing, negotiating, or giving details) still applies when the
+    // order finally closes. In a confirmed checkout turn even a bare "3" is a
+    // quantity (the intent disambiguates it); elsewhere an explicit cue is
+    // required, and pure browse/search turns never overwrite the remembered qty.
+    const isCheckoutAction = CHECKOUT_ACTIONS.has(action.type);
+    const modelQuantity = isCheckoutAction
+      ? normalizeQuantity(action.data?.quantity)
+      : null;
+    const statedQuantity =
+      modelQuantity ??
+      openaiService.extractQuantity(userMessage, {
+        allowBare: isCheckoutAction,
+      });
+    if (statedQuantity != null) {
+      if (isCheckoutAction && modelQuantity == null) {
+        action.data = { ...action.data, quantity: statedQuantity };
+        logger.info(
+          `[${business.name}] Quantity fallback: recovered ×${statedQuantity} from message`,
+        );
+      }
+      if (!QUANTITY_PERSIST_BLOCKED.has(action.type)) {
+        const s = getSession(businessId, customerNumber);
+        setSession(businessId, customerNumber, {
+          ...s,
+          checkout: { ...(s.checkout || {}), quantity: statedQuantity },
+        });
+      }
+    }
+
     logger.info(
       `[${business.name}] Normalized action: ${action.type} (language: ${language})`,
     );
@@ -1856,18 +2014,22 @@ export async function handleIncomingMessage(req, res) {
     // below with no separate greeting bubble. Uses this turn's detected language.
     if (isReturningAfterAbsence && action.type === "none") {
       responseText =
-        (await openaiService.generateGreeting("welcome_back", business, language)) ||
-        responseText;
+        (await openaiService.generateGreeting(
+          "welcome_back",
+          business,
+          language,
+        )) || responseText;
     }
 
     if (action.type !== "none") {
-      const { actionResult, productsToShow, asPickableCards } = await executeAction({
-        action,
-        businessId,
-        customerNumber,
-        session,
-        shownProductIds,
-      });
+      const { actionResult, productsToShow, asPickableCards } =
+        await executeAction({
+          action,
+          businessId,
+          customerNumber,
+          session,
+          shownProductIds,
+        });
 
       const freshSession = getSession(businessId, customerNumber);
 
@@ -1955,7 +2117,10 @@ export async function handleIncomingMessage(req, res) {
 
           // Force the exact payment URL in (the model isn't trusted to render it).
           if (actionResult?.paymentLink) {
-            responseText = enforcePaymentLink(responseText, actionResult.paymentLink);
+            responseText = enforcePaymentLink(
+              responseText,
+              actionResult.paymentLink,
+            );
           }
         }
 
