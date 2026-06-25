@@ -45,6 +45,7 @@ export async function generatePaymentLink(businessId, customerNumber, productNam
     productId: buyer.productId || null,
     productImage: buyer.productImage || null,
     amount,
+    quantity: buyer.quantity || 1,
     customerName: buyer.customerName || null,
     customerEmail: buyer.customerEmail || null,
     location: buyer.location || null,

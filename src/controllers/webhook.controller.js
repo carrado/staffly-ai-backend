@@ -397,10 +397,19 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
     selectedColor: data.selectedColor || prior.selectedColor || null,
     selectedAttributes: attrMap,
     selectedModifiers: modifiers.length ? modifiers : prior.selectedModifiers || [],
+    // Unit count the customer asked for; carried across turns so a quantity given
+    // early (before the buyer's details) still applies when the order closes.
+    quantity: normalizeQuantity(data.quantity) ?? prior.quantity ?? null,
     // A price agreed via negotiation overrides the list price; carried across
     // turns so a checkout completed later still closes at the agreed number.
     negotiatedPrice: prior.negotiatedPrice ?? null,
   };
+}
+
+// A whole-number unit quantity (≥1), or null when not a usable number.
+function normalizeQuantity(value) {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n >= 1 ? n : null;
 }
 
 // Flatten an attribute's stored values into the distinct options a buyer can
@@ -558,8 +567,11 @@ async function gatherCheckoutOrAsk({
   if (negotiatedPrice != null) checkout.negotiatedPrice = negotiatedPrice;
 
   const gaps = computeCheckoutGaps(product, checkout);
-  const baseAmount = checkout.negotiatedPrice ?? product.price;
-  const amount = baseAmount + gaps.extraTotal;
+  const quantity = normalizeQuantity(checkout.quantity) ?? 1;
+  // Per-unit price (negotiated price or list, plus chosen modifier add-ons),
+  // then multiplied by quantity for the amount actually charged.
+  const unitAmount = (checkout.negotiatedPrice ?? product.price) + gaps.extraTotal;
+  const amount = unitAmount * quantity;
   const negotiated = checkout.negotiatedPrice != null;
 
   // Tag the name/email/location gaps with anything the customer just typed that
@@ -586,6 +598,7 @@ async function gatherCheckoutOrAsk({
       needsInfo: true,
       product: product.name,
       price: amount,
+      quantity,
       negotiated,
       missing: gaps.missing,
       collected: {
@@ -604,6 +617,7 @@ async function gatherCheckoutOrAsk({
     customerNumber,
     product,
     amount,
+    quantity,
     email: checkout.email,
     customerName: checkout.customerName,
     location: checkout.location,
@@ -641,6 +655,7 @@ async function runCheckout({
   customerNumber,
   product,
   amount,
+  quantity = 1,
   email,
   customerName,
   location,
@@ -655,9 +670,11 @@ async function runCheckout({
     ...Object.values(selectedAttributes),
     ...selectedModifiers.map((m) => m.name),
   ];
-  const itemLabel = labelExtras.length
+  const baseLabel = labelExtras.length
     ? `${product.name} (${labelExtras.join(', ')})`
     : product.name;
+  // Show the count on the payment link / invoice label, e.g. "T-Shirt (L) ×2".
+  const itemLabel = quantity > 1 ? `${baseLabel} ×${quantity}` : baseLabel;
 
   // Derive size/colour from the chosen attributes for the reply summary, which
   // reads them back to the customer.
@@ -677,6 +694,7 @@ async function runCheckout({
       customerName,
       customerEmail: email,
       location,
+      quantity,
       productId: product?.id ? String(product.id) : null,
       productImage: product?.image_url || null,
     },
@@ -704,7 +722,8 @@ async function runCheckout({
     paymentLink,
     orderId,
     product: product.name,
-    // VAT-inclusive, shown to the customer only as "Price".
+    quantity,
+    // VAT-inclusive total (unit price × quantity), shown to the customer as "Price".
     price: amount,
     customerName: customerName || null,
     location: location || null,

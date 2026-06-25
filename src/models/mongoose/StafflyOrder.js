@@ -24,7 +24,8 @@ const StafflyOrderSchema = new mongoose.Schema(
     // `product` above stays the human label (incl. chosen variants/modifiers).
     productId: { type: String, default: null },
     productImage: { type: String, default: null }, // Product.mainImageUrl at checkout
-    amount: { type: Number },
+    amount: { type: Number }, // grand total = unit price × quantity
+    quantity: { type: Number, default: 1, min: 1 },
     status: { type: String, default: 'pending' }, // pending | paid | failed
     // Buyer details gathered during the WhatsApp checkout, used to fulfil the
     // order (name on the order, receipt email, delivery location).
