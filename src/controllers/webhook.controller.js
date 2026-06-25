@@ -181,16 +181,34 @@ function stripInternalMarkers(text) {
 // odd (e.g. rewriting a localhost velte link to some other domain) or hallucinate
 // one. So the model only leaves a {{PAYMENT_LINK}} placeholder; here we swap in
 // the real link, overwrite any URL it invented anyway, and guarantee it's present.
+const PAYMENT_LINK_PLACEHOLDER = /\{\{\s*PAYMENT_LINK\s*\}\}/gi;
 function enforcePaymentLink(text, link) {
-  if (!link) return text;
-  let out = String(text ?? "").replace(/\{\{\s*PAYMENT_LINK\s*\}\}/gi, link);
-  // Replace any other URL the model emitted (a rewrite/hallucination) with ours.
-  const urls = out.match(/\bhttps?:\/\/\S+/gi) || [];
-  for (const u of urls) {
-    if (u !== link) out = out.split(u).join(link);
+  let out = String(text ?? "");
+  if (link) {
+    out = out.replace(PAYMENT_LINK_PLACEHOLDER, link);
+    // Replace any other URL the model emitted (a rewrite/hallucination) with ours.
+    const urls = out.match(/\bhttps?:\/\/\S+/gi) || [];
+    for (const u of urls) {
+      if (u !== link) out = out.split(u).join(link);
+    }
+    if (!out.includes(link)) out = `${out.trim()}\n\n${link}`;
+  } else {
+    // No link to substitute (e.g. the order still needs a detail, but the model
+    // wrote the placeholder anyway). The token is INTERNAL and must never reach
+    // the customer — strip it. Other URLs are left alone, since non-payment
+    // replies legitimately link to the online store.
+    const stripped = out.replace(PAYMENT_LINK_PLACEHOLDER, "");
+    if (stripped !== out) {
+      logger.warn(
+        "[Webhook] {{PAYMENT_LINK}} placeholder with no link to fill — stripping (order likely still incomplete).",
+      );
+      out = stripped;
+    }
   }
-  if (!out.includes(link)) out = `${out.trim()}\n\n${link}`;
-  return out.replace(/\n{3,}/g, "\n\n").trim();
+  return out
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // AI-written, code-guarded "N more items — *show more*" line. The count and the
@@ -474,20 +492,30 @@ function mergeLine(prev = {}, next = {}) {
 // Merge the details supplied this turn with everything gathered on earlier turns
 // so checkout info accumulates instead of resetting when the customer answers one
 // question at a time. Buyer details are shared; the variant/quantity breakdown is
-// a list of lines (one per distinct variant). A turn that restates the breakdown
-// replaces it; a turn that supplies only buyer details keeps the prior lines. When
-// the line count is unchanged, lines merge by position so a single line's choices
-// still accumulate across turns. New non-null values win; prior values are kept.
+// a list of lines (one per distinct variant). A turn that supplies only buyer
+// details keeps the prior lines; a turn that restates the breakdown in full (same
+// or more lines) replaces it, merging by position when the counts match so a
+// single line's choices still accumulate across turns. Crucially, once a
+// MULTI-line breakdown is established, a turn that sends FEWER lines does NOT
+// collapse it — the model routinely drops lines while focused on buyer details,
+// and silently reducing "2 black + 1 white" to "white ×3" would mischarge the
+// order. New non-null values win; prior values are kept.
 function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
   const incoming = Array.isArray(data.items) ? data.items.map(toLine) : [];
   const priorLines = prior.lines || [];
   let lines;
   if (!incoming.length) {
+    // Only buyer details this turn — keep the breakdown gathered earlier.
     lines = priorLines;
-  } else if (priorLines.length === incoming.length) {
-    lines = incoming.map((ln, i) => mergeLine(priorLines[i], ln));
+  } else if (priorLines.length <= 1 || incoming.length >= priorLines.length) {
+    // No established multi-line breakdown yet, or this turn restates it in full.
+    lines =
+      priorLines.length === incoming.length
+        ? incoming.map((ln, i) => mergeLine(priorLines[i], ln))
+        : incoming;
   } else {
-    lines = incoming;
+    // Established multi-variant order, but this turn dropped lines — keep prior.
+    lines = priorLines;
   }
   return {
     productName: resolvedProductName || prior.productName || null,
@@ -508,6 +536,59 @@ function mergeCheckout(prior = {}, data = {}, resolvedProductName = null) {
     // turns so a checkout completed later still closes at the agreed number.
     negotiatedPrice: prior.negotiatedPrice ?? null,
   };
+}
+
+// Deterministic recovery of a multi-variant breakdown from the buyer's own words,
+// for when the model collapses "2 black and 1 white" into a single line. Matches
+// "<count> <option>" / "<count> in <option>" where <option> is a real value of one
+// of THIS product's multi-option attributes (colour, size, …), so it can't latch
+// onto an unrelated number. Returns model-schema items (one per variant line), or
+// null unless the buyer plainly named two or more distinct variant counts.
+function extractVariantLines(message, product) {
+  const attrGroups = product?.attributes || {};
+  const optionToAttr = new Map(); // lowercased option value -> { attrName, value }
+  for (const [name, rawValues] of Object.entries(attrGroups)) {
+    const options = normalizeAttrOptions(rawValues);
+    if (options.length < 2) continue; // a spec, not a real variant
+    for (const opt of options) {
+      optionToAttr.set(opt.toLowerCase(), { attrName: name, value: opt });
+    }
+  }
+  if (!optionToAttr.size) return null;
+
+  const text = String(message || "").toLowerCase();
+  // Longest option first so "navy blue" wins over "blue"; escape regex specials.
+  const optionAlt = [...optionToAttr.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((o) => o.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const re = new RegExp(
+    `\\b(\\d{1,2})\\s+(?:in\\s+|of\\s+)?(${optionAlt})\\b`,
+    "g",
+  );
+
+  const byValue = new Map(); // canonical value -> summed quantity (dedupe repeats)
+  let m;
+  while ((m = re.exec(text))) {
+    const qty = parseInt(m[1], 10);
+    const opt = optionToAttr.get(m[2]);
+    if (!opt || !(qty >= 1 && qty <= 99)) continue;
+    byValue.set(opt.value, {
+      attrName: opt.attrName,
+      value: opt.value,
+      quantity: (byValue.get(opt.value)?.quantity || 0) + qty,
+    });
+  }
+  if (byValue.size < 2) return null; // not a multi-variant request
+
+  return [...byValue.values()].map((l) => {
+    const item = { quantity: l.quantity };
+    const lname = l.attrName.toLowerCase();
+    if (/colou?r/.test(lname)) item.selectedColor = l.value;
+    else if (/size/.test(lname)) item.selectedSize = l.value;
+    else item.selectedAttributes = [{ name: l.attrName, value: l.value }];
+    return item;
+  });
 }
 
 // A whole-number unit quantity (≥1), or null when not a usable number.
@@ -730,7 +811,19 @@ async function gatherCheckoutOrAsk({
   product,
   data = {},
   negotiatedPrice = null,
+  userMessage = "",
 }) {
+  // Deterministic multi-variant recovery: if the buyer plainly listed several
+  // variant counts ("2 black and 1 white") but the model collapsed them into
+  // fewer lines, rebuild the breakdown from the message so the order isn't stored
+  // or charged as a single variant. Only overrides when it finds MORE lines than
+  // the model supplied this turn (i.e. the model under-counted the breakdown).
+  const recovered = extractVariantLines(userMessage, product);
+  const modelLineCount = Array.isArray(data.items) ? data.items.length : 0;
+  if (recovered && recovered.length > modelLineCount) {
+    data = { ...data, items: recovered };
+  }
+
   const prior = getSession(businessId, customerNumber).checkout || {};
   const checkout = mergeCheckout(prior, data, product.name);
   if (negotiatedPrice != null) checkout.negotiatedPrice = negotiatedPrice;
@@ -1148,6 +1241,7 @@ async function executeAction({
   businessId,
   customerNumber,
   session,
+  userMessage = "",
   shownProductIds = new Set(),
 }) {
   let actionResult = null;
@@ -1499,6 +1593,7 @@ async function executeAction({
         product,
         data: action.data,
         negotiatedPrice,
+        userMessage,
       });
 
       break;
@@ -1669,6 +1764,7 @@ async function executeAction({
           product,
           data: action.data,
           negotiatedPrice: decision.acceptedPrice,
+          userMessage,
         });
 
         if (checkout.needsInfo) {
@@ -1760,6 +1856,7 @@ async function executeAction({
         product,
         data: action.data,
         negotiatedPrice: agreedPrice,
+        userMessage,
       });
 
       if (checkout.needsInfo) {
@@ -2212,6 +2309,7 @@ export async function handleIncomingMessage(req, res) {
           businessId,
           customerNumber,
           session,
+          userMessage,
           shownProductIds,
         });
 
@@ -2300,12 +2398,13 @@ export async function handleIncomingMessage(req, res) {
           responseText = stripInternalMarkers(finalAiOutput.response);
 
           // Force the exact payment URL in (the model isn't trusted to render it).
-          if (actionResult?.paymentLink) {
-            responseText = enforcePaymentLink(
-              responseText,
-              actionResult.paymentLink,
-            );
-          }
+          // Always run this: with a link it substitutes the placeholder; without
+          // one it strips the placeholder so the raw {{PAYMENT_LINK}} token can
+          // never leak to the customer.
+          responseText = enforcePaymentLink(
+            responseText,
+            actionResult?.paymentLink,
+          );
         }
 
         if (moreItemsHint) {
