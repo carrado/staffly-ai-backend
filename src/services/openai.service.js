@@ -911,22 +911,22 @@ Guidelines:
   - Never confirm a size/color/variant that is not in the result.
 - For product image requests: a product card with the photo (when available) and the FULL details is being sent to the customer right now. Write only a short, friendly one-line note to go with it (e.g. "Here's the {product} 👇"). Do NOT re-list the details and do not claim to attach anything else.
   - If hasImage is false, briefly mention a photo isn't available for it, but its full details are shown.
-- For payment links: the order is confirmed — present a short, friendly order summary, THEN the link. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). MULTI-VARIANT ORDERS: when actionResult.multiLine is true, the order has several variant lines in actionResult.items — list EACH line on its own (its variant text and quantity, e.g. "Red ×3", "Black ×1"), so the customer sees the full breakdown, then give the single all-in total (actionResult.price). Read the lines back EXACTLY as given; never merge, drop, or invent a line, and never collapse different variants into one. The price is the single, all-in figure — present it simply as the price; never mention tax, VAT, or any breakdown. For the link itself, write the EXACT literal placeholder {{PAYMENT_LINK}} (those exact characters, double curly braces) on its own line where the link should appear — do NOT write, guess, copy, complete, or "fix" any actual URL yourself (the system substitutes the real payment link for that placeholder). Also give the customer their order reference, actionResult.orderId, so they can quote it when they pay. Only mention details that are actually present in the result; never invent any. (The price already includes any modifier extra cost.)
-- If the result has "needsInfo": true, the order is NOT placed yet and NO payment link exists — do not share or invent a link. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. The system gathers these in stages, so actionResult.missing holds only the items to ask for RIGHT NOW — ask for EXACTLY those, all together in ONE warm, natural message, and nothing else. DON'T re-ask for anything in actionResult.collected (already provided — collected.attributes holds chosen variants, plus name/email/location; you may briefly acknowledge them). Map each missing entry by its "field":
+- For a placed order (BANK TRANSFER): the order is confirmed — present a short, friendly order summary, THEN the bank details for the customer to transfer to. The summary must read back what's in the result: the product (actionResult.product), the price (actionResult.price, ₦ formatted), the chosen size/colour (actionResult.selectedSize/selectedColor) and any selectedModifiers when present, the name it's under (actionResult.customerName), and the delivery location (actionResult.location). MULTI-VARIANT ORDERS: when actionResult.multiLine is true, the order has several variant lines in actionResult.items — list EACH line on its own (its variant text and quantity, e.g. "Red ×3", "Black ×1"), so the customer sees the full breakdown, then give the single all-in total (actionResult.price). Read the lines back EXACTLY as given; never merge, drop, or invent a line, and never collapse different variants into one. The price is the single, all-in figure — present it simply as the price; never mention tax, VAT, or any breakdown. (The price already includes any modifier extra cost.) For the bank account, write the EXACT literal placeholder {{BANK_DETAILS}} (those exact characters, double curly braces) on its own line where the account should appear — do NOT write, guess, copy, or invent any account name, number, or bank yourself (the system substitutes the merchant's real bank details for that placeholder). Tell the customer to transfer the exact price to that account, give them their order reference (actionResult.orderId) to use as the transfer narration/remark, and ASK THEM TO SEND A PHOTO/SCREENSHOT OF THEIR PAYMENT RECEIPT here once they've paid so we can confirm the order. NO-ACCOUNT CASE: if actionResult.bankDetails is null/absent, the seller hasn't set up their bank account yet — do NOT invent details or write the placeholder; warmly apologise and ask the customer to hold on / contact the seller, and tell them their order reference. Only mention details that are actually present in the result; never invent any.
+- If the result has "needsInfo": true, the order is NOT placed yet and NO bank details exist — do not share or invent any account/payment details. The customer wants this product (actionResult.product, price actionResult.price); you just need the remaining details before creating the order. The system gathers these in stages, so actionResult.missing holds only the items to ask for RIGHT NOW — ask for EXACTLY those, all together in ONE warm, natural message, and nothing else. DON'T re-ask for anything in actionResult.collected (already provided — collected.attributes holds chosen variants, plus name/email/location; you may briefly acknowledge them). Map each missing entry by its "field":
     - "attribute": ask which "name" they want (e.g. Size, Colour, Storage) and list the available choices from its "options". If the entry has a "line" object, this is a MULTI-ITEM order and the question is about ONE specific item — identify it for the customer by its line.quantity and any already-chosen attributes in line.chosen (e.g. "for the 3 you want in red, which size?" / "and for the 1 in black?") so it's clear which item each question is for. Ask the questions for every missing line together in the one message.
     - "modifiers": for each group in "groups", ask them to choose, listing every option with its extra cost when it has one (e.g. "Chicken +₦500, Beef +₦800"); never invent options.
     - "name": ask for the name the order should be under.
     - "email": ask for the email address for the order/receipt.
     - "location": ask for their delivery address/location.
   WRONG INPUT — if a missing entry has an "invalidValue", the customer DID send that detail this turn but it isn't valid (a malformed email like "john@gmail" with no domain, a not-a-real-name, a too-short address, or — for an attribute — a choice that isn't offered). Don't silently re-ask: gently and specifically tell them that what they sent (quote the invalidValue back to them) doesn't look like a valid name / email / delivery address, or for an attribute that it isn't one of the available options, and ask them to send a correct one. Keep it warm, not robotic (e.g. "Hmm, 'joegmail.com' doesn't look like a complete email — could you double-check and resend it?"). For an attribute, restate the real choices from "options".
-  When "name" and "email" appear together, ask for both in the same breath ("Can I get your name and email for the order?"). Keep it friendly and conversational, not a stiff form. Once they reply, the next detail (or the payment link) follows automatically.
-- UNAVAILABLE ADD-ONS — this applies to BOTH the payment-link and needsInfo results above: if actionResult.unavailableModifiers is present (a list), the customer asked for add-ons / options / toppings this product does NOT offer (e.g. an extra or side that isn't on the menu). You MUST flag each one by name and say it isn't available for this product — never silently ignore the request or pretend it was added. If the order is otherwise complete (a payment link is present), still share the link, but make clear those specific item(s) weren't included and the price reflects only what IS available. If you're still collecting details, mention the unavailable item(s) up front, then continue asking for what's missing. When the product genuinely has other add-ons, you may point them to the real ones.
+  When "name" and "email" appear together, ask for both in the same breath ("Can I get your name and email for the order?"). Keep it friendly and conversational, not a stiff form. Once they reply, the next detail (or the bank details to pay) follows automatically.
+- UNAVAILABLE ADD-ONS — this applies to BOTH the placed-order and needsInfo results above: if actionResult.unavailableModifiers is present (a list), the customer asked for add-ons / options / toppings this product does NOT offer (e.g. an extra or side that isn't on the menu). You MUST flag each one by name and say it isn't available for this product — never silently ignore the request or pretend it was added. If the order is otherwise complete (bank details are present), still share the bank details, but make clear those specific item(s) weren't included and the price reflects only what IS available. If you're still collecting details, mention the unavailable item(s) up front, then continue asking for what's missing. When the product genuinely has other add-ons, you may point them to the real ones.
 - For price negotiation (the action result has a "negotiation" object):
   - SECRECY (non-negotiable rule): while bargaining, never reveal, hint at, or imply a minimum price, floor, or how low you can go. Only ever mention the list price or the exact price you are offering now. The ONLY exception is outcome "final" below — and even then, present negotiation.finalPrice simply as your final price, never as a "minimum", "floor", or "the lowest we're allowed to go".
   - PRICES ONLY MOVE DOWN: never state a counter or final price HIGHER than any price you already offered this customer for this product earlier in the conversation. The price in the action result is the standing commitment — quote exactly that number, and never resurrect an older, higher number from the chat history.
   - outcome "started": warmly invite the customer to make an offer. Do NOT name a discounted price yourself.
   - outcome "counter": you are countering at negotiation.counterPrice. Your reply MUST state that exact price (₦ formatted) as the price you are offering RIGHT NOW — never say you will check, confirm, or get back to the customer; the decision is already made. Present it as YOUR price and justify the number using the REAL qualities of this product from the "product" details — quality, material, features, popularity, and limited availability if product.lowStock is true. Be warm but hold the value; do not cave to the customer's number and do not mention any minimum. Style examples (do NOT copy them word-for-word; write your own in the same spirit): English — "Because of the quality on this one, the best I can do right now is ₦X."; Pidgin — "This one na original o — make we meet for ₦X, you no go regret am."
-  - outcome "accept": the deal is agreed at negotiation.acceptedPrice. Confirm it enthusiastically and move the customer to payment using the link in the result.
+  - outcome "accept": the deal is agreed at negotiation.acceptedPrice. Confirm it enthusiastically and move the customer to payment by sharing the bank details from the result (per the placed-order instructions above).
   - outcome "final": negotiation.finalPrice is your FINAL price — the haggling is over. This is the price you already last offered them; you have come down as far as you can and will not reduce again. Tell them warmly and personally that this is genuinely the lowest you can let it go for — the best you can do for THEM on this item — and briefly tie it to the product's real value (quality/material/features) so it lands as a considered last offer, not a cold fixed price. It is still take-it-or-leave-it: do not apologise excessively, do not invite further offers, and do not budge if they keep pushing — just hold this same number. If it's beyond their budget, offer to show similar items they can negotiate on. Style examples (do NOT copy them word-for-word; write your own in the same spirit, and never write "Oga/Madam" literally — address the customer naturally or not at all): English — "I've stretched as far as I can on this one — ₦X is honestly the lowest I can let it go for, and for this quality it's a steal. Should I package it for you?"; Pidgin — "I don try reach my limit o — ₦X na the last, last price wey I fit sell am give you. For this kind quality, e worth am. Make I package am?"
 - For fixed-price products (action result has "nonNegotiable": true):
   - Politely explain that the price for this product is fixed and you can't reduce it. Do not haggle.
@@ -1407,6 +1407,58 @@ export async function transcribeAudio(audioData, business = null) {
   return transcription.text;
 }
 
+/**
+ * Read a bank-transfer receipt IMAGE and return its fields as JSON. This is the
+ * PAID fallback in the receipt pipeline — only called when free OCR can't reliably
+ * read the receipt. Uses gpt-4o-mini (cheap, multimodal). Returns
+ * `{ amount, beneficiaryAccountNumber, beneficiaryName, bankName, reference, date,
+ * isReceipt }` (any unreadable field is null), or null on failure.
+ */
+export async function extractReceiptFieldsFromImage({ buffer, mimeType }) {
+  const base64 = Buffer.isBuffer(buffer) ? buffer.toString("base64") : "";
+  if (!base64) return null;
+  const dataUrl = `data:${mimeType || "image/jpeg"};base64,${base64}`;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You read Nigerian bank-transfer receipts. Return ONLY JSON with these keys: " +
+            "amount (number — the amount transferred, no currency symbol or commas), " +
+            "beneficiaryAccountNumber (string of digits — the RECIPIENT/beneficiary account number), " +
+            "beneficiaryName (string — the recipient name), bankName (string — the recipient bank), " +
+            "reference (string — the transaction reference / session id), date (string as shown), " +
+            "isReceipt (boolean — true ONLY if this image is genuinely a bank/transfer payment receipt). " +
+            "Use null for any field you cannot read. Never guess or invent a value.",
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Extract the fields from this payment receipt.",
+            },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        },
+      ],
+    });
+    const raw = completion.choices?.[0]?.message?.content || "";
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  } catch (error) {
+    logger.error("extractReceiptFieldsFromImage failed:", error);
+    return null;
+  }
+}
+
 // Nigeria (WAT, UTC+1) is the customer base — anchor "good morning/afternoon/
 // evening" to local time rather than the server clock.
 function getTimeOfDay() {
@@ -1543,7 +1595,7 @@ export async function generatePaymentFollowUp(
         },
         {
           role: "user",
-          content: `A customer began checking out "${productName}"${priceText ? ` for ${priceText}` : ""} — a payment link was sent — but they did not complete payment and have been quiet for about an hour. Write a SHORT, warm, no-pressure follow-up: gently let them know the item is still available/reserved and invite them to complete the order or ask any question. Do NOT be pushy, do NOT guilt them, and do NOT mention any discount unless told to. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
+          content: `A customer began checking out "${productName}"${priceText ? ` for ${priceText}` : ""} — the bank details to pay by transfer were shared — but they did not complete payment and have been quiet for about an hour. Write a SHORT, warm, no-pressure follow-up: gently let them know the item is still available/reserved and invite them to complete the order or ask any question. Do NOT be pushy, do NOT guilt them, and do NOT mention any discount unless told to. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
         },
       ],
       temperature: 0.7,

@@ -25,10 +25,19 @@ import {
   hydrateSession,
   clearPendingFollowUp,
 } from "../models/ConversationState.js";
+import {
+  getLatestUnpaidOrder,
+  isReceiptUsed,
+  markOrderPaid,
+  markOrderPaymentClaimed,
+  hasPriorPaidOrder,
+} from "../models/Order.js";
 import * as whatsapp from "../services/whatsapp.service.js";
 import * as openaiService from "../services/openai.service.js";
 import * as productService from "../services/product.service.js";
 import * as paymentService from "../services/payment.service.js";
+import * as receiptVerification from "../services/receiptVerification.service.js";
+import * as velteService from "../services/velte.service.js";
 import {
   startNegotiation,
   evaluateOffer,
@@ -139,7 +148,7 @@ async function tr(language, pick) {
 // engine. The reply model (gpt-4o-mini) has been observed to ignore the engine's
 // number and refuse the customer ("it's priced at ₦X, I can't go down to ₦Y"),
 // restating the list price — so we compose these two outcomes deterministically
-// and never let the model pick the figure (same stance as enforcePaymentLink).
+// and never let the model pick the figure (same stance as enforceBankDetails).
 // Returns the ready-to-send reply, or null to defer to the model (accept/needsInfo
 // outcomes carry a checkout summary + payment link, so those still go through it).
 async function composeNegotiationReply(language, neg) {
@@ -176,39 +185,41 @@ function stripInternalMarkers(text) {
     .trim();
 }
 
-// The payment URL is money-critical and must reach the customer byte-for-byte.
-// The reply model is NOT trusted to render it: it tends to "fix" URLs it deems
-// odd (e.g. rewriting a localhost velte link to some other domain) or hallucinate
-// one. So the model only leaves a {{PAYMENT_LINK}} placeholder; here we swap in
-// the real link, overwrite any URL it invented anyway, and guarantee it's present.
-const PAYMENT_LINK_PLACEHOLDER = /\{\{\s*PAYMENT_LINK\s*\}\}/gi;
-function enforcePaymentLink(text, link) {
+// The bank details are money-critical and must reach the customer byte-for-byte —
+// a single wrong digit sends the transfer to the wrong account. The reply model
+// is NOT trusted to render the account number (it can transpose/round digits), so
+// it only leaves a {{BANK_DETAILS}} placeholder; here we swap in the exact saved
+// account and guarantee the number is present.
+const BANK_DETAILS_PLACEHOLDER = /\{\{\s*BANK_DETAILS\s*\}\}/gi;
+function formatBankDetails(bankDetails) {
+  const lines = [
+    `🏦 Account Name: ${bankDetails.accountName}`,
+    `Account Number: ${bankDetails.accountNumber}`,
+  ];
+  if (bankDetails.bankName) lines.push(`Bank: ${bankDetails.bankName}`);
+  return lines.join("\n");
+}
+function enforceBankDetails(text, bankDetails) {
   let out = String(text ?? "");
-  if (link) {
-    out = out.replace(PAYMENT_LINK_PLACEHOLDER, link);
-    // Replace any other URL the model emitted (a rewrite/hallucination) with ours.
-    const urls = out.match(/\bhttps?:\/\/\S+/gi) || [];
-    for (const u of urls) {
-      if (u !== link) out = out.split(u).join(link);
+  if (bankDetails?.accountNumber && bankDetails?.accountName) {
+    const block = formatBankDetails(bankDetails);
+    out = out.replace(BANK_DETAILS_PLACEHOLDER, block);
+    // Guarantee the exact account number is present even if the model dropped the
+    // placeholder entirely.
+    if (!out.includes(bankDetails.accountNumber)) {
+      out = `${out.trim()}\n\n${block}`;
     }
-    if (!out.includes(link)) out = `${out.trim()}\n\n${link}`;
   } else {
-    // No link to substitute (e.g. the order still needs a detail, but the model
-    // wrote the placeholder anyway). The token is INTERNAL and must never reach
-    // the customer — strip it. Other URLs are left alone, since non-payment
-    // replies legitimately link to the online store.
-    const stripped = out.replace(PAYMENT_LINK_PLACEHOLDER, "");
+    // No saved account — strip the placeholder so the internal token never leaks.
+    const stripped = out.replace(BANK_DETAILS_PLACEHOLDER, "");
     if (stripped !== out) {
       logger.warn(
-        "[Webhook] {{PAYMENT_LINK}} placeholder with no link to fill — stripping (order likely still incomplete).",
+        "[Webhook] {{BANK_DETAILS}} placeholder but merchant has no saved bank account — stripping.",
       );
       out = stripped;
     }
   }
-  return out
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return out.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 // AI-written, code-guarded "N more items — *show more*" line. The count and the
@@ -1015,8 +1026,10 @@ async function runCheckout({
   };
 
   // `amount` is already VAT-inclusive (tax is folded in at the product mapper),
-  // so it's charged as-is — the customer only ever sees a single "Price".
-  const { paymentLink, orderId } = await paymentService.generatePaymentLink(
+  // so it's the exact figure the customer transfers — the customer only ever sees
+  // a single "Price". Places the order and returns the merchant's bank details
+  // for a DIRECT transfer (no payment link / processor).
+  const { bankDetails, orderId } = await paymentService.placeOrder(
     businessId,
     customerNumber,
     itemLabel,
@@ -1051,7 +1064,8 @@ async function runCheckout({
   // the order + receipt PDF). Staffly does not send any email itself.
 
   return {
-    paymentLink,
+    // The merchant's bank account for a direct transfer (null if none saved).
+    bankDetails,
     orderId,
     product: product.name,
     quantity,
@@ -1233,6 +1247,195 @@ async function extractUserMessage(message, accessToken, business) {
     logger.error("[Voice Error]", error);
 
     return "__VOICE_ERROR__";
+  }
+}
+
+// Per-session cap on rejected receipt uploads, to stop a customer brute-forcing
+// forged/mismatched receipts. Reset on a successful verification.
+const MAX_RECEIPT_FAILURES = 5;
+// At or above this order total, a verified receipt is NOT auto-confirmed — it's
+// held for the vendor to confirm (high-value risk). New buyers are also held.
+// Configurable via RECEIPT_VENDOR_CONFIRM_OVER (see env.js).
+const RECEIPT_VENDOR_CONFIRM_OVER = env.receiptVendorConfirmOver; // ₦
+
+// ── Receipt upload (manual-transfer payment confirmation) ─────────────────────
+// A photo from a customer who has an unpaid order is treated as their transfer
+// receipt: download it, verify against the order (amount + beneficiary account),
+// dedupe on the transaction reference, then EITHER auto-confirm (low-risk) or hold
+// for vendor confirmation (high-value / first-time buyer). Verification is hybrid
+// OCR → vision but the decision is deterministic.
+async function handleReceiptUpload({
+  phoneNumberId,
+  accessToken,
+  businessId,
+  customerNumber,
+  mediaId,
+}) {
+  const reply = (text) =>
+    whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, text);
+  const bumpFailures = () => {
+    const s = getSession(businessId, customerNumber);
+    setSession(businessId, customerNumber, {
+      ...s,
+      receiptFailures: (s.receiptFailures || 0) + 1,
+    });
+  };
+  const resetFailures = () => {
+    const s = getSession(businessId, customerNumber);
+    if (s.receiptFailures) {
+      setSession(businessId, customerNumber, { ...s, receiptFailures: 0 });
+    }
+  };
+
+  const order = await getLatestUnpaidOrder(businessId, customerNumber);
+  if (!order) {
+    await reply(
+      "I can't find an order waiting for payment right now. If you've just ordered, tell me what you'd like to buy and I'll set it up. 🙂",
+    );
+    return;
+  }
+  if (!mediaId) {
+    await reply(
+      "I couldn't open that image — please resend your payment receipt.",
+    );
+    return;
+  }
+
+  // Abuse guard: after too many rejected uploads, stop auto-processing and hand off
+  // to the seller (prevents brute-forcing forged receipts).
+  const failures = getSession(businessId, customerNumber).receiptFailures || 0;
+  if (failures >= MAX_RECEIPT_FAILURES) {
+    await reply(
+      "I've had trouble confirming several receipts. Please contact the seller directly to sort out your payment.",
+    );
+    return;
+  }
+
+  const bankDetails = await paymentService.getVendorBankDetails(businessId);
+  if (!bankDetails?.accountNumber) {
+    logger.warn(
+      `[Receipt] No vendor bank account for business ${businessId}; can't verify receipt for order ${order.id}.`,
+    );
+    await reply(
+      "Thanks for the receipt! The seller's payment account isn't fully set up yet — please hold on while I sort this out with them.",
+    );
+    return;
+  }
+
+  let media;
+  try {
+    media = await whatsapp.downloadMedia(mediaId, accessToken);
+  } catch (e) {
+    logger.error(`[Receipt] media download failed: ${e.message}`);
+    await reply(
+      "I couldn't download that image — please resend your payment receipt.",
+    );
+    return;
+  }
+
+  const result = await receiptVerification.verifyReceipt({
+    media,
+    order,
+    bankDetails,
+  });
+  logger.info(
+    `[Receipt] order ${order.id} → ${result.reason} (source: ${result.source || "n/a"})`,
+  );
+
+  if (!result.ok) {
+    bumpFailures();
+    await reply(receiptRejectionMessage(result, order));
+    return;
+  }
+
+  // Dedupe: a receipt reference can only settle one order.
+  if (result.reference && (await isReceiptUsed(businessId, result.reference))) {
+    await reply(
+      "This receipt has already been used for another order. If you've made a new payment for this order, please send that receipt.",
+    );
+    return;
+  }
+
+  resetFailures();
+
+  // Surface the order in the merchant's velte dashboard (fire-and-forget — the
+  // StafflyOrder is the source of truth; a bridge hiccup must not break the reply).
+  const bridgeToVelte = (paymentStatus) => {
+    const merchantId = getBusinessById(businessId)?.velteUserId || null;
+    if (!merchantId) {
+      logger.warn(
+        `[Receipt] business ${businessId} has no velteUserId — order ${order.id} not bridged to velte.`,
+      );
+      return;
+    }
+    velteService.notifyVelteOrder({
+      stafflyOrderId: order.id,
+      merchantId,
+      paymentStatus,
+      product: order.product,
+      productImage: order.productImage,
+      amount: order.amount,
+      quantity: order.quantity,
+      items: order.items,
+      customerName: order.customerName,
+      customerPhone: order.customerNumber,
+      customerEmail: order.customerEmail,
+      deliveryAddress: order.location,
+    });
+  };
+
+  // Risk routing: hold high-value orders and first-time buyers for the vendor to
+  // confirm in their dashboard; auto-confirm the rest.
+  const isNewBuyer = !(await hasPriorPaidOrder(businessId, customerNumber));
+  const needsVendorConfirm =
+    order.amount >= RECEIPT_VENDOR_CONFIRM_OVER || isNewBuyer;
+
+  if (needsVendorConfirm) {
+    // Snapshot the receipt so the vendor can review it in the dashboard: the
+    // WhatsApp media id (re-resolvable to the image) + what the pipeline read.
+    await markOrderPaymentClaimed(order.id, {
+      receiptReference: result.reference,
+      receiptClaim: {
+        mediaId,
+        mimeType: media?.mimeType || null,
+        extractedAmount: result.fields?.amount ?? null,
+        extractedAccount: result.fields?.accountNumber ?? null,
+        source: result.source || null,
+      },
+    });
+    bridgeToVelte("awaiting_confirmation");
+    logger.info(
+      `[Receipt] order ${order.id} held for vendor confirmation (amount ₦${Number(order.amount).toLocaleString()}, newBuyer: ${isNewBuyer}).`,
+    );
+    await reply(
+      `Thank you${order.customerName ? `, ${order.customerName}` : ""}! I've received your receipt for order ${order.id} and we're just confirming the payment with the seller. You'll get a confirmation shortly. 🙏`,
+    );
+    return;
+  }
+
+  await markOrderPaid(order.id, {
+    receiptReference: result.reference,
+    verifiedBy: "ai",
+  });
+  bridgeToVelte("paid");
+  await reply(
+    `✅ Payment confirmed for order ${order.id}${order.customerName ? `, ${order.customerName}` : ""}! Thank you — your order is now being processed. 🎉`,
+  );
+}
+
+function receiptRejectionMessage(result, order) {
+  const total = `₦${Number(order.amount).toLocaleString()}`;
+  switch (result.reason) {
+    case "unreadable":
+      return "I couldn't read that receipt clearly. Please resend a clear photo or screenshot showing the full transfer details.";
+    case "not_a_receipt":
+      return "That doesn't look like a payment receipt. Please send the transfer receipt from your bank app.";
+    case "account_mismatch":
+      return "The receipt shows a transfer to a different account. Please make sure you sent it to the account I shared, then send that receipt.";
+    case "amount_mismatch":
+      return `The amount on that receipt doesn't match your order total of ${total}. Please double-check and send the correct receipt.`;
+    default:
+      return "I couldn't confirm that receipt. Please resend a clear photo of your transfer receipt.";
   }
 }
 
@@ -2093,6 +2296,19 @@ export async function handleIncomingMessage(req, res) {
       return;
     }
 
+    // A photo from a customer with an open order is their transfer receipt —
+    // intercept it here (extractUserMessage doesn't handle images) and verify.
+    if (message.type === "image") {
+      await handleReceiptUpload({
+        phoneNumberId,
+        accessToken,
+        businessId,
+        customerNumber,
+        mediaId: message.image?.id,
+      });
+      return;
+    }
+
     const userMessage = await extractUserMessage(
       message,
       accessToken,
@@ -2397,13 +2613,13 @@ export async function handleIncomingMessage(req, res) {
 
           responseText = stripInternalMarkers(finalAiOutput.response);
 
-          // Force the exact payment URL in (the model isn't trusted to render it).
-          // Always run this: with a link it substitutes the placeholder; without
-          // one it strips the placeholder so the raw {{PAYMENT_LINK}} token can
-          // never leak to the customer.
-          responseText = enforcePaymentLink(
+          // Force the exact bank details in (the model isn't trusted to render the
+          // account number). Always run this: with a saved account it substitutes
+          // the {{BANK_DETAILS}} placeholder; without one it strips the token so it
+          // can never leak to the customer.
+          responseText = enforceBankDetails(
             responseText,
-            actionResult?.paymentLink,
+            actionResult?.bankDetails,
           );
         }
 

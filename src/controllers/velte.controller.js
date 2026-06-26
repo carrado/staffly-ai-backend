@@ -77,6 +77,16 @@ async function handleOrderPaid(business, data) {
   const orderId = data.stafflyOrderId || data.orderId || data.reference || null;
   const order = orderId ? await getOrderById(orderId) : null;
 
+  // Idempotency: a manual-transfer order we already settled here (AI auto-confirm
+  // or vendor confirmation) has both updated status AND notified the customer. If
+  // velte echoes order.paid back for that same order, don't notify a second time.
+  if (order?.status === 'paid') {
+    logger.info(
+      `[Velte] order.paid for ${orderId} already paid here — skipping duplicate notify`,
+    );
+    return;
+  }
+
   if (order) {
     await updateOrderStatus(orderId, 'paid');
     // Payment landed — make sure the abandoned-checkout sweeper never nudges

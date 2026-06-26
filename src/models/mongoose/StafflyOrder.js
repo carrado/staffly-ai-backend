@@ -53,7 +53,34 @@ const StafflyOrderSchema = new mongoose.Schema(
       ],
       default: [],
     },
-    status: { type: String, default: "pending" }, // pending | paid | failed
+    // pending | paid | failed | payment_claimed (receipt verified by AI but held
+    // for the vendor to confirm against their bank alert in the velte dashboard).
+    status: { type: String, default: "pending" },
+    // Manual-transfer receipt verification (a buyer uploads their transfer receipt;
+    // a hybrid OCR → vision pipeline checks it and marks the order paid).
+    paidAt: { type: Date, default: null },
+    paymentVerifiedBy: { type: String, default: null }, // 'ai' | 'vendor'
+    // The receipt's transaction reference/session id — stored to DEDUPE so the same
+    // receipt can't mark more than one order paid. Indexed per business.
+    receiptReference: { type: String, default: null, index: true },
+    // Snapshot of the held receipt so the vendor can eyeball it in the dashboard
+    // before confirming. `mediaId` is the WhatsApp media id (re-resolvable to the
+    // image bytes via the business access token within Meta's ~14-day retention);
+    // the extracted fields are what the OCR/vision pipeline read.
+    receiptClaim: {
+      type: new mongoose.Schema(
+        {
+          mediaId: { type: String, default: null },
+          mimeType: { type: String, default: null },
+          extractedAmount: { type: Number, default: null },
+          extractedAccount: { type: String, default: null },
+          source: { type: String, default: null }, // 'ocr' | 'vision' | 'hybrid'
+          claimedAt: { type: Date, default: null },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     // Buyer details gathered during the WhatsApp checkout, used to fulfil the
     // order (name on the order, receipt email, delivery location).
     customerName: { type: String, default: null },
