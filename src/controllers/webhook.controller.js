@@ -1370,8 +1370,8 @@ async function handleReceiptUpload({
   const bridgeToVelte = (paymentStatus) => {
     const merchantId = getBusinessById(businessId)?.velteUserId || null;
     if (!merchantId) {
-      logger.warn(
-        `[Receipt] business ${businessId} has no velteUserId — order ${order.id} not bridged to velte.`,
+      logger.error(
+        `[Receipt] business ${businessId} has no velteUserId — order ${order.id} NOT bridged to velte (won't appear in the merchant dashboard).`,
       );
       return;
     }

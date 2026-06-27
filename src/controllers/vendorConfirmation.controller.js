@@ -195,8 +195,8 @@ export async function getReceiptImage(req, res) {
 function bridgeToVelte(business, order, paymentStatus) {
   const merchantId = business?.velteUserId || null;
   if (!merchantId) {
-    logger.warn(
-      `[VendorConfirm] business ${order.businessId} has no velteUserId — order ${order.id} not bridged.`,
+    logger.error(
+      `[VendorConfirm] business ${order.businessId} has no velteUserId — order ${order.id} NOT bridged (won't appear in the merchant dashboard).`,
     );
     return;
   }
