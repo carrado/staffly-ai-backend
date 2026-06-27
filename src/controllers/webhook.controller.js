@@ -28,9 +28,7 @@ import {
 import {
   getLatestUnpaidOrder,
   isReceiptUsed,
-  markOrderPaid,
   markOrderPaymentClaimed,
-  hasPriorPaidOrder,
 } from "../models/Order.js";
 import * as whatsapp from "../services/whatsapp.service.js";
 import * as openaiService from "../services/openai.service.js";
@@ -43,7 +41,6 @@ import {
   evaluateOffer,
   concede,
 } from "../services/negotiation.service.js";
-import { env } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 
 const SEARCH_PAGE_SIZE = 3; // image cards per page for a specific search
@@ -1253,17 +1250,14 @@ async function extractUserMessage(message, accessToken, business) {
 // Per-session cap on rejected receipt uploads, to stop a customer brute-forcing
 // forged/mismatched receipts. Reset on a successful verification.
 const MAX_RECEIPT_FAILURES = 5;
-// At or above this order total, a verified receipt is NOT auto-confirmed — it's
-// held for the vendor to confirm (high-value risk). New buyers are also held.
-// Configurable via RECEIPT_VENDOR_CONFIRM_OVER (see env.js).
-const RECEIPT_VENDOR_CONFIRM_OVER = env.receiptVendorConfirmOver; // ₦
 
 // ── Receipt upload (manual-transfer payment confirmation) ─────────────────────
 // A photo from a customer who has an unpaid order is treated as their transfer
 // receipt: download it, verify against the order (amount + beneficiary account),
-// dedupe on the transaction reference, then EITHER auto-confirm (low-risk) or hold
-// for vendor confirmation (high-value / first-time buyer). Verification is hybrid
-// OCR → vision but the decision is deterministic.
+// dedupe on the transaction reference, then hold it for the vendor to confirm in
+// their dashboard. Verification is vision-only and the decision is deterministic;
+// a passing receipt only LOOKS genuine (a good fake passes the same checks), so
+// the vendor always has the final say — nothing auto-confirms.
 async function handleReceiptUpload({
   phoneNumberId,
   accessToken,
@@ -1344,7 +1338,20 @@ async function handleReceiptUpload({
 
   if (!result.ok) {
     bumpFailures();
-    await reply(receiptRejectionMessage(result, order));
+    // Explain WHY it was flagged in the customer's language/tone — the reason is
+    // decided deterministically above; the AI only phrases it. The fixed
+    // receiptRejectionMessage is the guaranteed fallback if the model fails.
+    const language = getSession(businessId, customerNumber).language;
+    await reply(
+      await openaiService.composeReceiptRejectionMessage({
+        reason: result.reason,
+        orderTotal: order.amount,
+        detectedAmount: result.got ?? result.fields?.amount ?? null,
+        language,
+        business: getBusinessById(businessId),
+        fallback: receiptRejectionMessage(result, order),
+      }),
+    );
     return;
   }
 
@@ -1384,42 +1391,28 @@ async function handleReceiptUpload({
     });
   };
 
-  // Risk routing: hold high-value orders and first-time buyers for the vendor to
-  // confirm in their dashboard; auto-confirm the rest.
-  const isNewBuyer = !(await hasPriorPaidOrder(businessId, customerNumber));
-  const needsVendorConfirm =
-    order.amount >= RECEIPT_VENDOR_CONFIRM_OVER || isNewBuyer;
-
-  if (needsVendorConfirm) {
-    // Snapshot the receipt so the vendor can review it in the dashboard: the
-    // WhatsApp media id (re-resolvable to the image) + what the pipeline read.
-    await markOrderPaymentClaimed(order.id, {
-      receiptReference: result.reference,
-      receiptClaim: {
-        mediaId,
-        mimeType: media?.mimeType || null,
-        extractedAmount: result.fields?.amount ?? null,
-        extractedAccount: result.fields?.accountNumber ?? null,
-        source: result.source || null,
-      },
-    });
-    bridgeToVelte("awaiting_confirmation");
-    logger.info(
-      `[Receipt] order ${order.id} held for vendor confirmation (amount ₦${Number(order.amount).toLocaleString()}, newBuyer: ${isNewBuyer}).`,
-    );
-    await reply(
-      `Thank you${order.customerName ? `, ${order.customerName}` : ""}! I've received your receipt for order ${order.id} and we're just confirming the payment with the seller. You'll get a confirmation shortly. 🙏`,
-    );
-    return;
-  }
-
-  await markOrderPaid(order.id, {
+  // Vision says the receipt looks genuine and its figures match — but that's not
+  // proof the money landed (a perfectly-rendered fake passes the same checks). So
+  // EVERY verified receipt is held for the vendor to confirm against their actual
+  // bank credit alert; nothing auto-confirms on vision alone. Snapshot the receipt
+  // so the vendor can review it in the dashboard: the WhatsApp media id
+  // (re-resolvable to the image) + what the vision pass read.
+  await markOrderPaymentClaimed(order.id, {
     receiptReference: result.reference,
-    verifiedBy: "ai",
+    receiptClaim: {
+      mediaId,
+      mimeType: media?.mimeType || null,
+      extractedAmount: result.fields?.amount ?? null,
+      extractedAccount: result.fields?.accountNumber ?? null,
+      source: result.source || null,
+    },
   });
-  bridgeToVelte("paid");
+  bridgeToVelte("awaiting_confirmation");
+  logger.info(
+    `[Receipt] order ${order.id} verified by vision, held for vendor confirmation (amount ₦${Number(order.amount).toLocaleString()}).`,
+  );
   await reply(
-    `✅ Payment confirmed for order ${order.id}${order.customerName ? `, ${order.customerName}` : ""}! Thank you — your order is now being processed. 🎉`,
+    `Thank you${order.customerName ? `, ${order.customerName}` : ""}! I've received your receipt for order ${order.id} and we're just confirming the payment with the seller. You'll get a confirmation shortly. 🙏`,
   );
 }
 

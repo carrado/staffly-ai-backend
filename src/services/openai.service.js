@@ -1427,12 +1427,15 @@ export async function extractReceiptFieldsFromImage({ buffer, mimeType }) {
         {
           role: "system",
           content:
-            "You read Nigerian bank-transfer receipts. Return ONLY JSON with these keys: " +
+            "You read AND authenticate Nigerian bank-transfer receipts. Return ONLY JSON with these keys: " +
             "amount (number — the amount transferred, no currency symbol or commas), " +
             "beneficiaryAccountNumber (string of digits — the RECIPIENT/beneficiary account number), " +
             "beneficiaryName (string — the recipient name), bankName (string — the recipient bank), " +
             "reference (string — the transaction reference / session id), date (string as shown), " +
-            "isReceipt (boolean — true ONLY if this image is genuinely a bank/transfer payment receipt). " +
+            "isReceipt (boolean — true ONLY if this is genuinely a real, untampered bank/transfer payment " +
+            "receipt; set it FALSE if the image is not a receipt at all, OR shows any sign of editing or " +
+            "forgery: mismatched fonts/sizes/alignment on the amount or account, inconsistent spacing or " +
+            "colour, pasted/retouched figures, or the look of a 'fake bank alert' generator app). " +
             "Use null for any field you cannot read. Never guess or invent a value.",
         },
         {
@@ -1641,5 +1644,82 @@ export async function generateVoiceErrorMessage(
     logger.error("Voice fallback AI failed:", error);
 
     return fallback;
+  }
+}
+
+/**
+ * AI-composed explanation for a receipt we couldn't accept. The REASON is decided
+ * deterministically upstream (vision read + amount/account checks) — here we only
+ * phrase WHY it was flagged and what to do next, in the customer's language and
+ * the business tone. Falls back to a fixed, guaranteed-correct line if the model
+ * fails or the reason is unknown — a rejected payment must always get a clear reply.
+ *
+ * Never reveals the vendor's correct account number (already shared earlier in the
+ * chat) and never accuses the customer of fraud — it just explains the issue.
+ */
+export async function composeReceiptRejectionMessage({
+  reason,
+  orderTotal,
+  detectedAmount = null,
+  language = "english",
+  business,
+  fallback,
+}) {
+  const safeFallback =
+    fallback ||
+    "I couldn't confirm that receipt. Please resend a clear photo of your transfer receipt.";
+
+  const total =
+    typeof orderTotal === "number" ? `₦${orderTotal.toLocaleString()}` : null;
+
+  // What the customer needs to understand + do, per reason. The model only phrases
+  // this naturally — it must NOT invent a different reason.
+  const REASONS = {
+    unreadable:
+      "The receipt image was too blurry or unclear to read the transfer details. Ask them to resend a clearer photo or screenshot showing the full receipt.",
+    not_a_receipt:
+      "The image does not look like a genuine bank-transfer receipt — it may be the wrong image, or it appears edited/altered. Ask them to send the real, unedited transfer receipt straight from their bank app.",
+    account_mismatch:
+      "The receipt shows the transfer went to a DIFFERENT account than the one the seller shared. Ask them to confirm they paid into the correct account and resend that receipt. Do NOT state any account number.",
+    amount_mismatch: `The amount on the receipt does not match the order total${
+      total ? ` of ${total}` : ""
+    }${
+      detectedAmount
+        ? ` (their receipt shows about ₦${Number(detectedAmount).toLocaleString()})`
+        : ""
+    }. Ask them to double-check and send the correct receipt for the full amount.`,
+  };
+
+  const reasonBrief = REASONS[reason];
+  if (!reasonBrief) return safeFallback;
+
+  const tone = business?.aiConfig?.businessTone;
+  const toneInstruction = tone ? ` Your communication style is ${tone}.` : "";
+  const languageInstruction = languageWritingInstruction(language);
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are an AI sales assistant for "${
+            business?.name || "our store"
+          }" handling a WhatsApp payment.${toneInstruction}${languageInstruction}`,
+        },
+        {
+          role: "user",
+          content: `A customer sent a payment receipt for their order, but it could not be accepted. Reason: ${reasonBrief} Write a SHORT, polite, NON-accusatory WhatsApp message that gently explains why the receipt couldn't be confirmed and tells them exactly what to do next. Never accuse them of fraud or forgery — stay friendly and helpful. Plain text only.${SHORT_MESSAGE_CONSTRAINTS}`,
+        },
+      ],
+      temperature: 0.5,
+    });
+
+    return (
+      sanitizeGreeting(completion.choices?.[0]?.message?.content) || safeFallback
+    );
+  } catch (error) {
+    logger.error("composeReceiptRejectionMessage failed:", error);
+    return safeFallback;
   }
 }
