@@ -2600,6 +2600,7 @@ export async function handleIncomingMessage(req, res) {
     // Done before the session is read below so classification and executeAction
     // both see the corrected lastProduct.
     let repliedQuoteText = null;
+    let repliedCardName = null;
     if (repliedWamid) {
       const replySession = getSession(businessId, customerNumber);
       const cardCount = Object.keys(replySession.cardMessages || {}).length;
@@ -2610,6 +2611,7 @@ export async function handleIncomingMessage(req, res) {
           await productService.getProductById(repliedProductId);
         if (repliedProduct) {
           setLastProduct(businessId, customerNumber, repliedProduct);
+          repliedCardName = repliedProduct.name;
           logger.info(
             `[${business.name}] Reply-to-CARD resolved → "${repliedProduct.name}" (wamid ${repliedWamid})`,
           );
@@ -2714,16 +2716,24 @@ export async function handleIncomingMessage(req, res) {
       };
     }
 
-    // When the customer quoted one of our text bubbles, prefix the quote to the
-    // message the CLASSIFIER sees so it knows which line they're replying to.
-    // The raw `userMessage` is left untouched — history, quantity/offer
-    // extraction, and the reply model all keep working off the real text.
-    const classifierMessage = repliedQuoteText
-      ? `[Replying to your earlier message: "${repliedQuoteText}"]\n${userMessage}`
+    // When the customer swipe-replied to one of OUR messages, prefix an explicit
+    // anchor so BOTH the classifier and the reply composer lock onto what they
+    // quoted — not the most recent topic in history. Setting lastProduct alone
+    // isn't enough: the conversation's recency bias makes the model answer about
+    // the latest item (e.g. a handbag) even when the customer clearly replied to
+    // an earlier sneaker card. The anchor overrides that. The raw `userMessage`
+    // is left untouched for history, quantity/offer extraction, etc.
+    const replyAnchor = repliedCardName
+      ? `[The customer is replying to the product card you sent for "${repliedCardName}". Any "this", "it", or "how much" refers to THAT product — not any more recent item in the conversation.]`
+      : repliedQuoteText
+        ? `[The customer is replying to your earlier message: "${repliedQuoteText}". Their message refers to THAT, not any more recent topic.]`
+        : null;
+    const anchoredMessage = replyAnchor
+      ? `${replyAnchor}\n${userMessage}`
       : userMessage;
 
     const rawAiOutput = await openaiService.processMessage(
-      classifierMessage,
+      anchoredMessage,
       activeSession,
       business,
     );
@@ -2884,7 +2894,7 @@ export async function handleIncomingMessage(req, res) {
             (await tr(language, (s) => s.exactPhotoMatch(name)));
         } else if (actionResult?.searchBreadth === "broad") {
           const composed = await openaiService.generateResponseWithActionResult(
-            userMessage,
+            anchoredMessage,
             { ...freshSession, language },
             actionResult,
             business,
@@ -2934,7 +2944,7 @@ export async function handleIncomingMessage(req, res) {
           // turn's detection so the reply switches languages without lag.
           const finalAiOutput =
             await openaiService.generateResponseWithActionResult(
-              userMessage,
+              anchoredMessage,
               { ...freshSession, language },
               actionResult,
               business,
