@@ -2602,6 +2602,8 @@ export async function handleIncomingMessage(req, res) {
     let repliedQuoteText = null;
     if (repliedWamid) {
       const replySession = getSession(businessId, customerNumber);
+      const cardCount = Object.keys(replySession.cardMessages || {}).length;
+      const textCount = Object.keys(replySession.textMessages || {}).length;
       const repliedProductId = replySession.cardMessages?.[repliedWamid];
       if (repliedProductId != null) {
         const repliedProduct =
@@ -2609,15 +2611,30 @@ export async function handleIncomingMessage(req, res) {
         if (repliedProduct) {
           setLastProduct(businessId, customerNumber, repliedProduct);
           logger.info(
-            `[${business.name}] Reply-to-card: lastProduct → "${repliedProduct.name}"`,
+            `[${business.name}] Reply-to-CARD resolved → "${repliedProduct.name}" (wamid ${repliedWamid})`,
+          );
+        } else {
+          logger.warn(
+            `[${business.name}] Reply-to-card: product ${repliedProductId} no longer exists (wamid ${repliedWamid})`,
           );
         }
       } else if (replySession.textMessages?.[repliedWamid]) {
         repliedQuoteText = replySession.textMessages[repliedWamid];
         logger.info(
-          `[${business.name}] Reply-to-text: quoting "${repliedQuoteText.slice(0, 60)}"`,
+          `[${business.name}] Reply-to-TEXT resolved → "${repliedQuoteText.slice(0, 60)}" (wamid ${repliedWamid})`,
+        );
+      } else {
+        // The customer quoted a message whose WAMID we never tracked (a greeting,
+        // a card intro line, a message from before this feature, or an id that
+        // doesn't match what we stored). This is the case to watch for.
+        logger.warn(
+          `[${business.name}] Reply-to-message MISS: quoted wamid ${repliedWamid} not in maps (cards:${cardCount}, texts:${textCount})`,
         );
       }
+    } else if (message.context) {
+      logger.info(
+        `[${business.name}] Inbound carries context but no usable reply id (referral=${!!message.referral})`,
+      );
     }
 
     const session = getSession(businessId, customerNumber);
