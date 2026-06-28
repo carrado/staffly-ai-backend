@@ -1471,10 +1471,13 @@ async function beginPhotoProductSearch({
     productType: photo.productType,
   });
 
-  // Phrase it as an explicit lookalike search so the classifier routes to
-  // search_products and the reply frames results as the closest match to the
-  // photo (the customer usually sent something from elsewhere).
-  return `I'm looking for something like this (sent as a photo): ${photo.query}`;
+  // Phrase it as an explicit lookalike search and return the raw query too: the
+  // caller FORCES a search_products action with it (a photo must always run the
+  // visual search — the classifier must never answer "none" for it).
+  return {
+    message: `I'm looking for something like this (sent as a photo): ${photo.query}`,
+    query: photo.query,
+  };
 }
 
 function receiptRejectionMessage(result, order) {
@@ -2466,6 +2469,8 @@ export async function handleIncomingMessage(req, res) {
     // safety prior: when one's pending, anything NOT clearly a product is still
     // treated as a receipt so the money path is never missed.
     let userMessage;
+    let isPhotoSearch = false;
+    let photoQuery = null;
     if (message.type === "image") {
       const mediaId = message.image?.id;
       const pendingOrder = await getLatestUnpaidOrder(
@@ -2503,7 +2508,7 @@ export async function handleIncomingMessage(req, res) {
       );
 
       if (kind === "product") {
-        userMessage = await beginPhotoProductSearch({
+        const photoSearch = await beginPhotoProductSearch({
           phoneNumberId,
           accessToken,
           businessId,
@@ -2511,7 +2516,10 @@ export async function handleIncomingMessage(req, res) {
           media,
           photo,
         });
-        if (!userMessage) return; // helper already replied on an unusable photo
+        if (!photoSearch) return; // helper already replied on an unusable photo
+        userMessage = photoSearch.message;
+        photoQuery = photoSearch.query;
+        isPhotoSearch = true;
       } else if (pendingOrder) {
         // Receipt, or unclear while a payment is outstanding → verify as a
         // receipt (verifyReceipt does its own forgery / not-a-receipt checks).
@@ -2704,7 +2712,21 @@ export async function handleIncomingMessage(req, res) {
       activeSession,
     );
     let action = aiOutput.action;
-    const language = aiOutput.language;
+
+    // A photo search must ALWAYS run the visual search — never let the
+    // classifier answer "none" (it sees the catalogue summary and will
+    // short-circuit a "we don't have that" reply, skipping the image match
+    // entirely). Force search_products with the vision-derived query; the
+    // stashed photo vector then drives the visual match in executeAction.
+    if (isPhotoSearch) {
+      action = { type: "search_products", data: { query: photoQuery } };
+    }
+
+    // The synthesized photo query is English, so language detection would always
+    // flip a photo reply to English — keep the conversation's existing language
+    // instead when there is one.
+    const language =
+      isPhotoSearch && session.language ? session.language : aiOutput.language;
     replyContext.language = language;
 
     // Safety net: mid-negotiation, a message carrying a money amount IS a bid.
