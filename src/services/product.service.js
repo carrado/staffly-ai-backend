@@ -413,33 +413,39 @@ const embeddingCache = new LruCache(EMBEDDING_CACHE_MAX); // `${bid}:${pid}:${ur
 // vector never bloats the Mongo session doc. Single-instance, like the other
 // in-process caches; a short TTL stops a stray vector from outliving its turn.
 const PHOTO_VECTOR_TTL_MS = 2 * 60 * 1000;
-const pendingPhotoVectors = new Map(); // `${bid}:${customerNumber}` → { vector, expiresAt }
+const pendingPhotoVectors = new Map(); // `${bid}:${customerNumber}` → { vector, productType, expiresAt }
 
-export function stashPhotoVector(businessId, customerNumber, vector) {
+export function stashPhotoVector(businessId, customerNumber, vector, productType = "") {
   if (!vector) return;
   pendingPhotoVectors.set(`${businessId}:${customerNumber}`, {
     vector,
+    productType,
     expiresAt: Date.now() + PHOTO_VECTOR_TTL_MS,
   });
 }
 
+// Single-use: returns { vector, productType } or null.
 export function takePhotoVector(businessId, customerNumber) {
   const key = `${businessId}:${customerNumber}`;
   const hit = pendingPhotoVectors.get(key);
-  pendingPhotoVectors.delete(key); // single-use
+  pendingPhotoVectors.delete(key);
   if (!hit || hit.expiresAt < Date.now()) return null;
-  return hit.vector;
+  return { vector: hit.vector, productType: hit.productType };
 }
 
 /**
- * Embed the customer's photo and stash it for the upcoming search. No-op unless
- * visual search is enabled. Called by the controller before it hands the
- * vision-derived query to the normal pipeline.
+ * Embed the customer's photo and stash it (with the vision-derived product type
+ * for the category gate) for the upcoming search. No-op unless visual search is
+ * enabled. Called by the controller before it hands off to the search pipeline.
  */
-export async function preparePhotoSearch(businessId, customerNumber, { buffer, mimeType }) {
+export async function preparePhotoSearch(
+  businessId,
+  customerNumber,
+  { buffer, mimeType, productType = "" },
+) {
   if (!voyage.isVisualSearchEnabled()) return;
   const vector = await voyage.embedImageQuery({ buffer, mimeType });
-  if (vector) stashPhotoVector(businessId, customerNumber, vector);
+  if (vector) stashPhotoVector(businessId, customerNumber, vector, productType);
 }
 
 // Resolve image-photo embeddings for the given products → Map id → vector.
@@ -521,36 +527,71 @@ async function getProductEmbeddings(businessId, products) {
   return result;
 }
 
+// Cosine→tier thresholds for embedding-first visual search. NOT calibrated out
+// of the box — voyage-multimodal-3 similarity values vary by domain, so tune
+// these against real photos (every candidate's score is logged). An item below
+// VISUAL_MIN_SIM is dropped entirely, so a catalogue with nothing close yields
+// an honest "no match" rather than a forced bad one.
+const VISUAL_STRONG_SIM = 0.5; // cosine ≥ this → "strong" (visually on-point)
+const VISUAL_MIN_SIM = 0.35; // cosine < this → dropped (nothing close enough)
+
 /**
- * Reorder `products` (the type-valid matches) by visual similarity to a
- * customer photo's embedding. Stable: products without a usable photo embedding
- * keep their original relative order at the tail. Returns the input unchanged on
- * any failure, so the text ranking always stands as the floor.
+ * Embedding-FIRST visual search. Match the customer's photo against EVERY
+ * available product photo in the catalogue — not just the text-search results —
+ * rank by visual similarity, drop positively wrong-type items (the category
+ * sanity gate), and tier survivors into strong/partial. This is what makes a
+ * lookalike findable even when the product's TEXT is thin or mislabelled: the
+ * match is on appearance, against the whole DB.
+ *
+ * Returns products ordered by visual similarity, each carrying a synthesized
+ * `matchPercent` (so the controller's existing strong/partial tiering and card
+ * rendering work unchanged) and `visualSim` for debugging. Empty when visual
+ * search is off, nothing is close enough, or embeddings are unavailable — the
+ * caller then renders an honest "I don't have anything close".
  */
-export async function visualRerank(businessId, photoVector, products) {
-  if (!photoVector || !products?.length) return products;
+export async function visualSearch(businessId, photoVector, { productType = '' } = {}) {
+  if (!photoVector) return [];
   try {
-    const candidates = products.slice(0, VISUAL_RERANK_MAX);
+    const all = await getProductsForBusiness(businessId);
+    let available = all.filter((p) => p.is_available && p.image_url);
+
+    // Category sanity gate: drop items POSITIVELY typed as something other than
+    // what the photo shows (a handbag for a shoe). Items whose type can't be
+    // read are kept, so a thin-text lookalike is still matched by appearance.
+    if (productType) {
+      available = available.filter((p) => !isTypeConflict(p, productType));
+    }
+    if (!available.length) return [];
+
+    const candidates = available.slice(0, VISUAL_RERANK_MAX);
     const embeddings = await getProductEmbeddings(businessId, candidates);
-    if (!embeddings.size) return products;
+    if (!embeddings.size) return [];
 
-    const scored = products.map((p, i) => {
+    const scored = [];
+    for (const p of candidates) {
       const vec = embeddings.get(p.id);
-      return { p, i, sim: vec ? voyage.cosineSimilarity(photoVector, vec) : -Infinity };
-    });
-    // Visual similarity desc; original order breaks ties (and orders the tail of
-    // un-embedded items).
-    scored.sort((a, b) => b.sim - a.sim || a.i - b.i);
+      if (!vec) continue;
+      const sim = voyage.cosineSimilarity(photoVector, vec);
+      if (Number.isFinite(sim) && sim >= VISUAL_MIN_SIM) scored.push({ p, sim });
+    }
+    scored.sort((a, b) => b.sim - a.sim);
 
-    const top = scored[0];
     logger.info(
-      `[Visual] reranked ${embeddings.size}/${candidates.length} candidate photo(s); ` +
-        `top "${top.p.name}" sim=${Number.isFinite(top.sim) ? top.sim.toFixed(3) : 'n/a'}`,
+      `[Visual] photo search over ${candidates.length} product photo(s) → ` +
+        `${scored.length} above floor` +
+        (scored.length ? `; top "${scored[0].p.name}" sim=${scored[0].sim.toFixed(3)}` : ''),
     );
-    return scored.map((s) => s.p);
+
+    // Map cosine → matchPercent: ≥STRONG_SIM is "strong" (≥STRONG_MATCH_PERCENT
+    // in the controller), the rest "partial".
+    return scored.map(({ p, sim }) => ({
+      ...p,
+      matchPercent: sim >= VISUAL_STRONG_SIM ? 100 : 60,
+      visualSim: Number(sim.toFixed(4)),
+    }));
   } catch (e) {
-    logger.warn(`[Visual] rerank failed (text order kept): ${e.message}`);
-    return products;
+    logger.warn(`[Visual] photo search failed: ${e.message}`);
+    return [];
   }
 }
 

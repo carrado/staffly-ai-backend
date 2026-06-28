@@ -1461,12 +1461,14 @@ async function beginPhotoProductSearch({
     `[PhotoSearch] ${customerNumber} → "${photo.query}" (type: ${photo.productType || "?"})`,
   );
 
-  // Option B: embed the photo and stash it so the upcoming search reorders the
-  // type-valid matches by visual similarity. No-op (and no added latency beyond
-  // one embed) when VOYAGE_API_KEY isn't set — the search then runs as Option A.
+  // Option B: embed the photo and stash it (with the product type for the
+  // category gate) so the upcoming search matches it against the whole product
+  // catalogue by visual similarity. No-op (beyond one embed) when VOYAGE_API_KEY
+  // isn't set — the search then runs text-only as Option A.
   await productService.preparePhotoSearch(businessId, customerNumber, {
     buffer: media.buffer,
     mimeType: media.mimeType,
+    productType: photo.productType,
   });
 
   // Phrase it as an explicit lookalike search so the classifier routes to
@@ -1520,12 +1522,32 @@ async function executeAction({
       const isBroadBrowse = query === "*";
       const pageSize = isBroadBrowse ? BROWSE_PAGE_SIZE : SEARCH_PAGE_SIZE;
 
-      const { products: allMatches, specificity: searchBreadth } =
-        await productService.searchProducts(
-          businessId,
-          query,
-          isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
-        );
+      // Photo-initiated search (Option B): single-use, null on the normal text
+      // path or when visual search is off. When present, the customer sent a
+      // photo — match it against the WHOLE catalogue by visual similarity rather
+      // than running the text search, so a lookalike is found even when the
+      // right product's text is thin/mislabelled. The vision-derived productType
+      // is the category sanity gate.
+      const photo =
+        !isBroadBrowse
+          ? productService.takePhotoVector(businessId, customerNumber)
+          : null;
+
+      let allMatches;
+      let searchBreadth;
+      if (photo) {
+        allMatches = await productService.visualSearch(businessId, photo.vector, {
+          productType: photo.productType,
+        });
+        searchBreadth = "specific"; // a photo is a specific request
+      } else {
+        ({ products: allMatches, specificity: searchBreadth } =
+          await productService.searchProducts(
+            businessId,
+            query,
+            isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
+          ));
+      }
 
       // Budget refinement ("cheaper ones", "under 15k"): keep the same
       // category matches the search returned, just drop anything above the
@@ -1535,27 +1557,14 @@ async function executeAction({
         typeof action.data.maxPrice === "number" && action.data.maxPrice > 0
           ? action.data.maxPrice
           : null;
-      let found = maxPrice
+      const found = maxPrice
         ? allMatches.filter(
             (p) => typeof p.price === "number" && p.price <= maxPrice,
           )
         : allMatches;
 
-      // Visual rerank (Option B): when this search was triggered by a customer
-      // photo, reorder the type-valid matches by how visually close each product
-      // is to that photo. takePhotoVector is single-use and returns null when
-      // visual search is off or the search wasn't photo-initiated — so this is a
-      // no-op on the normal text path.
-      const photoVector = productService.takePhotoVector(
-        businessId,
-        customerNumber,
-      );
-      if (photoVector) {
-        found = await productService.visualRerank(businessId, photoVector, found);
-      }
-
       logger.info(
-        `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""} → ${found.length} match(es) for business ${businessId}`,
+        `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""}${photo ? " [photo]" : ""} → ${found.length} match(es) for business ${businessId}`,
       );
 
       // Results arrive ordered by matchPercent. The strong tier (≥90%) is
