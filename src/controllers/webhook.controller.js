@@ -1275,6 +1275,7 @@ async function handleReceiptUpload({
   customerNumber,
   mediaId,
   order: providedOrder = null,
+  media: providedMedia = null,
 }) {
   const reply = (text) =>
     whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, text);
@@ -1328,15 +1329,17 @@ async function handleReceiptUpload({
     return;
   }
 
-  let media;
-  try {
-    media = await whatsapp.downloadMedia(mediaId, accessToken);
-  } catch (e) {
-    logger.error(`[Receipt] media download failed: ${e.message}`);
-    await reply(
-      "I couldn't download that image — please resend your payment receipt.",
-    );
-    return;
+  let media = providedMedia;
+  if (!media) {
+    try {
+      media = await whatsapp.downloadMedia(mediaId, accessToken);
+    } catch (e) {
+      logger.error(`[Receipt] media download failed: ${e.message}`);
+      await reply(
+        "I couldn't download that image — please resend your payment receipt.",
+      );
+      return;
+    }
   }
 
   const result = await receiptVerification.verifyReceipt({
@@ -1429,63 +1432,33 @@ async function handleReceiptUpload({
 }
 
 /**
- * Visual product search (Option A). A customer with NO order awaiting payment
- * sent a photo, so it reads as "find me something like this". Download the
- * image, turn it into a type-led search phrase via vision, and hand back a
- * synthesized user message for the normal search pipeline to consume — its
- * product-type gate then enforces the category and tiers the closest matches.
- * Returns null — after sending an apt reply — when the image can't be read or
- * isn't a shoppable product.
+ * Visual product search. The image has already been downloaded and classified
+ * as a product (`photo` = the analyzeCustomerPhoto result). Embed it for the
+ * visual rerank (Option B), then hand back a synthesized user message for the
+ * normal search pipeline to consume — its product-type gate enforces the
+ * category and tiers the closest matches (Option A). Returns null — after
+ * sending an apt reply — when the photo yielded no usable query.
  */
-async function buildPhotoSearchMessage({
+async function beginPhotoProductSearch({
   phoneNumberId,
   accessToken,
   businessId,
   customerNumber,
-  mediaId,
+  media,
+  photo,
 }) {
   const reply = (text) =>
     whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, text);
 
-  if (!mediaId) {
-    await reply(
-      "I couldn't open that image — please resend the photo of what you're looking for. 🙂",
-    );
-    return null;
-  }
-
-  let media;
-  try {
-    media = await whatsapp.downloadMedia(mediaId, accessToken);
-  } catch (e) {
-    logger.error(`[PhotoSearch] media download failed: ${e.message}`);
-    await reply(
-      "I couldn't download that image — please resend the photo of what you're looking for.",
-    );
-    return null;
-  }
-
-  const vision = await openaiService.describePhotoForProductSearch({
-    buffer: media.buffer,
-    mimeType: media.mimeType,
-  });
-
-  if (!vision || !vision.query) {
+  if (!photo?.query) {
     await reply(
       "I couldn't quite make out that photo — could you resend a clearer one, or just tell me what you're looking for?",
     );
     return null;
   }
 
-  if (!vision.isProduct) {
-    await reply(
-      "That doesn't look like an item I can search for. Send me a photo of the product you want, or describe it, and I'll find the closest match I have. 🙂",
-    );
-    return null;
-  }
-
   logger.info(
-    `[PhotoSearch] ${customerNumber} → "${vision.query}" (type: ${vision.productType || "?"})`,
+    `[PhotoSearch] ${customerNumber} → "${photo.query}" (type: ${photo.productType || "?"})`,
   );
 
   // Option B: embed the photo and stash it so the upcoming search reorders the
@@ -1499,7 +1472,7 @@ async function buildPhotoSearchMessage({
   // Phrase it as an explicit lookalike search so the classifier routes to
   // search_products and the reply frames results as the closest match to the
   // photo (the customer usually sent something from elsewhere).
-  return `I'm looking for something like this (sent as a photo): ${vision.query}`;
+  return `I'm looking for something like this (sent as a photo): ${photo.query}`;
 }
 
 function receiptRejectionMessage(result, order) {
@@ -2395,40 +2368,89 @@ export async function handleIncomingMessage(req, res) {
       return;
     }
 
-    // An inbound photo is one of two things, disambiguated by whether the
-    // customer has an order awaiting payment:
-    //   • order pending → it's their transfer receipt — verify it (the photo a
-    //     buyer mid-checkout sends is overwhelmingly their proof of payment);
-    //   • no order pending → it's "find me something like this" — read the image
-    //     into a search query and fall through to the normal search pipeline.
+    // An inbound photo is a payment receipt OR a product the customer wants
+    // matched. Route by the image's CONTENT (a vision classify), not merely by
+    // whether an order is open — so a shopper mid-checkout who sends a product
+    // photo is searched, not mistaken for sending a receipt. The open order is a
+    // safety prior: when one's pending, anything NOT clearly a product is still
+    // treated as a receipt so the money path is never missed.
     let userMessage;
     if (message.type === "image") {
+      const mediaId = message.image?.id;
       const pendingOrder = await getLatestUnpaidOrder(
         businessId,
         customerNumber,
       );
 
-      if (pendingOrder) {
+      let media = null;
+      try {
+        media = mediaId
+          ? await whatsapp.downloadMedia(mediaId, accessToken)
+          : null;
+      } catch (e) {
+        logger.error(`[Image] download failed: ${e.message}`);
+      }
+      if (!media) {
+        await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          "I couldn't open that image — please resend it. 🙂",
+        );
+        return;
+      }
+
+      const photo = await openaiService.analyzeCustomerPhoto({
+        buffer: media.buffer,
+        mimeType: media.mimeType,
+      });
+      // Classification failed → fall back to the order prior (receipt if one's
+      // pending, otherwise treat as a non-product).
+      const kind = photo?.kind || (pendingOrder ? "receipt" : "other");
+      logger.info(
+        `[Image] ${customerNumber} classified as "${kind}"${pendingOrder ? " (order pending)" : ""}`,
+      );
+
+      if (kind === "product") {
+        userMessage = await beginPhotoProductSearch({
+          phoneNumberId,
+          accessToken,
+          businessId,
+          customerNumber,
+          media,
+          photo,
+        });
+        if (!userMessage) return; // helper already replied on an unusable photo
+      } else if (pendingOrder) {
+        // Receipt, or unclear while a payment is outstanding → verify as a
+        // receipt (verifyReceipt does its own forgery / not-a-receipt checks).
         await handleReceiptUpload({
           phoneNumberId,
           accessToken,
           businessId,
           customerNumber,
-          mediaId: message.image?.id,
+          mediaId,
           order: pendingOrder,
+          media,
         });
         return;
+      } else if (kind === "receipt") {
+        await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          "I can't find an order waiting for payment right now. If you've just ordered, tell me what you'd like to buy and I'll set it up. 🙂",
+        );
+        return;
+      } else {
+        await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          "That doesn't look like an item I can search for. Send me a photo of the product you want, or describe it, and I'll find the closest match I have. 🙂",
+        );
+        return;
       }
-
-      userMessage = await buildPhotoSearchMessage({
-        phoneNumberId,
-        accessToken,
-        businessId,
-        customerNumber,
-        mediaId: message.image?.id,
-      });
-      // The helper already replied on any failure (unreadable / not a product).
-      if (!userMessage) return;
     } else {
       userMessage = await extractUserMessage(message, accessToken, business);
 

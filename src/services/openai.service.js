@@ -1470,34 +1470,34 @@ const CLAUDE_IMAGE_TYPES = new Set([
   "image/webp",
 ]);
 
-const PHOTO_SEARCH_SCHEMA = {
+const PHOTO_ANALYSIS_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["isProduct", "productType", "query"],
+  required: ["kind", "productType", "query"],
   properties: {
-    isProduct: { type: "boolean" },
+    kind: { type: "string", enum: ["product", "receipt", "other"] },
     productType: { type: "string" },
     query: { type: "string" },
   },
 };
 
 /**
- * Visual product search, Option A: turn a customer's PHOTO into a text search
- * query, then let the existing keyword+semantic pipeline (and its product-type
- * gate) find the closest catalogue matches. Customers usually send a lookalike
- * from elsewhere and want the nearest thing we stock, so the query is written to
- * feed that pipeline rather than to claim an exact identification.
+ * Classify a customer's inbound PHOTO and, when it's a product, turn it into a
+ * search query. One vision call drives BOTH the receipt-vs-product routing and
+ * the visual-search query, so a shopper mid-checkout who sends a product photo
+ * isn't mistaken for sending a receipt.
  *
- * Returns { isProduct, productType, query }:
- *   - isProduct false when the image isn't a shoppable item (a selfie, a
- *     receipt, scenery) — the caller then asks for a product photo instead.
- *   - productType: the item's real-world type (the search's hard gate).
- *   - query: a concise, TYPE-LED phrase (type first, then the salient visible
- *     attributes — colour, material, pattern, style, apparent audience).
- * Null on failure. Runs on Claude Haiku 4.5 (same multimodal model as the
- * product-photo describer used by the search ranker).
+ * Returns { kind, productType, query }:
+ *   - kind "receipt"  → a bank-transfer / payment / bank-alert image (proof of
+ *     payment) — the caller routes it to receipt verification.
+ *   - kind "product"  → a shoppable item the shopper wants matched; productType
+ *     is its real-world type (the search's hard gate) and query is a concise,
+ *     TYPE-LED phrase (type first, then visible attributes) for the search.
+ *   - kind "other"    → anything else (a selfie, scenery, a random screenshot).
+ * productType/query are empty unless kind is "product". Null on failure (the
+ * caller falls back to the open-order prior). Claude Haiku 4.5 (multimodal).
  */
-export async function describePhotoForProductSearch({ buffer, mimeType }) {
+export async function analyzeCustomerPhoto({ buffer, mimeType }) {
   const base64 = Buffer.isBuffer(buffer) ? buffer.toString("base64") : "";
   if (!base64) return null;
   const mediaType = CLAUDE_IMAGE_TYPES.has(mimeType) ? mimeType : "image/jpeg";
@@ -1508,19 +1508,24 @@ export async function describePhotoForProductSearch({ buffer, mimeType }) {
       max_tokens: 300,
       temperature: 0,
       system:
-        "You convert a shopper's photo into a product SEARCH query for an " +
-        "e-commerce catalogue. Identify the SINGLE main item in the photo. " +
-        "Return JSON: isProduct (boolean — true only if the image shows a " +
-        "shoppable physical product; false for a selfie/person, a payment " +
-        "receipt or screenshot, packaging text, or scenery), productType (the " +
-        "item's real-world type, e.g. \"sneakers\", \"handbag\", \"dress\", " +
-        "\"jollof rice\" — the single most specific correct noun), and query (a " +
-        "concise, factual search phrase that LEADS with the product type, then " +
-        "adds only clearly-visible distinguishing attributes — colour, " +
-        "material, pattern, style/formality, and apparent audience like " +
-        "women's/men's/kids' when evident). No marketing words, no guessed " +
-        "details, no brand names unless a logo is plainly legible. If isProduct " +
-        "is false, set productType and query to empty strings.",
+        "You triage a photo a shopper sent to a WhatsApp store, and (when it's a " +
+        "product) turn it into a catalogue SEARCH query. Return JSON with: " +
+        "kind — \"receipt\" if it is a payment/bank-transfer receipt or a " +
+        "bank-app/transfer-alert screenshot showing an amount, account, or " +
+        "transaction (proof of payment); \"product\" if it shows a shoppable " +
+        "physical item the shopper wants to buy or find; \"other\" for anything " +
+        "else (a selfie/person, scenery, a random screenshot, packaging text " +
+        "with no clear item). When in doubt between receipt and product, judge " +
+        "by content: anything that reads as a money/transaction screenshot is " +
+        "\"receipt\". productType — only when kind is \"product\": the item's " +
+        "real-world type as the single most specific correct noun (e.g. " +
+        "\"sneakers\", \"handbag\", \"dress\", \"jollof rice\"). query — only " +
+        "when kind is \"product\": a concise, factual search phrase that LEADS " +
+        "with the product type, then adds only clearly-visible distinguishing " +
+        "attributes (colour, material, pattern, style/formality, apparent " +
+        "audience like women's/men's/kids' when evident); no marketing words, " +
+        "no guessed details, no brand names unless a logo is plainly legible. " +
+        "Set productType and query to empty strings unless kind is \"product\".",
       messages: [
         {
           role: "user",
@@ -1531,13 +1536,13 @@ export async function describePhotoForProductSearch({ buffer, mimeType }) {
             },
             {
               type: "text",
-              text: "Turn this photo into a product search query.",
+              text: "Classify this photo, and if it's a product, write its search query.",
             },
           ],
         },
       ],
       output_config: {
-        format: { type: "json_schema", schema: PHOTO_SEARCH_SCHEMA },
+        format: { type: "json_schema", schema: PHOTO_ANALYSIS_SCHEMA },
       },
     });
 
@@ -1549,14 +1554,22 @@ export async function describePhotoForProductSearch({ buffer, mimeType }) {
     const parsed = safeJsonParse(raw);
     if (!parsed) return null;
 
+    const kind = ["product", "receipt", "other"].includes(parsed.kind)
+      ? parsed.kind
+      : "other";
     return {
-      isProduct: parsed.isProduct === true,
+      kind,
       productType:
-        typeof parsed.productType === "string" ? parsed.productType.trim() : "",
-      query: typeof parsed.query === "string" ? parsed.query.trim() : "",
+        kind === "product" && typeof parsed.productType === "string"
+          ? parsed.productType.trim()
+          : "",
+      query:
+        kind === "product" && typeof parsed.query === "string"
+          ? parsed.query.trim()
+          : "",
     };
   } catch (error) {
-    logger.error(`describePhotoForProductSearch failed: ${error.message}`);
+    logger.error(`analyzeCustomerPhoto failed: ${error.message}`);
     return null;
   }
 }
