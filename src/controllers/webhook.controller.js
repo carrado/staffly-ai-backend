@@ -88,6 +88,8 @@ const STRINGS = {
       `Great choice! 😊 Would you like to order *${name}* now${mins ? ` — it'll be ready in ~${mins} mins` : ""}?`,
     pickedRetail: (name) =>
       `Great choice! 😊 Would you like to buy *${name}*, check a size or color, or negotiate the price?`,
+    exactPhotoMatch: (name) =>
+      `Yes — *${name}* is a match for the photo you sent! Here it is 👇`,
     negCounter: (name, price) =>
       `For *${name}*, the best I can do right now is ₦${price}. Want me to package it for you at that price?`,
     // A SECOND (or later) reduction — never repeat the round-1 line. Frame it as a
@@ -114,6 +116,8 @@ const STRINGS = {
       `Correct choice! 😊 You wan order *${name}* now${mins ? ` — e go ready in ~${mins} mins` : ""}?`,
     pickedRetail: (name) =>
       `Correct choice! 😊 You wan buy *${name}*, check size or color, or you wan price am small?`,
+    exactPhotoMatch: (name) =>
+      `Na im be this! *${name}* match the photo wey you send 👇`,
     negCounter: (name, price) =>
       `For *${name}*, the best wey I fit do now na ₦${price}. Make I package am for you for that price?`,
     // A SECOND (or later) reduction — no need to repeat the round-1 line. Frame it
@@ -2845,15 +2849,23 @@ export async function handleIncomingMessage(req, res) {
         // bubble. A BROAD search (a wide selection that should invite narrowing)
         // gets a short AI intro line before the cards. (Partial matches never
         // reach this branch — they're sent as a message only, no cards.)
-        // A broad selection gets a narrowing nudge; an exact photo match gets a
-        // short "this is the one from your photo" lead-in. Other specific
+        // An exact photo match gets a short "this is the one from your photo"
+        // lead-in; a broad selection gets a narrowing nudge; other specific
         // strong matches let the card speak for itself.
-        const needsIntro =
-          actionResult?.searchBreadth === "broad" ||
-          actionResult?.matchTier === "exact";
+        const isExactPhoto = actionResult?.matchTier === "exact";
 
         let introText = "";
-        if (needsIntro) {
+        if (isExactPhoto && productsToShow[0]?.name) {
+          // A purpose-built composer writes a warm, VARIED line from ONLY the
+          // product name — no history/catalogue, so it can't drift into
+          // "couldn't find a match" or leak other items the way the general
+          // composer did. The hand-written template is the safety fallback if
+          // the model fails or its output looks off. The card carries all detail.
+          const name = productsToShow[0].name;
+          introText =
+            (await openaiService.composeExactPhotoMatchLine(name, language)) ||
+            (await tr(language, (s) => s.exactPhotoMatch(name)));
+        } else if (actionResult?.searchBreadth === "broad") {
           const composed = await openaiService.generateResponseWithActionResult(
             userMessage,
             { ...freshSession, language },

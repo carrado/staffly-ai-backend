@@ -1173,6 +1173,54 @@ export async function generateResponseWithActionResult(
   }
 }
 
+/**
+ * Compose the ONE-LINE intro for an exact photo match — a warm, varied, natural
+ * confirmation that the named product matches the photo the shopper sent.
+ * Deliberately handed NOTHING but the product name and language: no conversation
+ * history, no catalogue, no other products — so it cannot drift into "couldn't
+ * find a match", list extra items, or hallucinate products from history (the
+ * failure mode of the general reply composer when used here). Higher temperature
+ * for natural variety. Returns a trimmed line, or null on failure / a suspicious
+ * output so the caller can fall back to its fixed template.
+ */
+export async function composeExactPhotoMatchLine(productName, language = "english") {
+  if (!productName) return null;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.8,
+      max_tokens: 60,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Write ONE short, warm, natural WhatsApp line (max ~16 words) telling the " +
+            "shopper that the product named below is an EXACT match to the PHOTO they " +
+            `just sent, and it's shown right below. Write it in ${language}. Rules: ` +
+            "refer ONLY to this one product (you may name it); do NOT mention or list " +
+            "any other product; no prices, sizes, colours or invented details; no " +
+            "question; at most one emoji; output ONLY the line, nothing else.",
+        },
+        { role: "user", content: productName },
+      ],
+    });
+    const line = completion.choices?.[0]?.message?.content?.trim();
+    if (!line) return null;
+    // Guard against the very drift we're avoiding: a numbered list, or an overt
+    // "couldn't find / no match" contradiction → reject so the caller templates.
+    if (
+      /^\s*\d+\.\s/m.test(line) ||
+      /\b(couldn'?t|could not|don'?t have|no (exact )?match)\b/i.test(line)
+    ) {
+      return null;
+    }
+    return line;
+  } catch (error) {
+    logger.warn(`composeExactPhotoMatchLine failed: ${error.message}`);
+    return null;
+  }
+}
+
 // ─── Localized product descriptions ───────────────────────────────────────────
 
 // Vendor descriptions are written in English; non-English sessions get them
