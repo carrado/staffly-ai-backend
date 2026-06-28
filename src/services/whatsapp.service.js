@@ -505,33 +505,37 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
  *   2. One interactive image card per result, each with a "Pick this one" button
  *   3. Footer text (e.g. the "show more" hint), after the last card
  */
-// Returns an array of { productId, wamid } — one per card sent — so the caller
-// can map each card's message id back to its product for reply-to-card lookups.
+// Returns { cards, headerWamid, footerWamid }: `cards` is an array of
+// { productId, wamid } (one per card, for reply-to-card lookups); headerWamid /
+// footerWamid are the WAMIDs of the intro and "show more" text bubbles so the
+// caller can track them as reply targets too.
 export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '', footerText = '', language = 'english') {
-  if (!products.length) return [];
+  if (!products.length) return { cards: [], headerWamid: null, footerWamid: null };
 
   // Send the AI's intro text first
+  let headerWamid = null;
   if (headerText) {
-    await sendTextMessage(phoneNumberId, accessToken, to, headerText);
+    headerWamid = await sendTextMessage(phoneNumberId, accessToken, to, headerText);
     await new Promise((r) => setTimeout(r, 300));
   }
 
   // Send each product card with a gap between them
-  const sentCards = [];
+  const cards = [];
   let sent = 0;
   for (const product of products) {
     const wamid = await sendProductButtonCard(phoneNumberId, accessToken, to, product, language);
-    sentCards.push({ productId: product.id, wamid });
+    cards.push({ productId: product.id, wamid });
     sent += 1;
     logger.info(`[WhatsApp] Card ${sent}/${products.length} sent ("${product.name}")`);
     await new Promise((r) => setTimeout(r, 500)); // 500ms between cards
   }
 
+  let footerWamid = null;
   if (footerText) {
-    await sendTextMessage(phoneNumberId, accessToken, to, footerText);
+    footerWamid = await sendTextMessage(phoneNumberId, accessToken, to, footerText);
   }
 
-  return sentCards;
+  return { cards, headerWamid, footerWamid };
 }
 
 // ─── Presence / status ───────────────────────────────────────────────────────

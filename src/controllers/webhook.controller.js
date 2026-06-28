@@ -26,6 +26,7 @@ import {
   clearPendingFollowUp,
   rememberCardMessages,
   rememberTextMessage,
+  rememberInboundMessage,
 } from "../models/ConversationState.js";
 import {
   getLatestUnpaidOrder,
@@ -1137,7 +1138,7 @@ async function sendOutboundMessage({
   }
 
   if (products.length > 1) {
-    const cardMappings = await whatsapp.sendProductList(
+    const { cards, headerWamid } = await whatsapp.sendProductList(
       phoneNumberId,
       accessToken,
       customerNumber,
@@ -1146,7 +1147,9 @@ async function sendOutboundMessage({
       "",
       language,
     );
-    return { cardMappings, textWamid: null };
+    // The intro bubble carried responseText — surface its WAMID so the caller
+    // tracks it as a reply target (rememberTextMessage with responseText).
+    return { cardMappings: cards, textWamid: headerWamid };
   }
 
   const textWamid = await whatsapp.sendTextMessage(
@@ -2601,11 +2604,14 @@ export async function handleIncomingMessage(req, res) {
     // both see the corrected lastProduct.
     let repliedQuoteText = null;
     let repliedCardName = null;
+    let repliedOwnText = null;
     if (repliedWamid) {
       const replySession = getSession(businessId, customerNumber);
       const cardCount = Object.keys(replySession.cardMessages || {}).length;
       const textCount = Object.keys(replySession.textMessages || {}).length;
+      const inboundCount = Object.keys(replySession.inboundMessages || {}).length;
       const repliedProductId = replySession.cardMessages?.[repliedWamid];
+      const ownMessage = replySession.inboundMessages?.[repliedWamid];
       if (repliedProductId != null) {
         const repliedProduct =
           await productService.getProductById(repliedProductId);
@@ -2625,12 +2631,31 @@ export async function handleIncomingMessage(req, res) {
         logger.info(
           `[${business.name}] Reply-to-TEXT resolved → "${repliedQuoteText.slice(0, 60)}" (wamid ${repliedWamid})`,
         );
+      } else if (ownMessage) {
+        // The customer replied to their OWN earlier message. If that message was
+        // about a specific product, re-anchor to it; otherwise carry its text so
+        // the follow-up stays grounded in what they originally said.
+        if (ownMessage.productId != null) {
+          const ownProduct = await productService.getProductById(
+            ownMessage.productId,
+          );
+          if (ownProduct) {
+            setLastProduct(businessId, customerNumber, ownProduct);
+            repliedCardName = ownProduct.name;
+          }
+        }
+        if (!repliedCardName && ownMessage.text) {
+          repliedOwnText = ownMessage.text;
+        }
+        logger.info(
+          `[${business.name}] Reply-to-OWN resolved → "${(ownMessage.text || "").slice(0, 60)}"${ownMessage.productId != null ? ` (product ${ownMessage.productId})` : ""} (wamid ${repliedWamid})`,
+        );
       } else {
         // The customer quoted a message whose WAMID we never tracked (a greeting,
         // a card intro line, a message from before this feature, or an id that
         // doesn't match what we stored). This is the case to watch for.
         logger.warn(
-          `[${business.name}] Reply-to-message MISS: quoted wamid ${repliedWamid} not in maps (cards:${cardCount}, texts:${textCount})`,
+          `[${business.name}] Reply-to-message MISS: quoted wamid ${repliedWamid} not in maps (cards:${cardCount}, texts:${textCount}, inbound:${inboundCount})`,
         );
       }
     } else if (message.context) {
@@ -2693,12 +2718,13 @@ export async function handleIncomingMessage(req, res) {
     }
 
     if (greeting) {
-      await whatsapp.sendTextMessage(
+      const greetingWamid = await whatsapp.sendTextMessage(
         phoneNumberId,
         accessToken,
         customerNumber,
         greeting,
       );
+      rememberTextMessage(businessId, customerNumber, greetingWamid, greeting);
       await new Promise((r) => setTimeout(r, 600));
 
       // Sending the greeting cleared the typing bubble — re-trigger it (same
@@ -2727,7 +2753,9 @@ export async function handleIncomingMessage(req, res) {
       ? `[The customer is replying to the product card you sent for "${repliedCardName}". Any "this", "it", or "how much" refers to THAT product — not any more recent item in the conversation.]`
       : repliedQuoteText
         ? `[The customer is replying to your earlier message: "${repliedQuoteText}". Their message refers to THAT, not any more recent topic.]`
-        : null;
+        : repliedOwnText
+          ? `[The customer is replying to their OWN earlier message: "${repliedOwnText}". Their new message continues or refers to THAT, not any more recent topic.]`
+          : null;
     const anchoredMessage = replyAnchor
       ? `${replyAnchor}\n${userMessage}`
       : userMessage;
@@ -2909,19 +2937,31 @@ export async function handleIncomingMessage(req, res) {
 
         // The intro (when needed) is the header bubble; the more-items hint
         // goes out after the last card.
-        const cardMappings = await whatsapp.sendProductList(
-          phoneNumberId,
-          accessToken,
-          customerNumber,
-          localizedCards,
-          introText,
-          moreItemsHint || "",
-          language,
-        );
+        const { cards, headerWamid, footerWamid } =
+          await whatsapp.sendProductList(
+            phoneNumberId,
+            accessToken,
+            customerNumber,
+            localizedCards,
+            introText,
+            moreItemsHint || "",
+            language,
+          );
 
-        // Remember each card's WAMID so a later swipe-reply to one resolves to
-        // exactly that product.
-        rememberCardMessages(businessId, customerNumber, cardMappings);
+        // Remember each card's WAMID (→ product) and the intro/footer bubbles
+        // (→ their text) so a later swipe-reply to any of them resolves.
+        rememberCardMessages(businessId, customerNumber, cards);
+        if (headerWamid && introText) {
+          rememberTextMessage(businessId, customerNumber, headerWamid, introText);
+        }
+        if (footerWamid && moreItemsHint) {
+          rememberTextMessage(
+            businessId,
+            customerNumber,
+            footerWamid,
+            moreItemsHint,
+          );
+        }
 
         // History note (never sent) so follow-ups like "the second one" or
         // "the jollof" stay grounded in exactly what was shown.
@@ -2994,6 +3034,7 @@ export async function handleIncomingMessage(req, res) {
     }
 
     const currentSession = getSession(businessId, customerNumber);
+    const inboundProductId = currentSession.lastProduct?.id ?? null;
 
     // Spread the whole session so fields written during executeAction
     // (browseMode, similarSearch, ...) survive the turn.
@@ -3008,6 +3049,19 @@ export async function handleIncomingMessage(req, res) {
       language,
       lastMessageAt: new Date(),
     });
+
+    // Remember THIS inbound message (its WAMID → what they said, and the product
+    // it ended up about) so a later swipe-reply to their OWN message can be
+    // recovered and re-grounded. Done AFTER the main write above so it merges
+    // onto fresh state instead of being overwritten by the spread snapshot. For
+    // a photo, userMessage is the synthesized query.
+    rememberInboundMessage(
+      businessId,
+      customerNumber,
+      messageId,
+      userMessage,
+      inboundProductId,
+    );
 
     logger.info(`[${business.name}] → replied to ${customerNumber}`);
   } catch (error) {

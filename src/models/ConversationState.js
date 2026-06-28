@@ -200,6 +200,41 @@ export const rememberTextMessage = (businessId, customerNumber, wamid, text) => 
   setSession(businessId, customerNumber, { ...session, textMessages });
 };
 
+// Remember a message the CUSTOMER sent (WAMID → what they said, and any product
+// it resolved to). When they later swipe-reply to their OWN earlier message,
+// `message.context.id` is the WAMID of THEIR message — not ours — so it can't be
+// in cardMessages/textMessages; this map is what lets that reply be recovered
+// and re-grounded (text and the product it was about).
+const MAX_INBOUND_MESSAGES = 30;
+
+export const rememberInboundMessage = (
+  businessId,
+  customerNumber,
+  wamid,
+  text,
+  productId = null,
+) => {
+  if (!wamid || (!text && productId == null)) return;
+
+  const session = getSession(businessId, customerNumber);
+  const inboundMessages = { ...(session.inboundMessages || {}) };
+  delete inboundMessages[wamid]; // re-insert so a repeat lands in newest position
+  inboundMessages[wamid] = {
+    text: text ? String(text).slice(0, STORED_TEXT_MAX_CHARS) : null,
+    ...(productId != null ? { productId } : {}),
+  };
+
+  const keys = Object.keys(inboundMessages);
+  for (const stale of keys.slice(
+    0,
+    Math.max(0, keys.length - MAX_INBOUND_MESSAGES),
+  )) {
+    delete inboundMessages[stale];
+  }
+
+  setSession(businessId, customerNumber, { ...session, inboundMessages });
+};
+
 export const setNegotiation = (businessId, customerNumber, negotiation) => {
   const session = getSession(businessId, customerNumber);
   setSession(businessId, customerNumber, { ...session, negotiation });
