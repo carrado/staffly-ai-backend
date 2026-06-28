@@ -1488,6 +1488,14 @@ async function buildPhotoSearchMessage({
     `[PhotoSearch] ${customerNumber} → "${vision.query}" (type: ${vision.productType || "?"})`,
   );
 
+  // Option B: embed the photo and stash it so the upcoming search reorders the
+  // type-valid matches by visual similarity. No-op (and no added latency beyond
+  // one embed) when VOYAGE_API_KEY isn't set — the search then runs as Option A.
+  await productService.preparePhotoSearch(businessId, customerNumber, {
+    buffer: media.buffer,
+    mimeType: media.mimeType,
+  });
+
   // Phrase it as an explicit lookalike search so the classifier routes to
   // search_products and the reply frames results as the closest match to the
   // photo (the customer usually sent something from elsewhere).
@@ -1554,11 +1562,24 @@ async function executeAction({
         typeof action.data.maxPrice === "number" && action.data.maxPrice > 0
           ? action.data.maxPrice
           : null;
-      const found = maxPrice
+      let found = maxPrice
         ? allMatches.filter(
             (p) => typeof p.price === "number" && p.price <= maxPrice,
           )
         : allMatches;
+
+      // Visual rerank (Option B): when this search was triggered by a customer
+      // photo, reorder the type-valid matches by how visually close each product
+      // is to that photo. takePhotoVector is single-use and returns null when
+      // visual search is off or the search wasn't photo-initiated — so this is a
+      // no-op on the normal text path.
+      const photoVector = productService.takePhotoVector(
+        businessId,
+        customerNumber,
+      );
+      if (photoVector) {
+        found = await productService.visualRerank(businessId, photoVector, found);
+      }
 
       logger.info(
         `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""} → ${found.length} match(es) for business ${businessId}`,

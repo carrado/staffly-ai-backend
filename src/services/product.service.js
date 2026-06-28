@@ -8,10 +8,12 @@ import {
 import { getBusinessById } from '../models/Business.js';
 import { Product } from '../models/mongoose/Product.js';
 import { ModifierOption } from '../models/mongoose/ModifierOption.js';
+import { ProductEmbedding } from '../models/mongoose/ProductEmbedding.js';
 import { anthropic } from '../config/anthropic.js';
 import { logger } from '../utils/logger.js';
 import { env } from '../config/env.js';
 import { buildTaxConfig, computeTax } from '../utils/pricing.js';
+import * as voyage from './voyage.service.js';
 
 // ─── Shape conversion ─────────────────────────────────────────────────────────
 
@@ -391,6 +393,165 @@ async function attachVisualDescriptions(products) {
   return products.map((p) =>
     byId.has(p.id) ? { ...p, visualDescription: byId.get(p.id) } : p,
   );
+}
+
+// ─── Visual search rerank (Option B, env.voyageApiKey) ──────────────────────────
+//
+// When a customer sends a PHOTO, the category-correct candidate set comes from
+// the normal text pipeline (the type gate), and these helpers reorder it by how
+// visually close each product photo is to the customer's photo — so a lookalike
+// is matched by appearance, not just description. Off (no reorder) unless
+// VOYAGE_API_KEY is set; any failure degrades silently to the text order.
+
+const VISUAL_RERANK_MAX = 40; // most product photos embedded per photo search
+const EMBEDDING_CACHE_MAX = 2000; // product vectors held in memory (shared)
+const embeddingCache = new LruCache(EMBEDDING_CACHE_MAX); // `${bid}:${pid}:${url}` → vector
+
+// Transient hand-off for a photo-initiated search: the controller embeds the
+// customer's photo up front, and the search_products handler consumes that
+// vector to rerank. Kept here (not in the persisted session) so a ~1k-float
+// vector never bloats the Mongo session doc. Single-instance, like the other
+// in-process caches; a short TTL stops a stray vector from outliving its turn.
+const PHOTO_VECTOR_TTL_MS = 2 * 60 * 1000;
+const pendingPhotoVectors = new Map(); // `${bid}:${customerNumber}` → { vector, expiresAt }
+
+export function stashPhotoVector(businessId, customerNumber, vector) {
+  if (!vector) return;
+  pendingPhotoVectors.set(`${businessId}:${customerNumber}`, {
+    vector,
+    expiresAt: Date.now() + PHOTO_VECTOR_TTL_MS,
+  });
+}
+
+export function takePhotoVector(businessId, customerNumber) {
+  const key = `${businessId}:${customerNumber}`;
+  const hit = pendingPhotoVectors.get(key);
+  pendingPhotoVectors.delete(key); // single-use
+  if (!hit || hit.expiresAt < Date.now()) return null;
+  return hit.vector;
+}
+
+/**
+ * Embed the customer's photo and stash it for the upcoming search. No-op unless
+ * visual search is enabled. Called by the controller before it hands the
+ * vision-derived query to the normal pipeline.
+ */
+export async function preparePhotoSearch(businessId, customerNumber, { buffer, mimeType }) {
+  if (!voyage.isVisualSearchEnabled()) return;
+  const vector = await voyage.embedImageQuery({ buffer, mimeType });
+  if (vector) stashPhotoVector(businessId, customerNumber, vector);
+}
+
+// Resolve image-photo embeddings for the given products → Map id → vector.
+// Three tiers: in-memory LRU → Mongo (keyed by the CURRENT image url, so a
+// changed photo is treated as stale) → Voyage (computed, then persisted).
+async function getProductEmbeddings(businessId, products) {
+  const result = new Map();
+  const need = [];
+  for (const p of products) {
+    const url = p.image_url;
+    if (!url) continue;
+    const pid = String(p.id);
+    const key = `${businessId}:${pid}:${url}`;
+    const cached = embeddingCache.get(key);
+    if (cached) {
+      result.set(p.id, cached);
+    } else {
+      need.push({ id: p.id, pid, imageUrl: url, key });
+    }
+  }
+  if (!need.length) return result;
+
+  // Mongo second level — survives restarts, so the catalogue isn't re-embedded
+  // (and re-billed) every boot.
+  let docs = [];
+  try {
+    docs = await ProductEmbedding.find({
+      businessId,
+      productId: { $in: need.map((n) => n.pid) },
+    }).lean();
+  } catch (e) {
+    logger.warn(`[Visual] embedding load failed: ${e.message}`);
+  }
+  const byId = new Map(docs.map((d) => [d.productId, d]));
+
+  const toEmbed = [];
+  for (const n of need) {
+    const doc = byId.get(n.pid);
+    if (doc?.imageUrl === n.imageUrl && doc.embedding?.length) {
+      embeddingCache.set(n.key, doc.embedding);
+      result.set(n.id, doc.embedding);
+    } else {
+      toEmbed.push(n); // never embedded, or the photo changed since
+    }
+  }
+  if (!toEmbed.length) return result;
+
+  const vectors = await voyage.embedProductImages(
+    toEmbed.map((n) => ({ id: n.id, imageUrl: n.imageUrl })),
+  );
+  const ops = [];
+  for (const n of toEmbed) {
+    const vec = vectors.get(n.id);
+    if (!vec) continue;
+    embeddingCache.set(n.key, vec);
+    result.set(n.id, vec);
+    ops.push({
+      updateOne: {
+        filter: { businessId, productId: n.pid },
+        update: {
+          $set: {
+            businessId,
+            productId: n.pid,
+            imageUrl: n.imageUrl,
+            embedding: vec,
+          },
+        },
+        upsert: true,
+      },
+    });
+  }
+  if (ops.length) {
+    try {
+      await ProductEmbedding.bulkWrite(ops, { ordered: false });
+    } catch (e) {
+      logger.warn(`[Visual] embedding persist failed: ${e.message}`);
+    }
+  }
+  return result;
+}
+
+/**
+ * Reorder `products` (the type-valid matches) by visual similarity to a
+ * customer photo's embedding. Stable: products without a usable photo embedding
+ * keep their original relative order at the tail. Returns the input unchanged on
+ * any failure, so the text ranking always stands as the floor.
+ */
+export async function visualRerank(businessId, photoVector, products) {
+  if (!photoVector || !products?.length) return products;
+  try {
+    const candidates = products.slice(0, VISUAL_RERANK_MAX);
+    const embeddings = await getProductEmbeddings(businessId, candidates);
+    if (!embeddings.size) return products;
+
+    const scored = products.map((p, i) => {
+      const vec = embeddings.get(p.id);
+      return { p, i, sim: vec ? voyage.cosineSimilarity(photoVector, vec) : -Infinity };
+    });
+    // Visual similarity desc; original order breaks ties (and orders the tail of
+    // un-embedded items).
+    scored.sort((a, b) => b.sim - a.sim || a.i - b.i);
+
+    const top = scored[0];
+    logger.info(
+      `[Visual] reranked ${embeddings.size}/${candidates.length} candidate photo(s); ` +
+        `top "${top.p.name}" sim=${Number.isFinite(top.sim) ? top.sim.toFixed(3) : 'n/a'}`,
+    );
+    return scored.map((s) => s.p);
+  } catch (e) {
+    logger.warn(`[Visual] rerank failed (text order kept): ${e.message}`);
+    return products;
+  }
 }
 
 // ─── Data source ──────────────────────────────────────────────────────────────

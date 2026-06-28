@@ -19,6 +19,12 @@ export const env = {
   // default — it adds a one-time (cached) vision call per product.
   productVision: process.env.PRODUCT_VISION === "true",
 
+  // Voyage AI multimodal embeddings (voyage-multimodal-3). When set, a photo a
+  // customer sends is embedded and used to visually RERANK the type-valid search
+  // matches (Option B). Absent → visual search degrades to the vision→text path
+  // (Option A) with no behaviour change.
+  voyageApiKey: process.env.VOYAGE_API_KEY,
+
   // Shared secret for verifying webhooks dispatched by velte-backend
   // (HMAC-SHA256 over the raw body, sent as the `x-velte-signature` header).
   // Must match velte-backend's VELTE_WEBHOOK_SECRET. Reused (same shared secret) to
