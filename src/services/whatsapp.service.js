@@ -20,8 +20,14 @@ const MEDIA_TIMEOUT_MS = 30000;
 
 // ─── Basic message senders ────────────────────────────────────────────────────
 
+// The WhatsApp message id (WAMID) Meta assigns to a message we just sent. The
+// reply-to-card feature keys off this: storing it against the product lets us
+// resolve which card a customer swipe-replied to (their reply carries this id
+// in `message.context.id`).
+const sentWamid = (res) => res?.data?.messages?.[0]?.id ?? null;
+
 export async function sendTextMessage(phoneNumberId, accessToken, to, text) {
-  await axios.post(
+  const res = await axios.post(
     `${GRAPH_URL}/${phoneNumberId}/messages`,
     {
       messaging_product: 'whatsapp',
@@ -37,10 +43,11 @@ export async function sendTextMessage(phoneNumberId, accessToken, to, text) {
       timeout: SEND_TIMEOUT_MS,
     }
   );
+  return sentWamid(res);
 }
 
 export async function sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption) {
-  await axios.post(
+  const res = await axios.post(
     `${GRAPH_URL}/${phoneNumberId}/messages`,
     {
       messaging_product: 'whatsapp',
@@ -56,13 +63,14 @@ export async function sendImageMessage(phoneNumberId, accessToken, to, imageUrl,
       timeout: SEND_TIMEOUT_MS,
     }
   );
+  return sentWamid(res);
 }
 
 // Send an image that's ALREADY uploaded to Meta (by media id, not a link).
 // Media sent by id is on Meta's servers, so it delivers fast and in order —
 // before any follow-up button — which a link-fetched image can't guarantee.
 export async function sendImageMessageById(phoneNumberId, accessToken, to, mediaId, caption) {
-  await axios.post(
+  const res = await axios.post(
     `${GRAPH_URL}/${phoneNumberId}/messages`,
     {
       messaging_product: 'whatsapp',
@@ -78,6 +86,7 @@ export async function sendImageMessageById(phoneNumberId, accessToken, to, media
       timeout: SEND_TIMEOUT_MS,
     }
   );
+  return sentWamid(res);
 }
 
 // ─── Media-id cache (link → uploaded Meta media id) ───────────────────────────
@@ -163,17 +172,17 @@ async function resolveMediaId(phoneNumberId, accessToken, imageUrl) {
 // path (delivers in order) and degrading gracefully: media-id → link → text.
 // A rejected cached id (expired/deleted on Meta's side) is dropped and retried
 // via the link path so a stale cache never swallows a card.
+// Returns the WAMID of whichever message actually delivered (image bubble, or
+// the text fallback) so callers can map it back to the product.
 async function sendProductImageBubble(phoneNumberId, accessToken, to, product, caption) {
   const imageUrl = sendableImageUrl(product);
   if (!imageUrl) {
-    await sendTextMessage(phoneNumberId, accessToken, to, caption);
-    return;
+    return sendTextMessage(phoneNumberId, accessToken, to, caption);
   }
 
   try {
     const mediaId = await resolveMediaId(phoneNumberId, accessToken, imageUrl);
-    await sendImageMessageById(phoneNumberId, accessToken, to, mediaId, caption);
-    return;
+    return await sendImageMessageById(phoneNumberId, accessToken, to, mediaId, caption);
   } catch (err) {
     mediaIdCache.delete(mediaCacheKey(phoneNumberId, imageUrl));
     logger.warn(
@@ -182,10 +191,10 @@ async function sendProductImageBubble(phoneNumberId, accessToken, to, product, c
   }
 
   try {
-    await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
+    return await sendImageMessage(phoneNumberId, accessToken, to, imageUrl, caption);
   } catch (err) {
     logger.warn(`[WhatsApp] Image failed for product "${product.name}": ${err.message}`);
-    await sendTextMessage(phoneNumberId, accessToken, to, caption);
+    return sendTextMessage(phoneNumberId, accessToken, to, caption);
   }
 }
 
@@ -375,18 +384,22 @@ async function buildProductCaption(product, language = 'english') {
  *
  * Falls back to text-only if no image URL is set.
  */
+// Returns the WAMID of the card (the image bubble) — NOT the follow-up text — so
+// a customer's reply to the card resolves back to this product.
 export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '', language = 'english') {
   const caption = await buildProductCaption(product, language);
 
   // Image (by media id so it delivers before the follow-up), falling back to
   // link then a plain text card.
-  await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
+  const wamid = await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
 
   // Send the AI's conversational response as a separate follow-up bubble
   if (followUpText) {
     await new Promise((r) => setTimeout(r, 300)); // slight delay for natural feel
     await sendTextMessage(phoneNumberId, accessToken, to, followUpText);
   }
+
+  return wamid;
 }
 
 // Interactive-message limits (Meta API)
@@ -462,7 +475,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
     });
 
   try {
-    await post(buildPayload(true));
+    return sentWamid(await post(buildPayload(true)));
   } catch (err) {
     // A bad image header can reject the whole message. Retry once without it so
     // the details + Pick button still reach the customer.
@@ -471,8 +484,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
         `[WhatsApp] interactive card with image failed for "${product.name}", retrying without image: ${err.response?.data?.error?.message || err.message}`,
       );
       try {
-        await post(buildPayload(false));
-        return;
+        return sentWamid(await post(buildPayload(false)));
       } catch (err2) {
         logger.warn(
           `[WhatsApp] interactive card retry failed for "${product.name}", falling back to text: ${err2.response?.data?.error?.message || err2.message}`,
@@ -480,7 +492,7 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
       }
     }
     // Last resort: a plain text card so the customer at least gets the details.
-    await sendTextMessage(phoneNumberId, accessToken, to, caption);
+    return await sendTextMessage(phoneNumberId, accessToken, to, caption);
   }
 }
 
@@ -493,8 +505,10 @@ export async function sendProductButtonCard(phoneNumberId, accessToken, to, prod
  *   2. One interactive image card per result, each with a "Pick this one" button
  *   3. Footer text (e.g. the "show more" hint), after the last card
  */
+// Returns an array of { productId, wamid } — one per card sent — so the caller
+// can map each card's message id back to its product for reply-to-card lookups.
 export async function sendProductList(phoneNumberId, accessToken, to, products, headerText = '', footerText = '', language = 'english') {
-  if (!products.length) return;
+  if (!products.length) return [];
 
   // Send the AI's intro text first
   if (headerText) {
@@ -503,9 +517,11 @@ export async function sendProductList(phoneNumberId, accessToken, to, products, 
   }
 
   // Send each product card with a gap between them
+  const sentCards = [];
   let sent = 0;
   for (const product of products) {
-    await sendProductButtonCard(phoneNumberId, accessToken, to, product, language);
+    const wamid = await sendProductButtonCard(phoneNumberId, accessToken, to, product, language);
+    sentCards.push({ productId: product.id, wamid });
     sent += 1;
     logger.info(`[WhatsApp] Card ${sent}/${products.length} sent ("${product.name}")`);
     await new Promise((r) => setTimeout(r, 500)); // 500ms between cards
@@ -514,6 +530,8 @@ export async function sendProductList(phoneNumberId, accessToken, to, products, 
   if (footerText) {
     await sendTextMessage(phoneNumberId, accessToken, to, footerText);
   }
+
+  return sentCards;
 }
 
 // ─── Presence / status ───────────────────────────────────────────────────────

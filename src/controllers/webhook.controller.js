@@ -24,6 +24,8 @@ import {
   clearNegotiation,
   hydrateSession,
   clearPendingFollowUp,
+  rememberCardMessages,
+  rememberTextMessage,
 } from "../models/ConversationState.js";
 import {
   getLatestUnpaidOrder,
@@ -1114,8 +1116,12 @@ async function sendOutboundMessage({
 }) {
   const products = await localizeProductsForLanguage(productsToShow, language);
 
+  // Returns { cardMappings, textWamid }: card → product mappings for reply-to-
+  // card lookups, and the WAMID of a plain-text reply (when no cards were sent)
+  // so the caller can record it for reply-to-text lookups. Exactly one is
+  // populated per call.
   if (products.length === 1) {
-    await whatsapp.sendProductCard(
+    const wamid = await whatsapp.sendProductCard(
       phoneNumberId,
       accessToken,
       customerNumber,
@@ -1123,11 +1129,11 @@ async function sendOutboundMessage({
       responseText,
       language,
     );
-    return;
+    return { cardMappings: [{ productId: products[0].id, wamid }], textWamid: null };
   }
 
   if (products.length > 1) {
-    await whatsapp.sendProductList(
+    const cardMappings = await whatsapp.sendProductList(
       phoneNumberId,
       accessToken,
       customerNumber,
@@ -1136,15 +1142,16 @@ async function sendOutboundMessage({
       "",
       language,
     );
-    return;
+    return { cardMappings, textWamid: null };
   }
 
-  await whatsapp.sendTextMessage(
+  const textWamid = await whatsapp.sendTextMessage(
     phoneNumberId,
     accessToken,
     customerNumber,
     responseText,
   );
+  return { cardMappings: [], textWamid };
 }
 
 /**
@@ -1182,7 +1189,7 @@ async function handleProductSelection({
 
   const [localized] = await localizeProductsForLanguage([product], language);
 
-  await whatsapp.sendProductCard(
+  const wamid = await whatsapp.sendProductCard(
     phoneNumberId,
     accessToken,
     customerNumber,
@@ -1190,6 +1197,9 @@ async function handleProductSelection({
     followUpText,
     language,
   );
+  rememberCardMessages(businessId, customerNumber, [
+    { productId: product.id, wamid },
+  ]);
 
   const currentSession = getSession(businessId, customerNumber);
 
@@ -1264,6 +1274,7 @@ async function handleReceiptUpload({
   businessId,
   customerNumber,
   mediaId,
+  order: providedOrder = null,
 }) {
   const reply = (text) =>
     whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, text);
@@ -1281,7 +1292,8 @@ async function handleReceiptUpload({
     }
   };
 
-  const order = await getLatestUnpaidOrder(businessId, customerNumber);
+  const order =
+    providedOrder ?? (await getLatestUnpaidOrder(businessId, customerNumber));
   if (!order) {
     await reply(
       "I can't find an order waiting for payment right now. If you've just ordered, tell me what you'd like to buy and I'll set it up. 🙂",
@@ -1414,6 +1426,72 @@ async function handleReceiptUpload({
   await reply(
     `Thank you${order.customerName ? `, ${order.customerName}` : ""}! I've received your receipt for order ${order.id} and we're just confirming the payment with the seller. You'll get a confirmation shortly. 🙏`,
   );
+}
+
+/**
+ * Visual product search (Option A). A customer with NO order awaiting payment
+ * sent a photo, so it reads as "find me something like this". Download the
+ * image, turn it into a type-led search phrase via vision, and hand back a
+ * synthesized user message for the normal search pipeline to consume — its
+ * product-type gate then enforces the category and tiers the closest matches.
+ * Returns null — after sending an apt reply — when the image can't be read or
+ * isn't a shoppable product.
+ */
+async function buildPhotoSearchMessage({
+  phoneNumberId,
+  accessToken,
+  businessId,
+  customerNumber,
+  mediaId,
+}) {
+  const reply = (text) =>
+    whatsapp.sendTextMessage(phoneNumberId, accessToken, customerNumber, text);
+
+  if (!mediaId) {
+    await reply(
+      "I couldn't open that image — please resend the photo of what you're looking for. 🙂",
+    );
+    return null;
+  }
+
+  let media;
+  try {
+    media = await whatsapp.downloadMedia(mediaId, accessToken);
+  } catch (e) {
+    logger.error(`[PhotoSearch] media download failed: ${e.message}`);
+    await reply(
+      "I couldn't download that image — please resend the photo of what you're looking for.",
+    );
+    return null;
+  }
+
+  const vision = await openaiService.describePhotoForProductSearch({
+    buffer: media.buffer,
+    mimeType: media.mimeType,
+  });
+
+  if (!vision || !vision.query) {
+    await reply(
+      "I couldn't quite make out that photo — could you resend a clearer one, or just tell me what you're looking for?",
+    );
+    return null;
+  }
+
+  if (!vision.isProduct) {
+    await reply(
+      "That doesn't look like an item I can search for. Send me a photo of the product you want, or describe it, and I'll find the closest match I have. 🙂",
+    );
+    return null;
+  }
+
+  logger.info(
+    `[PhotoSearch] ${customerNumber} → "${vision.query}" (type: ${vision.productType || "?"})`,
+  );
+
+  // Phrase it as an explicit lookalike search so the classifier routes to
+  // search_products and the reply frames results as the closest match to the
+  // photo (the customer usually sent something from elsewhere).
+  return `I'm looking for something like this (sent as a photo): ${vision.query}`;
 }
 
 function receiptRejectionMessage(result, order) {
@@ -2240,6 +2318,13 @@ export async function handleIncomingMessage(req, res) {
     const phoneNumberId = value.metadata?.phone_number_id;
     const messageId = message.id;
 
+    // A swipe-reply to one of our messages carries the replied-to message's
+    // WAMID here. `referral` marks an ad/forward context (not a genuine reply),
+    // so it's excluded. Resolved to a product further below, once the session
+    // (with its card→WAMID map) is loaded.
+    const repliedWamid =
+      message.context?.id && !message.referral ? message.context.id : null;
+
     if (!customerNumber || !phoneNumberId) {
       logger.warn("[Webhook] Missing customerNumber or phoneNumberId");
       return;
@@ -2289,55 +2374,104 @@ export async function handleIncomingMessage(req, res) {
       return;
     }
 
-    // A photo from a customer with an open order is their transfer receipt —
-    // intercept it here (extractUserMessage doesn't handle images) and verify.
+    // An inbound photo is one of two things, disambiguated by whether the
+    // customer has an order awaiting payment:
+    //   • order pending → it's their transfer receipt — verify it (the photo a
+    //     buyer mid-checkout sends is overwhelmingly their proof of payment);
+    //   • no order pending → it's "find me something like this" — read the image
+    //     into a search query and fall through to the normal search pipeline.
+    let userMessage;
     if (message.type === "image") {
-      await handleReceiptUpload({
+      const pendingOrder = await getLatestUnpaidOrder(
+        businessId,
+        customerNumber,
+      );
+
+      if (pendingOrder) {
+        await handleReceiptUpload({
+          phoneNumberId,
+          accessToken,
+          businessId,
+          customerNumber,
+          mediaId: message.image?.id,
+          order: pendingOrder,
+        });
+        return;
+      }
+
+      userMessage = await buildPhotoSearchMessage({
         phoneNumberId,
         accessToken,
         businessId,
         customerNumber,
         mediaId: message.image?.id,
       });
-      return;
+      // The helper already replied on any failure (unreadable / not a product).
+      if (!userMessage) return;
+    } else {
+      userMessage = await extractUserMessage(message, accessToken, business);
+
+      if (userMessage === "__VOICE_ERROR__") {
+        // Generate smart AI fallback message
+        const fallback = await openaiService.generateVoiceErrorMessage(
+          business,
+          replyContext.language,
+        );
+
+        await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          fallback,
+        );
+
+        return;
+      }
+
+      if (!userMessage) {
+        logger.warn(
+          `[${business.name}] Empty or unsupported message from ${customerNumber}`,
+        );
+
+        await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          await tr(replyContext.language, (s) => s.notUnderstood),
+        );
+
+        return;
+      }
     }
 
-    const userMessage = await extractUserMessage(
-      message,
-      accessToken,
-      business,
-    );
-
-    if (userMessage === "__VOICE_ERROR__") {
-      // Generate smart AI fallback message
-      const fallback = await openaiService.generateVoiceErrorMessage(
-        business,
-        replyContext.language,
-      );
-
-      await whatsapp.sendTextMessage(
-        phoneNumberId,
-        accessToken,
-        customerNumber,
-        fallback,
-      );
-
-      return;
-    }
-
-    if (!userMessage) {
-      logger.warn(
-        `[${business.name}] Empty or unsupported message from ${customerNumber}`,
-      );
-
-      await whatsapp.sendTextMessage(
-        phoneNumberId,
-        accessToken,
-        customerNumber,
-        await tr(replyContext.language, (s) => s.notUnderstood),
-      );
-
-      return;
+    // Resolve a swipe-reply (quote) to one of OUR earlier messages. A reply can
+    // quote either a product card or a plain-text bubble:
+    //   • a card → treat THAT card's product as the one they mean, overriding
+    //     the most-recently-shown product, so "how much is this?" or "reduce am"
+    //     resolves to the card they tapped, not whatever was last on screen;
+    //   • a text bubble → recover what they quoted (Meta doesn't echo it) so the
+    //     classifier knows which earlier line their message refers to.
+    // Done before the session is read below so classification and executeAction
+    // both see the corrected lastProduct.
+    let repliedQuoteText = null;
+    if (repliedWamid) {
+      const replySession = getSession(businessId, customerNumber);
+      const repliedProductId = replySession.cardMessages?.[repliedWamid];
+      if (repliedProductId != null) {
+        const repliedProduct =
+          await productService.getProductById(repliedProductId);
+        if (repliedProduct) {
+          setLastProduct(businessId, customerNumber, repliedProduct);
+          logger.info(
+            `[${business.name}] Reply-to-card: lastProduct → "${repliedProduct.name}"`,
+          );
+        }
+      } else if (replySession.textMessages?.[repliedWamid]) {
+        repliedQuoteText = replySession.textMessages[repliedWamid];
+        logger.info(
+          `[${business.name}] Reply-to-text: quoting "${repliedQuoteText.slice(0, 60)}"`,
+        );
+      }
     }
 
     const session = getSession(businessId, customerNumber);
@@ -2417,8 +2551,16 @@ export async function handleIncomingMessage(req, res) {
       };
     }
 
+    // When the customer quoted one of our text bubbles, prefix the quote to the
+    // message the CLASSIFIER sees so it knows which line they're replying to.
+    // The raw `userMessage` is left untouched — history, quantity/offer
+    // extraction, and the reply model all keep working off the real text.
+    const classifierMessage = repliedQuoteText
+      ? `[Replying to your earlier message: "${repliedQuoteText}"]\n${userMessage}`
+      : userMessage;
+
     const rawAiOutput = await openaiService.processMessage(
-      userMessage,
+      classifierMessage,
       activeSession,
       business,
     );
@@ -2567,7 +2709,7 @@ export async function handleIncomingMessage(req, res) {
 
         // The intro (when needed) is the header bubble; the more-items hint
         // goes out after the last card.
-        await whatsapp.sendProductList(
+        const cardMappings = await whatsapp.sendProductList(
           phoneNumberId,
           accessToken,
           customerNumber,
@@ -2576,6 +2718,10 @@ export async function handleIncomingMessage(req, res) {
           moreItemsHint || "",
           language,
         );
+
+        // Remember each card's WAMID so a later swipe-reply to one resolves to
+        // exactly that product.
+        rememberCardMessages(businessId, customerNumber, cardMappings);
 
         // History note (never sent) so follow-ups like "the second one" or
         // "the jollof" stay grounded in exactly what was shown.
@@ -2620,7 +2766,7 @@ export async function handleIncomingMessage(req, res) {
           responseText += `\n\n${moreItemsHint}`;
         }
 
-        await sendOutboundMessage({
+        const { cardMappings, textWamid } = await sendOutboundMessage({
           phoneNumberId,
           accessToken,
           customerNumber,
@@ -2628,6 +2774,8 @@ export async function handleIncomingMessage(req, res) {
           productsToShow,
           language,
         });
+        rememberCardMessages(businessId, customerNumber, cardMappings);
+        rememberTextMessage(businessId, customerNumber, textWamid, responseText);
       }
 
       // Remember every card we just put on screen so later questions about the
@@ -2636,12 +2784,13 @@ export async function handleIncomingMessage(req, res) {
         if (p?.id != null) shownProductIds.add(p.id);
       }
     } else if (!greetingWasSent) {
-      await whatsapp.sendTextMessage(
+      const textWamid = await whatsapp.sendTextMessage(
         phoneNumberId,
         accessToken,
         customerNumber,
         responseText,
       );
+      rememberTextMessage(businessId, customerNumber, textWamid, responseText);
     }
 
     const currentSession = getSession(businessId, customerNumber);

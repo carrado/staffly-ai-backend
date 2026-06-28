@@ -146,6 +146,60 @@ export const setLastProduct = (businessId, customerNumber, product) => {
   setSession(businessId, customerNumber, { ...session, lastProduct: product });
 };
 
+// ─── Reply-to-card tracking ─────────────────────────────────────────────────
+//
+// When we send product cards we remember each card's WhatsApp message id
+// (WAMID) → productId. If the customer later swipe-replies to a specific card,
+// the inbound webhook carries that WAMID in `message.context.id`, letting us
+// resolve exactly which product they meant — even when it isn't the most-recent
+// one shown. Bounded to the most-recent entries so it can't grow without bound.
+const MAX_CARD_MESSAGES = 30;
+
+export const rememberCardMessages = (businessId, customerNumber, entries = []) => {
+  const valid = entries.filter((e) => e?.wamid && e.productId != null);
+  if (!valid.length) return;
+
+  const session = getSession(businessId, customerNumber);
+  const cardMessages = { ...(session.cardMessages || {}) };
+  for (const { wamid, productId } of valid) {
+    delete cardMessages[wamid]; // re-insert so a repeat lands in newest position
+    cardMessages[wamid] = productId;
+  }
+
+  // Object string keys keep insertion order, so the leading keys are the oldest
+  // — drop them once we exceed the cap.
+  const keys = Object.keys(cardMessages);
+  for (const stale of keys.slice(0, Math.max(0, keys.length - MAX_CARD_MESSAGES))) {
+    delete cardMessages[stale];
+  }
+
+  setSession(businessId, customerNumber, { ...session, cardMessages });
+};
+
+// Parallel to cardMessages, but for plain-text messages WE sent: WAMID → the
+// text. When a customer swipe-replies to one of our text bubbles, the inbound
+// `message.context.id` lets us recover what they quoted (Meta doesn't echo the
+// quoted text) and feed it to the classifier. Stored text is truncated — only
+// enough to identify the message is needed — and the map is bounded.
+const MAX_TEXT_MESSAGES = 30;
+const STORED_TEXT_MAX_CHARS = 280;
+
+export const rememberTextMessage = (businessId, customerNumber, wamid, text) => {
+  if (!wamid || !text) return;
+
+  const session = getSession(businessId, customerNumber);
+  const textMessages = { ...(session.textMessages || {}) };
+  delete textMessages[wamid]; // re-insert so a repeat lands in newest position
+  textMessages[wamid] = String(text).slice(0, STORED_TEXT_MAX_CHARS);
+
+  const keys = Object.keys(textMessages);
+  for (const stale of keys.slice(0, Math.max(0, keys.length - MAX_TEXT_MESSAGES))) {
+    delete textMessages[stale];
+  }
+
+  setSession(businessId, customerNumber, { ...session, textMessages });
+};
+
 export const setNegotiation = (businessId, customerNumber, negotiation) => {
   const session = getSession(businessId, customerNumber);
   setSession(businessId, customerNumber, { ...session, negotiation });

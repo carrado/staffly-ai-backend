@@ -1462,6 +1462,105 @@ export async function extractReceiptFieldsFromImage({ buffer, mimeType }) {
   }
 }
 
+// Claude accepts only these image media types; anything else is sent as jpeg.
+const CLAUDE_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+const PHOTO_SEARCH_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["isProduct", "productType", "query"],
+  properties: {
+    isProduct: { type: "boolean" },
+    productType: { type: "string" },
+    query: { type: "string" },
+  },
+};
+
+/**
+ * Visual product search, Option A: turn a customer's PHOTO into a text search
+ * query, then let the existing keyword+semantic pipeline (and its product-type
+ * gate) find the closest catalogue matches. Customers usually send a lookalike
+ * from elsewhere and want the nearest thing we stock, so the query is written to
+ * feed that pipeline rather than to claim an exact identification.
+ *
+ * Returns { isProduct, productType, query }:
+ *   - isProduct false when the image isn't a shoppable item (a selfie, a
+ *     receipt, scenery) — the caller then asks for a product photo instead.
+ *   - productType: the item's real-world type (the search's hard gate).
+ *   - query: a concise, TYPE-LED phrase (type first, then the salient visible
+ *     attributes — colour, material, pattern, style, apparent audience).
+ * Null on failure. Runs on Claude Haiku 4.5 (same multimodal model as the
+ * product-photo describer used by the search ranker).
+ */
+export async function describePhotoForProductSearch({ buffer, mimeType }) {
+  const base64 = Buffer.isBuffer(buffer) ? buffer.toString("base64") : "";
+  if (!base64) return null;
+  const mediaType = CLAUDE_IMAGE_TYPES.has(mimeType) ? mimeType : "image/jpeg";
+
+  try {
+    const completion = await anthropic.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 300,
+      temperature: 0,
+      system:
+        "You convert a shopper's photo into a product SEARCH query for an " +
+        "e-commerce catalogue. Identify the SINGLE main item in the photo. " +
+        "Return JSON: isProduct (boolean — true only if the image shows a " +
+        "shoppable physical product; false for a selfie/person, a payment " +
+        "receipt or screenshot, packaging text, or scenery), productType (the " +
+        "item's real-world type, e.g. \"sneakers\", \"handbag\", \"dress\", " +
+        "\"jollof rice\" — the single most specific correct noun), and query (a " +
+        "concise, factual search phrase that LEADS with the product type, then " +
+        "adds only clearly-visible distinguishing attributes — colour, " +
+        "material, pattern, style/formality, and apparent audience like " +
+        "women's/men's/kids' when evident). No marketing words, no guessed " +
+        "details, no brand names unless a logo is plainly legible. If isProduct " +
+        "is false, set productType and query to empty strings.",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: mediaType, data: base64 },
+            },
+            {
+              type: "text",
+              text: "Turn this photo into a product search query.",
+            },
+          ],
+        },
+      ],
+      output_config: {
+        format: { type: "json_schema", schema: PHOTO_SEARCH_SCHEMA },
+      },
+    });
+
+    const raw =
+      (completion.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("") || "{}";
+    const parsed = safeJsonParse(raw);
+    if (!parsed) return null;
+
+    return {
+      isProduct: parsed.isProduct === true,
+      productType:
+        typeof parsed.productType === "string" ? parsed.productType.trim() : "",
+      query: typeof parsed.query === "string" ? parsed.query.trim() : "",
+    };
+  } catch (error) {
+    logger.error(`describePhotoForProductSearch failed: ${error.message}`);
+    return null;
+  }
+}
+
 // Nigeria (WAT, UTC+1) is the customer base — anchor "good morning/afternoon/
 // evening" to local time rather than the server clock.
 function getTimeOfDay() {
