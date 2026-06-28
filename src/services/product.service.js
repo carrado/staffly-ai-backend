@@ -532,6 +532,12 @@ async function getProductEmbeddings(businessId, products) {
 // these against real photos (every candidate's score is logged). An item below
 // VISUAL_MIN_SIM is dropped entirely, so a catalogue with nothing close yields
 // an honest "no match" rather than a forced bad one.
+//
+//   ≥ VISUAL_EXACT_SIM   → the uploaded photo IS (essentially) this product →
+//                          show ONLY this one card as the exact match.
+//   ≥ VISUAL_MIN_SIM     → similar but not exact → offer to show as "similar".
+//   <  VISUAL_MIN_SIM    → dropped (nothing close).
+export const VISUAL_EXACT_SIM = 0.8; // cosine ≥ this → exact / near-identical
 const VISUAL_STRONG_SIM = 0.5; // cosine ≥ this → "strong" (visually on-point)
 const VISUAL_MIN_SIM = 0.35; // cosine < this → dropped (nothing close enough)
 

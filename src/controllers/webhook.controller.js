@@ -1524,30 +1524,112 @@ async function executeAction({
 
       // Photo-initiated search (Option B): single-use, null on the normal text
       // path or when visual search is off. When present, the customer sent a
-      // photo — match it against the WHOLE catalogue by visual similarity rather
-      // than running the text search, so a lookalike is found even when the
-      // right product's text is thin/mislabelled. The vision-derived productType
-      // is the category sanity gate.
-      const photo =
-        !isBroadBrowse
-          ? productService.takePhotoVector(businessId, customerNumber)
-          : null;
+      // photo — match it against the WHOLE catalogue by visual similarity (the
+      // vision-derived productType is the category sanity gate) and render in
+      // three bands: an EXACT/near-identical hit shows ONLY that one card; close
+      // -but-not-exact items are offered as "similar" (described, no cards, shown
+      // on a follow-up "yes"); nothing close gives an honest no-match.
+      const photo = !isBroadBrowse
+        ? productService.takePhotoVector(businessId, customerNumber)
+        : null;
 
-      let allMatches;
-      let searchBreadth;
       if (photo) {
-        allMatches = await productService.visualSearch(businessId, photo.vector, {
-          productType: photo.productType,
-        });
-        searchBreadth = "specific"; // a photo is a specific request
-      } else {
-        ({ products: allMatches, specificity: searchBreadth } =
-          await productService.searchProducts(
-            businessId,
+        const matches = await productService.visualSearch(
+          businessId,
+          photo.vector,
+          { productType: photo.productType },
+        );
+        const top = matches[0];
+        const isExact =
+          top && (top.visualSim ?? 0) >= productService.VISUAL_EXACT_SIM;
+
+        logger.info(
+          `[Search] "${query}" [photo] → ${matches.length} match(es)` +
+            (top ? `, top sim=${top.visualSim} (${isExact ? "exact" : "similar"})` : ", none") +
+            ` for business ${businessId}`,
+        );
+
+        if (!matches.length) {
+          // Nothing close enough — honest no-match (message only).
+          actionResult = {
             query,
-            isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
-          ));
+            count: 0,
+            photoSearch: true,
+            matchTier: "partial",
+            searchBreadth: "specific",
+            displayMode: "none",
+            products: [],
+          };
+          break;
+        }
+
+        const currentSession = getSession(businessId, customerNumber);
+
+        if (isExact) {
+          // Exact / near-identical → show ONLY this one product as the match.
+          setLastProduct(businessId, customerNumber, top);
+          productsToShow = [top];
+          asPickableCards = true;
+          setSession(businessId, customerNumber, {
+            ...currentSession,
+            browseMode: "search",
+            lastSearch: {
+              query,
+              productIds: matches.map((p) => p.id),
+              offset: 1,
+              strongCount: 1,
+            },
+          });
+          actionResult = {
+            query,
+            count: 1,
+            shownCount: 1,
+            photoSearch: true,
+            matchTier: "exact",
+            searchBreadth: "specific",
+            displayMode: "cards",
+            startNumber: 1,
+            remainingCount: 0,
+            products: [mapProductForAI(top)],
+          };
+          break;
+        }
+
+        // Close but not exact → describe + OFFER (no cards yet). Stash the
+        // similar items in lastSearch so a follow-up "yes, show me" pages them in
+        // as cards via show_more_products (offset 0).
+        const similar = matches.slice(0, SEARCH_LIMIT);
+        setLastProduct(businessId, customerNumber, similar[0]);
+        setSession(businessId, customerNumber, {
+          ...currentSession,
+          browseMode: "search",
+          lastSearch: {
+            query,
+            productIds: similar.map((p) => p.id),
+            offset: 0,
+            strongCount: 0,
+          },
+        });
+        actionResult = {
+          query,
+          count: similar.length,
+          shownCount: 0,
+          photoSearch: true,
+          similarOffer: true,
+          matchTier: "partial",
+          searchBreadth: "specific",
+          displayMode: "none",
+          products: [],
+        };
+        break;
       }
+
+      const { products: allMatches, specificity: searchBreadth } =
+        await productService.searchProducts(
+          businessId,
+          query,
+          isBroadBrowse ? BROWSE_LIMIT : SEARCH_LIMIT,
+        );
 
       // Budget refinement ("cheaper ones", "under 15k"): keep the same
       // category matches the search returned, just drop anything above the
@@ -1564,7 +1646,7 @@ async function executeAction({
         : allMatches;
 
       logger.info(
-        `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""}${photo ? " [photo]" : ""} → ${found.length} match(es) for business ${businessId}`,
+        `[Search] "${query}"${maxPrice ? ` (≤₦${maxPrice})` : ""} → ${found.length} match(es) for business ${businessId}`,
       );
 
       // Results arrive ordered by matchPercent. The strong tier (≥90%) is
@@ -2741,7 +2823,12 @@ export async function handleIncomingMessage(req, res) {
         // bubble. A BROAD search (a wide selection that should invite narrowing)
         // gets a short AI intro line before the cards. (Partial matches never
         // reach this branch — they're sent as a message only, no cards.)
-        const needsIntro = actionResult?.searchBreadth === "broad";
+        // A broad selection gets a narrowing nudge; an exact photo match gets a
+        // short "this is the one from your photo" lead-in. Other specific
+        // strong matches let the card speak for itself.
+        const needsIntro =
+          actionResult?.searchBreadth === "broad" ||
+          actionResult?.matchTier === "exact";
 
         let introText = "";
         if (needsIntro) {
