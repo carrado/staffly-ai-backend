@@ -224,6 +224,62 @@ export function sendableImageUrl(product) {
   return url;
 }
 
+/**
+ * A product's full, WhatsApp-sendable photo set: the main image first, then the
+ * gallery thumbnails — deduped, and screened the same way sendableImageUrl
+ * screens the main image (drop blanks, placeholder domains, and formats Meta
+ * can't deliver). Returns [] when the product has no usable photo.
+ */
+export function productPhotoUrls(product) {
+  const candidates = [product?.image_url, ...(product?.gallery || [])];
+  const seen = new Set();
+  const out = [];
+  for (const raw of candidates) {
+    if (typeof raw !== 'string') continue;
+    const url = raw.trim();
+    if (!url || seen.has(url) || url.includes('example.com')) continue;
+    if (UNSUPPORTED_IMAGE_EXT.test(url)) {
+      logger.warn(`[WhatsApp] Skipping gallery photo — unsupported format: ${url}`);
+      continue;
+    }
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+/**
+ * Send a list of image URLs as plain image bubbles — "just the photos", no card
+ * chrome, no caption. Each photo prefers the media-id path (ordered delivery)
+ * and falls back to a link; a photo that fails both is skipped so the rest still
+ * arrive. A small gap between sends keeps them in order. Returns the WAMIDs of
+ * the bubbles that actually delivered (so callers can map them back to a product
+ * for reply-to-photo resolution).
+ */
+export async function sendProductPhotos(phoneNumberId, accessToken, to, imageUrls = []) {
+  const wamids = [];
+  for (let i = 0; i < imageUrls.length; i++) {
+    const url = imageUrls[i];
+    let wamid = null;
+    try {
+      const mediaId = await resolveMediaId(phoneNumberId, accessToken, url);
+      wamid = await sendImageMessageById(phoneNumberId, accessToken, to, mediaId, '');
+    } catch (err) {
+      mediaIdCache.delete(mediaCacheKey(phoneNumberId, url));
+      try {
+        wamid = await sendImageMessage(phoneNumberId, accessToken, to, url, '');
+      } catch (err2) {
+        logger.warn(
+          `[WhatsApp] photo send failed (${url}): ${err2.response?.data?.error?.message || err2.message}`,
+        );
+      }
+    }
+    if (wamid) wamids.push(wamid);
+    if (i < imageUrls.length - 1) await new Promise((r) => setTimeout(r, 250));
+  }
+  return wamids;
+}
+
 // Fixed card labels per conversation language. Product descriptions are
 // translated upstream (openai.service translateDescriptions) — this table covers
 // everything composed in code. English and Pidgin are hand-written; any other

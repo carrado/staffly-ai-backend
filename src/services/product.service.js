@@ -380,6 +380,130 @@ async function describeProductImage(imageUrl) {
   }
 }
 
+// ─── Colour-specific photo matching ─────────────────────────────────────────
+//
+// A product lists its colours as flat attribute values and its photos as a flat
+// gallery — nothing ties "green" to a specific image. So when a shopper asks to
+// see a colour we INFER which photo shows it: rank the gallery against the
+// colour text with Voyage's shared text/image space (when enabled), then CONFIRM
+// the top candidates with a one-shot vision yes/no so we never present, say, a
+// black photo as "the green one". If nothing confirms, the caller says so
+// honestly rather than faking a match.
+
+const galleryEmbedCache = new LruCache(VISUAL_CACHE_MAX); // imageUrl → vector
+const colorConfirmCache = new LruCache(VISUAL_CACHE_MAX); // `${url}::${color}` → bool
+
+// Most gallery photos we vision-confirm per colour request (cost guard). Voyage
+// ranking puts the likeliest matches first, so the real green photo — when one
+// exists — is almost always inside this window.
+const COLOR_VISION_CANDIDATES = 3;
+
+// Embed a set of gallery image URLs as document vectors (in-memory cached per
+// URL). Returns Map url → vector; URLs that fail to embed are absent.
+async function embedGalleryImages(urls) {
+  const result = new Map();
+  const need = [];
+  for (const url of urls) {
+    const hit = galleryEmbedCache.get(url);
+    if (hit) result.set(url, hit);
+    else need.push(url);
+  }
+  if (need.length) {
+    const vectors = await voyage.embedProductImages(
+      need.map((u) => ({ id: u, imageUrl: u })),
+    );
+    for (const url of need) {
+      const vec = vectors.get(url);
+      if (vec) {
+        galleryEmbedCache.set(url, vec);
+        result.set(url, vec);
+      }
+    }
+  }
+  return result;
+}
+
+// One-shot vision check: does THIS photo show the item predominantly in `color`?
+// Cached per (url, colour). This is the reliable arbiter — embedding rank only
+// orders the candidates; this decides whether we may call it a match.
+async function confirmImageColor(imageUrl, color) {
+  if (!imageUrl || !color) return false;
+  const key = `${imageUrl}::${color.toLowerCase()}`;
+  const cached = colorConfirmCache.get(key);
+  if (cached !== undefined) return cached;
+
+  try {
+    const completion = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 8,
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'url', url: imageUrl } },
+            {
+              type: 'text',
+              text: `Does the main product in this photo appear predominantly in the colour "${color}" (or clearly show "${color}" as the variant pictured)? Answer with exactly one word: yes or no.`,
+            },
+          ],
+        },
+      ],
+    });
+    const text = (completion.content || [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join(' ')
+      .toLowerCase();
+    const match = /\byes\b/.test(text);
+    colorConfirmCache.set(key, match);
+    return match;
+  } catch (error) {
+    logger.warn(`[Vision] colour confirm failed (${imageUrl}): ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * From a product's photo set, find the one(s) that actually show `color`.
+ * Voyage ranks the gallery against the colour text (when enabled; otherwise the
+ * photos keep their given order), then the top few are vision-confirmed. Returns
+ * { matched } — the confirmed-colour URLs (possibly empty). `queryHint` (e.g.
+ * the product name) grounds the text embedding so a bare colour word isn't
+ * ambiguous.
+ */
+export async function matchColorPhotos(color, photoUrls = [], queryHint = '') {
+  if (!color || !photoUrls.length) return { matched: [] };
+
+  let ordered = photoUrls;
+  if (voyage.isVisualSearchEnabled()) {
+    const queryVec = await voyage.embedTextQuery(`${color} ${queryHint}`.trim());
+    if (queryVec) {
+      const embeds = await embedGalleryImages(photoUrls);
+      const scored = photoUrls
+        .map((url) => ({
+          url,
+          sim: embeds.has(url)
+            ? voyage.cosineSimilarity(queryVec, embeds.get(url))
+            : -1,
+        }))
+        .sort((a, b) => b.sim - a.sim);
+      ordered = scored.map((s) => s.url);
+      logger.info(
+        `[ColorPhoto] "${color}" ranked → ${scored
+          .map((s) => s.sim.toFixed(2))
+          .join(', ')}`,
+      );
+    }
+  }
+
+  const candidates = ordered.slice(0, COLOR_VISION_CANDIDATES);
+  const flags = await Promise.all(
+    candidates.map((url) => confirmImageColor(url, color)),
+  );
+  return { matched: candidates.filter((_, i) => flags[i]) };
+}
+
 // Attach a `visualDescription` (read from the product photo) to up to VISION_MAX
 // of the given products. No-op unless PRODUCT_VISION is enabled.
 async function attachVisualDescriptions(products) {

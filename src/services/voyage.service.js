@@ -117,6 +117,28 @@ export async function embedImageQuery({ buffer, mimeType }) {
 }
 
 /**
+ * Embed a short text as a QUERY vector in the SAME multimodal space as the
+ * product images — so a phrase like "green sneakers" can be cosine-ranked
+ * against a product's photos to surface the one that shows that colour. Null
+ * when visual search is disabled or the call fails (caller then degrades).
+ */
+export async function embedTextQuery(text) {
+  if (!isVisualSearchEnabled() || !text || !text.trim()) return null;
+  try {
+    const [vec] = await callVoyage(
+      [{ content: [{ type: 'text', text: text.trim() }] }],
+      'query',
+    );
+    return Array.isArray(vec) ? vec : null;
+  } catch (e) {
+    logger.warn(
+      `[Voyage] text query embed failed: ${e.response?.data?.detail || e.message}`,
+    );
+    return null;
+  }
+}
+
+/**
  * Embed product images as document vectors. `items` is [{ id, imageUrl }];
  * returns a Map id → vector. Images are fetched individually (a single broken
  * URL never sinks the batch) and embedded in small batches to keep payloads

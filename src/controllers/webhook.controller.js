@@ -70,6 +70,7 @@ const QUANTITY_PERSIST_BLOCKED = new Set([
   "show_more_products",
   "list_categories",
   "send_product_image",
+  "show_photos",
   "find_similar_negotiable",
   "check_attribute",
 ]);
@@ -105,6 +106,13 @@ const STRINGS = {
       "Sorry, I could not understand that message. Please send text or a clear voice note.",
     somethingWrong:
       "Sorry, something went wrong on my end. Please try that again in a moment 🙏",
+    photosColorHere: (color) => `Here's the ${color} one 👇📸`,
+    photosColorNoImage: (color) =>
+      `It does come in ${color} 👍 — the photos I have are of a different colour, but it's the same style. Here's what I've got:`,
+    photosColorUnsure: (color) =>
+      `Here are the photos I have for this one — I can't pick out a separate ${color} shot, but take a look:`,
+    photosColorNotOffered: (color, colors) =>
+      `I don't have ${color} for this one — it comes in ${colors}. Want me to show you?`,
   },
   pidgin: {
     moreItems: (n) =>
@@ -133,6 +141,13 @@ const STRINGS = {
       "Sorry, I no understand that message. Abeg send text or clear voice note.",
     somethingWrong:
       "Sorry, something spoil for my side. Abeg try am again small time 🙏",
+    photosColorHere: (color) => `See the ${color} one 👇📸`,
+    photosColorNoImage: (color) =>
+      `E dey available for ${color} 👍 — but the photos wey I get na different colour, na the same style sha. See wetin I get:`,
+    photosColorUnsure: (color) =>
+      `See the photos wey I get for this one — I no fit pick out one separate ${color} photo, but check am:`,
+    photosColorNotOffered: (color, colors) =>
+      `I no get ${color} for this one — e dey available for ${colors}. Make I show you?`,
   },
 };
 
@@ -276,6 +291,34 @@ function createDefaultActionResult(message) {
 
 function getResolvedProductName(actionData = {}, session = {}) {
   return actionData.productName || session.lastProduct?.name || null;
+}
+
+// The colour values a product is offered in (from its attributes, any "colour"
+// key, case-insensitive). [] when the product lists no colours at all.
+function getProductColors(product) {
+  const attrs = product?.attributes || {};
+  for (const [key, value] of Object.entries(attrs)) {
+    if (/colou?r/i.test(key)) {
+      const arr = Array.isArray(value) ? value : [value];
+      return arr.filter((v) => typeof v === "string" && v.trim());
+    }
+  }
+  return [];
+}
+
+// Is `wanted` one of the offered colours? Lenient both ways so "green" matches
+// "Forest Green" and vice-versa.
+function colorIsOffered(wanted, offeredColors) {
+  const w = wanted.toLowerCase();
+  return offeredColors.some((c) => {
+    const cc = c.toLowerCase();
+    return cc === w || cc.includes(w) || w.includes(cc);
+  });
+}
+
+function formatColorList(colors) {
+  if (colors.length <= 1) return colors[0] || "";
+  return `${colors.slice(0, -1).join(", ")} and ${colors[colors.length - 1]}`;
 }
 
 function mapProductForAI(product) {
@@ -2376,6 +2419,94 @@ async function executeAction({
       break;
     }
 
+    case "show_photos": {
+      // "Just the photos" — send the vendor's images as plain image bubbles (no
+      // price, no details). With no colour asked, send them all. With a colour
+      // asked, send only the photo(s) that actually show it (see matchColorPhotos)
+      // — and stay honest when none do, or when the colour isn't even offered.
+      const resolvedProductName = getResolvedProductName(action.data, session);
+
+      const product = resolvedProductName
+        ? await productService.getProductByName(businessId, resolvedProductName)
+        : session.lastProduct;
+
+      if (!product) {
+        actionResult = createDefaultActionResult(
+          "Tell me which product you'd like to see photos of and I'll send them.",
+        );
+        break;
+      }
+
+      setLastProduct(businessId, customerNumber, product);
+
+      const photos = whatsapp.productPhotoUrls(product);
+      if (!photos.length) {
+        actionResult = createDefaultActionResult(
+          `I don't have any photos of ${product.name} to show right now.`,
+        );
+        break;
+      }
+
+      productsToShow = []; // photos are sent raw below — not as product cards
+
+      const wantedColor = action.data.color;
+      if (wantedColor) {
+        const offeredColors = getProductColors(product);
+        // Colour is listed AND it isn't one of them → say so honestly, send
+        // nothing (the reply lists what it DOES come in).
+        if (offeredColors.length && !colorIsOffered(wantedColor, offeredColors)) {
+          actionResult = {
+            photoMode: true,
+            kind: "color_not_offered",
+            color: wantedColor,
+            offeredColors,
+            photoProductName: product.name,
+          };
+          break;
+        }
+
+        const { matched } = await productService.matchColorPhotos(
+          wantedColor,
+          photos,
+          product.name,
+        );
+
+        if (matched.length) {
+          actionResult = {
+            photoMode: true,
+            kind: "color_match",
+            photos: matched,
+            photoProductId: product.id,
+            photoProductName: product.name,
+            color: wantedColor,
+          };
+        } else {
+          // No photo confirms the colour. If the product lists it, say it's
+          // available (just no matching shot); if it lists no colours at all,
+          // stay non-committal. Either way show what we DO have — never fake it.
+          actionResult = {
+            photoMode: true,
+            kind: offeredColors.length ? "color_no_image" : "color_unsure",
+            photos,
+            photoProductId: product.id,
+            photoProductName: product.name,
+            color: wantedColor,
+          };
+        }
+        break;
+      }
+
+      actionResult = {
+        photoMode: true,
+        kind: "plain",
+        photos,
+        photoProductId: product.id,
+        photoProductName: product.name,
+        photoCount: photos.length,
+      };
+      break;
+    }
+
     case "none":
     default:
       actionResult = null;
@@ -2950,7 +3081,57 @@ export async function handleIncomingMessage(req, res) {
 
       const sendingCards = asPickableCards && productsToShow.length > 0;
 
-      if (sendingCards) {
+      if (actionResult?.photoMode) {
+        // "Just the photos" (optionally for a specific colour). The lead-in note
+        // is composed in CODE — not by the model — so the honesty rules hold
+        // exactly: a colour we can't show is never faked, and we never promise to
+        // chase a colour photo from the seller. A plain request keeps the model's
+        // friendly line. Then the images go out as plain bubbles, each mapped
+        // back to the product so a swipe-reply to one resolves.
+        const r = actionResult;
+        let note = responseText; // plain: the model's varied line
+        if (r.kind === "color_match") {
+          note = await tr(language, (s) => s.photosColorHere(r.color));
+        } else if (r.kind === "color_no_image") {
+          note = await tr(language, (s) => s.photosColorNoImage(r.color));
+        } else if (r.kind === "color_unsure") {
+          note = await tr(language, (s) => s.photosColorUnsure(r.color));
+        } else if (r.kind === "color_not_offered") {
+          note = await tr(language, (s) =>
+            s.photosColorNotOffered(r.color, formatColorList(r.offeredColors)),
+          );
+        }
+
+        const noteWamid = await whatsapp.sendTextMessage(
+          phoneNumberId,
+          accessToken,
+          customerNumber,
+          note,
+        );
+        rememberTextMessage(businessId, customerNumber, noteWamid, note);
+
+        if (r.photos?.length) {
+          const photoWamids = await whatsapp.sendProductPhotos(
+            phoneNumberId,
+            accessToken,
+            customerNumber,
+            r.photos,
+          );
+          rememberCardMessages(
+            businessId,
+            customerNumber,
+            photoWamids.map((wamid) => ({
+              wamid,
+              productId: r.photoProductId,
+            })),
+          );
+          responseText = `${note}\n[Sent ${photoWamids.length} photo${
+            photoWamids.length === 1 ? "" : "s"
+          } of ${r.photoProductName}${r.color ? ` (asked for colour: ${r.color})` : ""}]`;
+        } else {
+          responseText = note;
+        }
+      } else if (sendingCards) {
         // Strong, specific matches: the cards speak for themselves — no intro
         // bubble. A BROAD search (a wide selection that should invite narrowing)
         // gets a short AI intro line before the cards. (Partial matches never

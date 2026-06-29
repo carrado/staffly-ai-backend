@@ -31,6 +31,7 @@ const VALID_ACTION_TYPES = new Set([
   "accept_offer",
   "find_similar_negotiable",
   "send_product_image",
+  "show_photos",
   "generate_payment_link",
   "list_categories",
 ]);
@@ -673,6 +674,17 @@ function normalizeActionData(type, rawData = {}, session = {}) {
           null,
       };
 
+    case "show_photos":
+      return {
+        productName:
+          toNullableString(data.productName) ||
+          session.lastProduct?.name ||
+          null,
+        // The colour the shopper asked to see, if any (reuses the selectedColor
+        // field). null = they just want the photos, no specific colour.
+        color: toNullableString(data.selectedColor) || null,
+      };
+
     case "generate_payment_link":
       return {
         productName:
@@ -817,7 +829,7 @@ function buildActionDecisionSystem(business, session, catalogSummary = null) {
   const instructions = `You are an AI sales assistant for an online store on WhatsApp. You help customers browse products, check attributes (size/color/material/stock), negotiate prices, and place orders.
 
 Return ONLY a JSON object: { "response": short reply to the customer, "language": language name, "action": { "type": one allowed type, "data": {...} } }.
-Allowed action.type (choose exactly one, never invent one): none, search_products, show_more_products, check_attribute, start_negotiation, make_offer, accept_offer, find_similar_negotiable, send_product_image, generate_payment_link, list_categories.
+Allowed action.type (choose exactly one, never invent one): none, search_products, show_more_products, check_attribute, start_negotiation, make_offer, accept_offer, find_similar_negotiable, send_product_image, show_photos, generate_payment_link, list_categories.
 
 LANGUAGE:
 - Set "language" to the language of THE CURRENT message, as a lowercase English name (e.g. english, pidgin, yoruba, hausa, igbo, french). Use "pidgin" for Nigerian Pidgin.
@@ -843,7 +855,8 @@ CHOOSING THE ACTION:
 - accept_offer — clearly agrees to the price YOU last offered ("ok", "deal", "I'll take it").
 - generate_payment_link — wants to buy/order/pay/checkout ("package am for me", "send me link make I pay", "I don gree"). data: { productName (null = last), items:[{ quantity, selectedSize, selectedColor, selectedAttributes:[{name,value}], selectedModifiers:[] }], email, customerName, location }. The order is for ONE product (productName); 'items' is its breakdown into variant lines. Use ONE item per DISTINCT variant combination the customer asked for, each with its own quantity: "3 in red and 1 in black" → items:[{quantity:3,selectedColor:"red"},{quantity:1,selectedColor:"black"}]; a plain "I want 2" with no variant split → items:[{quantity:2}]. quantity on a line = how many of THAT variant, as a whole number — set it whenever they say a count ("two", "2", "3 of them", "a pair" = 2, "a dozen" = 12); leave it out (defaults to 1) when they don't state one. The price the system charges already multiplies each line by its quantity and sums the lines, so never do that maths yourself. ALWAYS include the COMPLETE current breakdown in 'items' on every checkout turn (every variant line, not just the newest) — the system replaces the breakdown each turn, so a line you omit is dropped. email, customerName and location are SHARED across the whole order (one buyer), so keep them at the top level of data, NOT inside items. To place an order the system needs the buyer's name, email, and delivery location, plus — for EACH item line — a chosen value for every variant the product lists (size, colour, or ANY other attribute like storage, material, flavour) and a choice from every required food modifier group. Pull whatever the customer has given into data (customerName = their full name; location = their delivery address/area; email; per line: selectedModifiers = chosen option names). For variant picks on a line: put size in selectedSize and colour in selectedColor, and put any OTHER attribute choice in selectedAttributes as { name, value } using the attribute's exact name from the product (e.g. { "name": "Storage", "value": "256GB" }). Do NOT invent, guess, auto-fill, or assume any of these — and NEVER copy the example values shown anywhere in these instructions (names, emails, addresses, option values) into data. They are format illustrations, not customer data. A field goes into data ONLY when the customer actually typed that value in this conversation; otherwise leave it null/empty. The system then replies asking for exactly what's still missing, so it is always correct to leave a field out — it is never correct to fill it with a placeholder to "complete" the order. Always use this action for buy/checkout intent even when details are incomplete.
 - CHECKOUT FOLLOW-UP: once you've asked the customer for order details (name, email, delivery location, size, colour, or a modifier choice), treat their next message that supplies any of those as continuing the SAME purchase → action generate_payment_link, with productName = the item being bought (from context) and every detail they just gave mapped into data. When the customer sends a bare reply that is clearly their details — a name, an email, and an address run together (e.g. "<their name>, <their email>, <their address>") — parse each part into customerName, email, and location respectively, using ONLY what they actually wrote (never a placeholder). Never restart a search or answer "none" when the customer is clearly answering your checkout questions.
-- send_product_image — wants to SEE a product (picture/photo/"what does it look like?"). The ONLY way to send a photo.
+- send_product_image — wants to SEE a product as a full card (its picture WITH price/details), e.g. "show me that one", "what does it look like?", "send me the product".
+- show_photos — explicitly wants the PHOTOS/PICTURES themselves, just the images and nothing else: "send me photos", "can I see pictures", "show me the pictures/images", "more photos", "other angles", "any other pictures?", "just the photos". ALSO use this when they want to SEE a specific COLOUR of the product ("show me the green one", "can I see it in red", "let me see the blue colour"). data: { productName (null = last product), selectedColor (the colour they asked to see, or null if they didn't name one) }. This sends the photos the vendor uploaded as plain images (no price, no details); when a colour is given, the system finds and sends the photo of that colour. Use this — not send_product_image — whenever the customer asks for photos/pictures (or to see a colour) rather than the product card.
 - find_similar_negotiable — agrees to see similar items they can bargain on, or asks for them directly.
 - list_categories — explicitly asks for category/department names.
 - none — ONLY pure greetings, thanks, or chit-chat with no product interest.
