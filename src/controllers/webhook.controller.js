@@ -2616,6 +2616,7 @@ export async function handleIncomingMessage(req, res) {
     let repliedQuoteText = null;
     let repliedCardName = null;
     let repliedOwnText = null;
+    let repliedOwnProductName = null;
     if (repliedWamid) {
       const replySession = getSession(businessId, customerNumber);
       const cardCount = Object.keys(replySession.cardMessages || {}).length;
@@ -2652,10 +2653,14 @@ export async function handleIncomingMessage(req, res) {
           );
           if (ownProduct) {
             setLastProduct(businessId, customerNumber, ownProduct);
-            repliedCardName = ownProduct.name;
+            repliedOwnProductName = ownProduct.name;
           }
         }
-        if (!repliedCardName && ownMessage.text) {
+        // Carry the text too (not just when no product resolved): on a reply-to
+        // -own the customer is following up on what THEY said, and the original
+        // wording often qualifies the product (size/colour/use) the anchor alone
+        // wouldn't convey.
+        if (ownMessage.text) {
           repliedOwnText = ownMessage.text;
         }
         logger.info(
@@ -2764,9 +2769,11 @@ export async function handleIncomingMessage(req, res) {
       ? `[The customer is replying to the product card you sent for "${repliedCardName}". Any "this", "it", or "how much" refers to THAT product — not any more recent item in the conversation.]`
       : repliedQuoteText
         ? `[The customer is replying to your earlier message: "${repliedQuoteText}". Their message refers to THAT, not any more recent topic.]`
-        : repliedOwnText
-          ? `[The customer is replying to their OWN earlier message: "${repliedOwnText}". Their new message continues or refers to THAT, not any more recent topic.]`
-          : null;
+        : repliedOwnProductName
+          ? `[The customer is replying to their OWN earlier message${repliedOwnText ? ` ("${repliedOwnText}")` : ""}, which was about "${repliedOwnProductName}". Any "this", "it", or "how much" refers to THAT product — not any more recent item in the conversation.]`
+          : repliedOwnText
+            ? `[The customer is replying to their OWN earlier message: "${repliedOwnText}". Their new message continues or refers to THAT, not any more recent topic.]`
+            : null;
     const anchoredMessage = replyAnchor
       ? `${replyAnchor}\n${userMessage}`
       : userMessage;
@@ -2879,6 +2886,12 @@ export async function handleIncomingMessage(req, res) {
         )) || responseText;
     }
 
+    // A photo turn only yields a TRUSTWORTHY product anchor when it produced an
+    // exact, single-card match. Partial / no-match photos set lastProduct to a
+    // visual GUESS the customer was never shown (or leave a stale product from an
+    // earlier turn) — anchoring a later reply-to-own to that yields confidently
+    // wrong answers, so we record text only in that case (see inboundProductId).
+    let photoMatchWasExact = false;
     if (action.type !== "none") {
       const { actionResult, productsToShow, asPickableCards } =
         await executeAction({
@@ -2889,6 +2902,10 @@ export async function handleIncomingMessage(req, res) {
           userMessage,
           shownProductIds,
         });
+
+      if (isPhotoSearch && actionResult?.matchTier === "exact") {
+        photoMatchWasExact = true;
+      }
 
       const freshSession = getSession(businessId, customerNumber);
 
@@ -3045,7 +3062,15 @@ export async function handleIncomingMessage(req, res) {
     }
 
     const currentSession = getSession(businessId, customerNumber);
-    const inboundProductId = currentSession.lastProduct?.id ?? null;
+    // For a photo turn, only anchor a later reply-to-own to a product when the
+    // photo was an EXACT, shown match. On a partial/no-match photo, lastProduct
+    // is a guess the customer never saw (or a stale earlier item), so we store
+    // text only and let a reply re-run the search instead of asserting a wrong
+    // product. Text turns keep the existing behaviour (anchor to lastProduct).
+    const inboundProductId =
+      isPhotoSearch && !photoMatchWasExact
+        ? null
+        : currentSession.lastProduct?.id ?? null;
 
     // Spread the whole session so fields written during executeAction
     // (browseMode, similarSearch, ...) survive the turn.
