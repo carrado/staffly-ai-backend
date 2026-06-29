@@ -1565,7 +1565,15 @@ export async function analyzeCustomerPhoto({ buffer, mimeType }) {
         "transaction (proof of payment); \"product\" if it shows a shoppable " +
         "physical item the shopper wants to buy or find; \"other\" for anything " +
         "else (a selfie/person, scenery, a random screenshot, packaging text " +
-        "with no clear item). When in doubt between receipt and product, judge " +
+        "with no clear item). CRUCIAL: judge a photo by the PHYSICAL OBJECT it " +
+        "depicts, not by what is shown ON that object's screen. A real-world " +
+        "photograph of a device — a laptop, phone, tablet, TV, monitor, smart " +
+        "-watch — is \"product\" (productType = the device), even when its screen " +
+        "displays a wallpaper, scenery, app icons, or a website; the on-screen " +
+        "content is NOT the subject. Only treat an image as \"receipt\"/\"other\" " +
+        "for its screen content when the WHOLE image IS a screenshot (a flat, " +
+        "full-bleed screen capture with no surrounding physical device, desk, or " +
+        "background visible). When in doubt between receipt and product, judge " +
         "by content: anything that reads as a money/transaction screenshot is " +
         "\"receipt\". productType — only when kind is \"product\": the item's " +
         "real-world type as the single most specific correct noun (e.g. " +

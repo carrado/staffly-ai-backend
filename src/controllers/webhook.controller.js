@@ -2484,8 +2484,10 @@ export async function handleIncomingMessage(req, res) {
     // matched. Route by the image's CONTENT (a vision classify), not merely by
     // whether an order is open — so a shopper mid-checkout who sends a product
     // photo is searched, not mistaken for sending a receipt. The open order is a
-    // safety prior: when one's pending, anything NOT clearly a product is still
-    // treated as a receipt so the money path is never missed.
+    // narrow safety prior: when one's pending AND the classifier was unclear (no
+    // usable kind), the photo is verified as a receipt so a genuine but hard-to
+    // -read receipt is never missed. A confident "product"/"receipt"/"other" is
+    // always honoured as-is.
     let userMessage;
     let isPhotoSearch = false;
     let photoQuery = null;
@@ -2518,14 +2520,18 @@ export async function handleIncomingMessage(req, res) {
         buffer: media.buffer,
         mimeType: media.mimeType,
       });
-      // Classification failed → fall back to the order prior (receipt if one's
-      // pending, otherwise treat as a non-product).
-      const kind = photo?.kind || (pendingOrder ? "receipt" : "other");
+      // "product" | "receipt" | "other" when the vision call succeeded; null when
+      // it failed or returned nothing usable. The null case is the ONLY one the
+      // pending-order safety prior treats as a possible receipt — a CONFIDENT
+      // "other" is taken at face value so an obvious non-receipt (a laptop, a
+      // selfie) isn't forced through receipt verification just because an order
+      // is open.
+      const rawKind = photo?.kind || null;
       logger.info(
-        `[Image] ${customerNumber} classified as "${kind}"${pendingOrder ? " (order pending)" : ""}`,
+        `[Image] ${customerNumber} classified as "${rawKind || "unknown"}"${pendingOrder ? " (order pending)" : ""}`,
       );
 
-      if (kind === "product") {
+      if (rawKind === "product") {
         const photoSearch = await beginPhotoProductSearch({
           phoneNumberId,
           accessToken,
@@ -2538,9 +2544,32 @@ export async function handleIncomingMessage(req, res) {
         userMessage = photoSearch.message;
         photoQuery = photoSearch.query;
         isPhotoSearch = true;
-      } else if (pendingOrder) {
-        // Receipt, or unclear while a payment is outstanding → verify as a
-        // receipt (verifyReceipt does its own forgery / not-a-receipt checks).
+      } else if (rawKind === "receipt") {
+        if (pendingOrder) {
+          // verifyReceipt does its own forgery / not-a-receipt checks.
+          await handleReceiptUpload({
+            phoneNumberId,
+            accessToken,
+            businessId,
+            customerNumber,
+            mediaId,
+            order: pendingOrder,
+            media,
+          });
+        } else {
+          await whatsapp.sendTextMessage(
+            phoneNumberId,
+            accessToken,
+            customerNumber,
+            "I can't find an order waiting for payment right now. If you've just ordered, tell me what you'd like to buy and I'll set it up. 🙂",
+          );
+        }
+        return;
+      } else if (!rawKind && pendingOrder) {
+        // Classification was unclear/failed AND a payment is outstanding: the one
+        // case worth the benefit of the doubt — verify as a receipt so a genuine
+        // but hard-to-read receipt is never missed. (A confident "other" skips
+        // this and falls through to the honest non-product reply below.)
         await handleReceiptUpload({
           phoneNumberId,
           accessToken,
@@ -2551,15 +2580,8 @@ export async function handleIncomingMessage(req, res) {
           media,
         });
         return;
-      } else if (kind === "receipt") {
-        await whatsapp.sendTextMessage(
-          phoneNumberId,
-          accessToken,
-          customerNumber,
-          "I can't find an order waiting for payment right now. If you've just ordered, tell me what you'd like to buy and I'll set it up. 🙂",
-        );
-        return;
       } else {
+        // Confident "other", or unclear with no order pending → not a product.
         await whatsapp.sendTextMessage(
           phoneNumberId,
           accessToken,
