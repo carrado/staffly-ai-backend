@@ -1126,7 +1126,7 @@ async function sendOutboundMessage({
   // so the caller can record it for reply-to-text lookups. Exactly one is
   // populated per call.
   if (products.length === 1) {
-    const wamid = await whatsapp.sendProductCard(
+    const { cardWamid, followUpWamid } = await whatsapp.sendProductCard(
       phoneNumberId,
       accessToken,
       customerNumber,
@@ -1134,7 +1134,13 @@ async function sendOutboundMessage({
       responseText,
       language,
     );
-    return { cardMappings: [{ productId: products[0].id, wamid }], textWamid: null };
+    // The follow-up bubble carried responseText — surface its WAMID as textWamid
+    // so the caller tracks it as a reply target (it's the bottom-most message and
+    // the one customers most often swipe-reply to).
+    return {
+      cardMappings: [{ productId: products[0].id, wamid: cardWamid }],
+      textWamid: followUpWamid,
+    };
   }
 
   if (products.length > 1) {
@@ -1196,7 +1202,7 @@ async function handleProductSelection({
 
   const [localized] = await localizeProductsForLanguage([product], language);
 
-  const wamid = await whatsapp.sendProductCard(
+  const { cardWamid, followUpWamid } = await whatsapp.sendProductCard(
     phoneNumberId,
     accessToken,
     customerNumber,
@@ -1205,8 +1211,13 @@ async function handleProductSelection({
     language,
   );
   rememberCardMessages(businessId, customerNumber, [
-    { productId: product.id, wamid },
+    { productId: product.id, wamid: cardWamid },
   ]);
+  // The follow-up bubble sits below the card and is the more natural swipe-reply
+  // target — track it so a reply to it resolves back to its text.
+  if (followUpWamid) {
+    rememberTextMessage(businessId, customerNumber, followUpWamid, followUpText);
+  }
 
   const currentSession = getSession(businessId, customerNumber);
 

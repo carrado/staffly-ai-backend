@@ -384,22 +384,27 @@ async function buildProductCaption(product, language = 'english') {
  *
  * Falls back to text-only if no image URL is set.
  */
-// Returns the WAMID of the card (the image bubble) — NOT the follow-up text — so
-// a customer's reply to the card resolves back to this product.
+// Returns { cardWamid, followUpWamid }: the WAMID of the card (the image bubble)
+// AND the WAMID of the follow-up conversational text bubble (when one is sent).
+// Both are reply targets — the follow-up text is the bottom-most message in the
+// chat and the one customers most often swipe-reply to — so the caller can track
+// each: a reply to the card resolves to this product, a reply to the follow-up
+// resolves to its text.
 export async function sendProductCard(phoneNumberId, accessToken, to, product, followUpText = '', language = 'english') {
   const caption = await buildProductCaption(product, language);
 
   // Image (by media id so it delivers before the follow-up), falling back to
   // link then a plain text card.
-  const wamid = await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
+  const cardWamid = await sendProductImageBubble(phoneNumberId, accessToken, to, product, caption);
 
   // Send the AI's conversational response as a separate follow-up bubble
+  let followUpWamid = null;
   if (followUpText) {
     await new Promise((r) => setTimeout(r, 300)); // slight delay for natural feel
-    await sendTextMessage(phoneNumberId, accessToken, to, followUpText);
+    followUpWamid = await sendTextMessage(phoneNumberId, accessToken, to, followUpText);
   }
 
-  return wamid;
+  return { cardWamid, followUpWamid };
 }
 
 // Interactive-message limits (Meta API)
