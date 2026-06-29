@@ -153,7 +153,15 @@ export const setLastProduct = (businessId, customerNumber, product) => {
 // the inbound webhook carries that WAMID in `message.context.id`, letting us
 // resolve exactly which product they meant — even when it isn't the most-recent
 // one shown. Bounded to the most-recent entries so it can't grow without bound.
-const MAX_CARD_MESSAGES = 30;
+//
+// The cap must comfortably exceed a realistic conversation's worth of messages:
+// customers routinely swipe-reply to a card/photo/message from much earlier
+// ("how much is this?" on a card seen several exchanges ago), and an evicted
+// WAMID resolves to nothing — the reply then loses its anchor and the AI answers
+// about the most recent topic instead (the "replied to an old message, got an
+// off-target answer" failure). At ~a few hundred bytes per entry these maps stay
+// tiny even at this size, and the 30-day session TTL caps total growth.
+const MAX_CARD_MESSAGES = 250;
 
 export const rememberCardMessages = (businessId, customerNumber, entries = []) => {
   const valid = entries.filter((e) => e?.wamid && e.productId != null);
@@ -181,7 +189,7 @@ export const rememberCardMessages = (businessId, customerNumber, entries = []) =
 // `message.context.id` lets us recover what they quoted (Meta doesn't echo the
 // quoted text) and feed it to the classifier. Stored text is truncated — only
 // enough to identify the message is needed — and the map is bounded.
-const MAX_TEXT_MESSAGES = 30;
+const MAX_TEXT_MESSAGES = 250;
 const STORED_TEXT_MAX_CHARS = 280;
 
 export const rememberTextMessage = (businessId, customerNumber, wamid, text) => {
@@ -205,7 +213,11 @@ export const rememberTextMessage = (businessId, customerNumber, wamid, text) => 
 // `message.context.id` is the WAMID of THEIR message — not ours — so it can't be
 // in cardMessages/textMessages; this map is what lets that reply be recovered
 // and re-grounded (text and the product it was about).
-const MAX_INBOUND_MESSAGES = 30;
+// Every inbound customer message lands here, so this map fills fastest of the
+// three — the cap is the main guard against an older photo/message a customer
+// swipe-replies to having already been evicted. Keep it generous (see the note
+// on MAX_CARD_MESSAGES).
+const MAX_INBOUND_MESSAGES = 250;
 
 export const rememberInboundMessage = (
   businessId,

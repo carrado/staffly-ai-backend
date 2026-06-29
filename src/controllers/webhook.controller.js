@@ -2886,12 +2886,13 @@ export async function handleIncomingMessage(req, res) {
         )) || responseText;
     }
 
-    // A photo turn only yields a TRUSTWORTHY product anchor when it produced an
-    // exact, single-card match. Partial / no-match photos set lastProduct to a
-    // visual GUESS the customer was never shown (or leave a stale product from an
-    // earlier turn) — anchoring a later reply-to-own to that yields confidently
-    // wrong answers, so we record text only in that case (see inboundProductId).
-    let photoMatchWasExact = false;
+    // A photo turn yields a trustworthy product anchor only when the search
+    // actually MATCHED something (count > 0) — then lastProduct is that match
+    // (the exact item or the nearest fit), the right thing for a later "how much
+    // is it?" reply-to-own to resolve to. On a NO-MATCH photo, lastProduct is
+    // left as a stale product from an earlier turn, so we must NOT anchor to it;
+    // that case records text only (see inboundProductId below).
+    let photoMatchedProductId = null;
     if (action.type !== "none") {
       const { actionResult, productsToShow, asPickableCards } =
         await executeAction({
@@ -2903,11 +2904,11 @@ export async function handleIncomingMessage(req, res) {
           shownProductIds,
         });
 
-      if (isPhotoSearch && actionResult?.matchTier === "exact") {
-        photoMatchWasExact = true;
-      }
-
       const freshSession = getSession(businessId, customerNumber);
+
+      if (isPhotoSearch && actionResult?.count > 0) {
+        photoMatchedProductId = freshSession.lastProduct?.id ?? null;
+      }
 
       // The "show more" hint is AI-written but code-guarded: code decides the
       // exact count and whether to show it at all (it must only ever appear when
@@ -3062,15 +3063,13 @@ export async function handleIncomingMessage(req, res) {
     }
 
     const currentSession = getSession(businessId, customerNumber);
-    // For a photo turn, only anchor a later reply-to-own to a product when the
-    // photo was an EXACT, shown match. On a partial/no-match photo, lastProduct
-    // is a guess the customer never saw (or a stale earlier item), so we store
-    // text only and let a reply re-run the search instead of asserting a wrong
-    // product. Text turns keep the existing behaviour (anchor to lastProduct).
-    const inboundProductId =
-      isPhotoSearch && !photoMatchWasExact
-        ? null
-        : currentSession.lastProduct?.id ?? null;
+    // For a photo turn, anchor a later reply-to-own to the product the photo
+    // MATCHED (exact or nearest) — but never to a stale earlier item on a
+    // no-match photo (photoMatchedProductId is null there, so we store text
+    // only). Text turns keep the existing behaviour (anchor to lastProduct).
+    const inboundProductId = isPhotoSearch
+      ? photoMatchedProductId
+      : currentSession.lastProduct?.id ?? null;
 
     // Spread the whole session so fields written during executeAction
     // (browseMode, similarSearch, ...) survive the turn.
