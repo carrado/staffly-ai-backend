@@ -1,0 +1,24 @@
+{
+  "name": "staffly-ai-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Velte Connect AI search service — retrieval/ranking split out of velte-backend so the buyer-facing search hot path doesn't share traffic with the vendor dashboard API.",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv-flow": "^4.1.0",
+    "express": "^4.18.2",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0",
+    "hpp": "^0.2.3",
+    "mongoose": "^8.0.3",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
