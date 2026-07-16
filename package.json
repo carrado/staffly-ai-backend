@@ -5,7 +5,8 @@
   "description": "Velte Connect AI search service — retrieval/ranking split out of velte-backend so the buyer-facing search hot path doesn't share traffic with the vendor dashboard API.",
   "scripts": {
     "start": "node src/app.js",
-    "dev": "nodemon src/app.js"
+    "dev": "nodemon src/app.js",
+    "test:retrieval": "node src/scripts/test-retrieval.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
