@@ -1,46 +1,88 @@
-import express from 'express';
-import webhookRoutes from './routes/webhook.routes.js';
-import authRoutes from './routes/auth.routes.js';
-import paymentRoutes from './routes/payment.routes.js';
-import velteRoutes from './routes/velte.routes.js';
-import { errorHandler } from './middleware/error.handler.js';
+import "./loadEnv.js";
+
+import express from "express";
+import mongoose from "mongoose";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import mongoSanitize from "express-mongo-sanitize";
+import hpp from "hpp";
+import searchRoutes from "./routes/search.routes.js";
+import { errorHandler, notFound } from "./middleware/errorHandler.js";
 
 const app = express();
 
-app.use(express.json({
-    /**
-     * The verify function allows us to intercept the raw request body.
-     * @param req The request object
-     * @param res The response object
-     * @param buf A Buffer of the raw request body
-     * @param encoding The encoding of the request
-     */
-    verify: (req, res, buf, encoding) => {
-      if (buf && buf.length) {
-        req.rawBody = buf;
-      }
-    }
-  }));
+// Same reasoning as velte-backend's app.js: exactly one reverse proxy hop on
+// the deploy target, so trust exactly one — never `true` (spoofable).
+app.set("trust proxy", 1);
 
-  
-// ── Routes ────────────────────────────────────────────────────────────────────
-// Single webhook endpoint handles messages for ALL connected businesses.
-// Meta routes all messages here; we use phone_number_id to identify the business.
-app.use('/webhook', webhookRoutes);
+app.use(helmet());
+app.use(hpp());
 
-// Embedded Signup OAuth callback + business management
-app.use('/auth', authRoutes);
+const env = process.env.NODE_ENV || "development";
 
-// Payment gateway webhook
-app.use('/api', paymentRoutes);
+// Same origin allowlist as velte-backend — this service is only ever called
+// from the same frontend, never directly by anything else.
+app.use(
+  cors({
+    origin: [
+      "http://localhost:4001",
+      "https://velte-dev.vercel.app",
+      "https://velte.ng",
+    ],
+    credentials: true,
+  }),
+);
 
-// Signed webhooks from velte-backend (order.paid → WhatsApp confirmation, etc.)
-app.use('/api', velteRoutes);
+app.use(express.json({ limit: "10kb" }));
+app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+app.use(mongoSanitize());
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+// Search is a public, unauthenticated, higher-traffic surface than the
+// vendor dashboard API by design (that's the whole point of the split) — a
+// higher ceiling than velte-backend's 100/15min, but still bounded.
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      success: false,
+      message: "Too many requests, please try again later.",
+    },
+  }),
+);
 
-// Error handler
+// Same MongoDB, same URI-selection rule as velte-backend (localhost +
+// staging share one DB; only production has its own) — this service reads
+// velte-backend's Product/Store/User/Wallet collections directly and writes
+// its own search-domain collections (VendorExposure, RecruitmentLead,
+// Notification) into the same cluster.
+const dbUri =
+  env === "production" ? process.env.MONGODB_URI_PRODUCTION : process.env.MONGODB_URI;
+
+mongoose
+  .connect(dbUri)
+  .then(() => console.log(`✅ Connected to MongoDB (${env})`))
+  .catch((err) => console.error("❌ MongoDB connection error:", err.message));
+
+app.use("/api/search", searchRoutes);
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    service: "staffly-ai-backend",
+    environment: env,
+    database: env === "production" ? "Production DB" : "Staging DB",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.use(notFound);
 app.use(errorHandler);
 
-export default app;
+const PORT = process.env.PORT || 7100;
+app.listen(PORT, () => {
+  console.log(`🚀 staffly-ai-backend running on port ${PORT} (${env})`);
+});

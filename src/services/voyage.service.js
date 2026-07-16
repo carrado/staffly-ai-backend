@@ -1,186 +1,213 @@
-/**
- * Voyage AI multimodal embeddings (voyage-multimodal-3).
- *
- * Option B of visual product search: embed images into vectors and rank product
- * photos by cosine similarity to a customer's photo, so a "find me something
- * like this" lookalike is matched by how items actually LOOK — not just how
- * they're described. Text and images share one vector space.
- *
- * Disabled (every export no-ops / returns null) unless VOYAGE_API_KEY is set, so
- * visual search degrades cleanly to the vision→text path (Option A).
- *
- * NOTE: the request/response shape below targets Voyage's multimodal embeddings
- * endpoint — verify field names against the current Voyage docs before relying
- * on it in production, as the API may have evolved.
- */
+// Voyage AI client — embeddings + reranking for Velte Connect retrieval
+// (Velte_Connect_Technical_Implementation.md §6). Plain fetch, no SDK.
+//
+// Duplicated verbatim from velte-backend/src/services/voyage.service.js
+// (which keeps its own copy for write-time embedding on product/store
+// create/update — see that repo's embedding.service.js). This is a thin,
+// self-contained third-party API wrapper with no business logic and no
+// cross-model dependencies, so duplicating it is low-risk compared to
+// duplicating actual ranking/matching logic — see this repo's README.
 
-import axios from 'axios';
-import { env } from '../config/env.js';
-import { logger } from '../utils/logger.js';
+const VOYAGE_EMBEDDINGS_URL = "https://api.voyageai.com/v1/embeddings";
+const VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank";
+const VOYAGE_MULTIMODAL_URL = "https://api.voyageai.com/v1/multimodalembeddings";
+const EMBED_MODEL = "voyage-4";
+const RERANK_MODEL = "rerank-2.5";
+const MULTIMODAL_MODEL = "voyage-multimodal-3";
+const TIMEOUT_MS = 15_000;
 
-const VOYAGE_URL = 'https://api.voyageai.com/v1/multimodalembeddings';
-const MODEL = 'voyage-multimodal-3';
+const MAX_RETRIES = 1;
+const RETRY_DELAYS_MS = [250];
 
-const FETCH_TIMEOUT_MS = 15000; // downloading a product image
-const EMBED_TIMEOUT_MS = 30000; // the Voyage call itself
-const PRODUCT_BATCH = 8; // product images per Voyage request (base64 is heavy)
-
-const CLAUDE_IMAGE_TYPES = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-]);
-
-export function isVisualSearchEnabled() {
-  return !!env.voyageApiKey;
+function isRetryableStatus(status) {
+  return status === 429 || status >= 500;
 }
 
-// Cosine similarity of two equal-length vectors. Returns -Infinity for missing
-// or mismatched vectors so they sort to the bottom of a ranking.
-export function cosineSimilarity(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
-    return -Infinity;
-  }
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
-  }
-  if (!na || !nb) return -Infinity;
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function bufferToDataUrl(buffer, mimeType) {
-  const mime = CLAUDE_IMAGE_TYPES.has(mimeType) ? mimeType : 'image/jpeg';
-  return `data:${mime};base64,${Buffer.from(buffer).toString('base64')}`;
-}
-
-async function fetchImageAsDataUrl(url) {
-  const res = await axios.get(url, {
-    responseType: 'arraybuffer',
-    timeout: FETCH_TIMEOUT_MS,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-  });
-  const ct = (res.headers['content-type'] || '').toLowerCase();
-  const mime = ct.includes('png')
-    ? 'image/png'
-    : ct.includes('webp')
-      ? 'image/webp'
-      : ct.includes('gif')
-        ? 'image/gif'
-        : 'image/jpeg';
-  return `data:${mime};base64,${Buffer.from(res.data).toString('base64')}`;
-}
-
-// One Voyage multimodal call. `inputType` is "query" for the shopper's photo and
-// "document" for catalogue products — the asymmetric encoding Voyage recommends
-// for retrieval. Returns an array of embedding vectors aligned to `inputs`.
-async function callVoyage(inputs, inputType) {
-  const res = await axios.post(
-    VOYAGE_URL,
-    { inputs, model: MODEL, input_type: inputType },
-    {
-      headers: {
-        Authorization: `Bearer ${env.voyageApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: EMBED_TIMEOUT_MS,
-    },
-  );
-  return (res.data?.data || []).map((d) => d.embedding);
-}
-
-/**
- * Embed the shopper's photo (a Buffer) as a query vector. Null when visual
- * search is disabled or the call fails — the caller then stays on Option A.
- */
-export async function embedImageQuery({ buffer, mimeType }) {
-  if (!isVisualSearchEnabled() || !buffer) return null;
-  try {
-    const dataUrl = bufferToDataUrl(buffer, mimeType);
-    const [vec] = await callVoyage(
-      [{ content: [{ type: 'image_base64', image_base64: dataUrl }] }],
-      'query',
-    );
-    return Array.isArray(vec) ? vec : null;
-  } catch (e) {
-    logger.warn(
-      `[Voyage] query image embed failed: ${e.response?.data?.detail || e.message}`,
-    );
-    return null;
-  }
-}
-
-/**
- * Embed a short text as a QUERY vector in the SAME multimodal space as the
- * product images — so a phrase like "green sneakers" can be cosine-ranked
- * against a product's photos to surface the one that shows that colour. Null
- * when visual search is disabled or the call fails (caller then degrades).
- */
-export async function embedTextQuery(text) {
-  if (!isVisualSearchEnabled() || !text || !text.trim()) return null;
-  try {
-    const [vec] = await callVoyage(
-      [{ content: [{ type: 'text', text: text.trim() }] }],
-      'query',
-    );
-    return Array.isArray(vec) ? vec : null;
-  } catch (e) {
-    logger.warn(
-      `[Voyage] text query embed failed: ${e.response?.data?.detail || e.message}`,
-    );
-    return null;
-  }
-}
-
-/**
- * Embed product images as document vectors. `items` is [{ id, imageUrl }];
- * returns a Map id → vector. Images are fetched individually (a single broken
- * URL never sinks the batch) and embedded in small batches to keep payloads
- * sane. Missing/failed items are simply absent from the returned Map.
- */
-export async function embedProductImages(items) {
-  const out = new Map();
-  if (!isVisualSearchEnabled() || !items?.length) return out;
-
-  for (let i = 0; i < items.length; i += PRODUCT_BATCH) {
-    const batch = items.slice(i, i + PRODUCT_BATCH);
-
-    // Fetch each image to a data URL, dropping any that fail.
-    const fetched = await Promise.all(
-      batch.map(async (it) => {
-        try {
-          return { id: it.id, dataUrl: await fetchImageAsDataUrl(it.imageUrl) };
-        } catch (e) {
-          logger.warn(`[Voyage] image fetch failed (${it.imageUrl}): ${e.message}`);
-          return null;
-        }
-      }),
-    );
-    const usable = fetched.filter(Boolean);
-    if (!usable.length) continue;
+async function fetchWithRetry(makeRequest, label, deadlineAt) {
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    const remainingMs =
+      deadlineAt == null ? TIMEOUT_MS : deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      console.error(`[voyage] ${label} skipped — search deadline already spent`);
+      throw lastErr ?? new Error(`${label}: search deadline exceeded`);
+    }
 
     try {
-      const vectors = await callVoyage(
-        usable.map((u) => ({
-          content: [{ type: 'image_base64', image_base64: u.dataUrl }],
-        })),
-        'document',
+      const res = await makeRequest(Math.min(TIMEOUT_MS, remainingMs));
+      if (res.ok || !isRetryableStatus(res.status) || attempt === MAX_RETRIES) {
+        return res;
+      }
+      console.error(
+        `[voyage] ${label} got ${res.status}, retrying (attempt ${attempt + 1}/${MAX_RETRIES})…`,
       );
-      vectors.forEach((vec, j) => {
-        if (Array.isArray(vec)) out.set(usable[j].id, vec);
-      });
-    } catch (e) {
-      logger.warn(
-        `[Voyage] product embed batch failed: ${e.response?.data?.detail || e.message}`,
+    } catch (err) {
+      if (attempt === MAX_RETRIES) throw err;
+      lastErr = err;
+      console.error(
+        `[voyage] ${label} network error, retrying (attempt ${attempt + 1}/${MAX_RETRIES}):`,
+        err.message,
       );
     }
-  }
 
-  return out;
+    const backoff = RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS.at(-1);
+    const budgetLeft =
+      deadlineAt == null ? backoff : Math.max(0, deadlineAt - Date.now());
+    await sleep(Math.min(backoff, budgetLeft));
+  }
+  throw lastErr;
+}
+
+/**
+ * Embed one or more texts. `inputType` is "document" for catalog data,
+ * "query" for a buyer's search text. Returns null (not a throw) if the key
+ * is missing or the call fails. `deadlineAt` — optional Date.now()-scale
+ * timestamp shared across every Voyage call within one buyer search.
+ */
+export async function embed(texts, inputType, deadlineAt) {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey || !texts?.length) return null;
+
+  try {
+    const res = await fetchWithRetry(
+      (timeoutMs) =>
+        fetch(VOYAGE_EMBEDDINGS_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: EMBED_MODEL,
+            input: texts,
+            input_type: inputType,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        }),
+      "embed",
+      deadlineAt,
+    );
+
+    if (!res.ok) {
+      console.error(`[voyage] embed failed: ${res.status} ${await res.text()}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const vectors = data?.data?.map((d) => d.embedding);
+    return Array.isArray(vectors) && vectors.every(Array.isArray)
+      ? vectors
+      : null;
+  } catch (err) {
+    console.error("[voyage] embed error:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Embed a single image (optionally paired with text) via voyage-multimodal-3.
+ * Same never-throw convention as embed/rerank.
+ */
+export async function embedImage(imageUrl, inputType, text, deadlineAt) {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey || !imageUrl) return null;
+
+  try {
+    const content = [];
+    if (text) content.push({ type: "text", text });
+    content.push({ type: "image_url", image_url: imageUrl });
+
+    const res = await fetchWithRetry(
+      (timeoutMs) =>
+        fetch(VOYAGE_MULTIMODAL_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: MULTIMODAL_MODEL,
+            inputs: [{ content }],
+            input_type: inputType,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        }),
+      "embedImage",
+      deadlineAt,
+    );
+
+    if (!res.ok) {
+      console.error(
+        `[voyage] embedImage failed: ${res.status} ${await res.text()}`,
+      );
+      return null;
+    }
+
+    const data = await res.json();
+    const vector = data?.data?.[0]?.embedding;
+    return Array.isArray(vector) ? vector : null;
+  } catch (err) {
+    console.error("[voyage] embedImage error:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Rerank `documents` against `query`, returning a relevance score per
+ * document in the SAME order as the input array. Returns null on any
+ * failure so callers can fall back to vector-search order alone.
+ */
+export async function rerank(query, documents, deadlineAt) {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey || !documents?.length) return null;
+
+  try {
+    const res = await fetchWithRetry(
+      (timeoutMs) =>
+        fetch(VOYAGE_RERANK_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: RERANK_MODEL,
+            query,
+            documents,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        }),
+      "rerank",
+      deadlineAt,
+    );
+
+    if (!res.ok) {
+      console.error(`[voyage] rerank failed: ${res.status} ${await res.text()}`);
+      return null;
+    }
+
+    const data = await res.json();
+    // Voyage's rerank envelope is { object, data: [{index, relevance_score}],
+    // model, usage } — NOT { results: [...] }.
+    const results = data?.data;
+    if (!Array.isArray(results)) {
+      console.error("[voyage] rerank response missing data[] array:", JSON.stringify(data));
+      return null;
+    }
+
+    const scores = new Array(documents.length).fill(0);
+    for (const r of results) {
+      if (typeof r.index === "number" && typeof r.relevance_score === "number") {
+        scores[r.index] = r.relevance_score;
+      }
+    }
+    return scores;
+  } catch (err) {
+    console.error("[voyage] rerank error:", err.message);
+    return null;
+  }
 }

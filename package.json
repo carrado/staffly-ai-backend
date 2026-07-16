@@ -1,34 +1,25 @@
 {
-  "name": "staffly-backend",
+  "name": "staffly-ai-backend",
   "version": "1.0.0",
-  "description": "AI-powered WhatsApp e-commerce assistant",
-  "main": "src/server.js",
   "type": "module",
+  "description": "Velte Connect AI search service — retrieval/ranking split out of velte-backend so the buyer-facing search hot path doesn't share traffic with the vendor dashboard API.",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "test:webhook": "node scripts/test-webhook.js",
-    "eval": "node scripts/eval-understanding.mjs"
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test:retrieval": "node src/scripts/test-retrieval.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.104.1",
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1",
+    "cors": "^2.8.5",
+    "dotenv-flow": "^4.1.0",
     "express": "^4.18.2",
-    "form-data": "^4.0.0",
-    "mongoose": "^9.6.2",
-    "openai": "^4.20.0",
-    "tesseract.js": "^5.1.0"
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0",
+    "hpp": "^0.2.3",
+    "mongoose": "^8.0.3",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
-  },
-  "keywords": [
-    "whatsapp",
-    "ai",
-    "ecommerce",
-    "openai"
-  ],
-  "author": "",
-  "license": "ISC"
+    "nodemon": "^3.0.2"
+  }
 }
