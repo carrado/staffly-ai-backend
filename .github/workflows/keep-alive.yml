@@ -1,0 +1,19 @@
+name: Keep Render service warm
+
+# Render's free tier spins the service down after ~15 min idle, and the next
+# request pays a ~20-30s cold-start penalty — bad when that request is a
+# buyer's live AI search on Velte Connect (see /api/search in the velte repo,
+# which has no timeout/retry around this backend and lets the LLM see the
+# failure as a real tool error). Pinging /health well inside that idle
+# window keeps the instance alive so real requests never hit a cold start.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: curl -fsS --max-time 30 https://staffly-ai-backend.onrender.com/health
