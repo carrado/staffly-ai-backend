@@ -21,7 +21,6 @@ const notificationSchema = new mongoose.Schema(
         "new-order",
         "new-message",
         "new-lead",
-        "low-stock",
         "expired-product",
         "payment",
         "wallet",

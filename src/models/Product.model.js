@@ -59,9 +59,6 @@ const productSchema = new mongoose.Schema(
     videoUrl: { type: String, default: null },
     colorClass: { type: String, default: null },
 
-    stockQuantity: { type: Number, default: 0 },
-    orderedQuantity: { type: Number, default: 0 },
-    lowStockThreshold: { type: Number, default: null },
     manufacturingDate: { type: Date, default: null },
     expirationDate: { type: Date, default: null },
     attributes: { type: [attributeSchema], default: [] },

@@ -537,7 +537,9 @@ export async function searchProducts({
     VendorRead.find({ _id: { $in: vendorIds } }).select(
       "geo trustScore area state name phone company avatar",
     ),
-    Store.find({ vendorId: { $in: vendorIds } }).select("vendorId name whatsapp"),
+    Store.find({ vendorId: { $in: vendorIds } }).select(
+      "vendorId name whatsapp handle",
+    ),
   ]);
   const vendorById = new Map(vendors.map((v) => [String(v._id), v]));
   const storeByVendorId = new Map(stores.map((s) => [String(s.vendorId), s]));
@@ -553,6 +555,8 @@ export async function searchProducts({
       quoteOnRequest: product.quoteOnRequest === true,
       currency: product.currency,
       mainImageUrl: product.mainImageUrl,
+      thumbnailUrls: product.thumbnailUrls || [],
+      storeHandle: store?.handle ?? null,
       description: product.description ?? null,
       attributes: (product.attributes || []).map((a) => ({
         name: a.name,
