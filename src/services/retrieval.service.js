@@ -182,9 +182,11 @@ const STORE_RERANK_FLOOR = 0.58;
 const STORE_RAW_SCORE_FLOOR = 0.7;
 
 // How much above the base relevance floor a candidate must score to count
-// as a "direct" match rather than merely "similar" — only used for
-// image-derived product searches.
-const IMAGE_MATCH_MARGIN = 0.08;
+// as a "direct" match rather than merely "similar" — applies to every
+// product search, text or image (semanticScore already folds in visualScore
+// only when one exists, so a plain-text query's semanticScore is just its
+// rerank textScore, same space this margin was originally calibrated on).
+const MATCH_QUALITY_MARGIN = 0.08;
 
 // How much a product's own visual similarity counts versus its text-derived
 // semantic score, for image-derived searches only.
@@ -470,12 +472,14 @@ async function rankCandidates({
   };
 }
 
-// Splits a tier's already-ranked candidates into "direct" vs. "similar".
-function applyMatchQuality(tierCandidates, relevanceFloor, tieredQuery) {
-  if (!tieredQuery || !tierCandidates.length) {
+// Splits a tier's already-ranked candidates into "direct" vs. "similar" —
+// applied to every product search so a buyer gets an honest "no exact match,
+// but here's something similar" whether they searched by text or photo.
+function applyMatchQuality(tierCandidates, relevanceFloor) {
+  if (!tierCandidates.length) {
     return { candidates: tierCandidates, matchQuality: undefined };
   }
-  const directFloor = relevanceFloor + IMAGE_MATCH_MARGIN;
+  const directFloor = relevanceFloor + MATCH_QUALITY_MARGIN;
   const direct = tierCandidates.filter((c) => c.semanticScore >= directFloor);
   return direct.length
     ? { candidates: direct, matchQuality: "direct" }
@@ -498,7 +502,6 @@ export async function searchProducts({
   imageUrl,
 }) {
   const deadlineAt = Date.now() + SEARCH_DEADLINE_MS;
-  const tieredQuery = isImageQuery;
 
   const queryVectors = await embed([queryText], "query", deadlineAt);
   const queryVector = queryVectors?.[0];
@@ -609,7 +612,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       relevanceFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     recordActiveExposure(active);
@@ -640,7 +642,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       local,
       localFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -670,7 +671,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nearby,
       nearbyFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -705,7 +705,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       stateWide,
       stateFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -730,7 +729,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       nationwideFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
