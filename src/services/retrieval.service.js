@@ -249,6 +249,25 @@ function haversineKm([lng1, lat1], [lng2, lat2]) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Places' free-text search has no facet for "long-term lease" vs. "shortlet"
+// — a query like "apartment rental" matches both a real letting agency AND a
+// shortlet/serviced-apartment business, since the latter's own Google listing
+// often uses that exact wording too (found live: an Enugu buyer asking for
+// "an apartment to rent" got back The Mastadon Apartments and BOX 55, both
+// nightly-rate shortlets, not the long-term lease they meant). Biasing the
+// request to Places' own "real_estate_agency" type steers away from the
+// lodging/hotel-typed shortlet businesses without needing query-text tricks
+// Text Search doesn't support. Only applied when the query is clearly about
+// renting/leasing AND doesn't itself name a shortlet — a buyer who actually
+// wants a shortlet should still get one.
+const RENTAL_INTENT = /\b(rent|rental|renting|lease|leasing|letting)\b/i;
+const SHORTLET_INTENT = /\b(shortlet|short.let|airbnb|nightly|per.night|per.day)\b/i;
+function placesIncludedType(queryText) {
+  if (SHORTLET_INTENT.test(queryText)) return undefined;
+  if (RENTAL_INTENT.test(queryText)) return "real_estate_agency";
+  return undefined;
+}
+
 /**
  * Shared Tier 5 for both searchProducts and searchStores once every real
  * Velte-vendor geo tier has come up empty (or been fully wallet-filtered
@@ -256,7 +275,13 @@ function haversineKm([lng1, lat1], [lng2, lat2]) {
  * failure or nothing within radius.
  */
 async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
-  const places = await searchNearbyBusinesses({ queryText, lat, lng, radiusKm });
+  const places = await searchNearbyBusinesses({
+    queryText,
+    lat,
+    lng,
+    radiusKm,
+    includedType: placesIncludedType(queryText),
+  });
   const externalSuggestions = places
     ?.map((p) => ({
       placeId: p.placeId,
@@ -571,6 +596,7 @@ export async function searchProducts({
       currency: product.currency,
       mainImageUrl: product.mainImageUrl,
       thumbnailUrls: product.thumbnailUrls || [],
+      videoUrl: product.videoUrl ?? null,
       storeHandle: store?.handle ?? null,
       description: product.description ?? null,
       attributes: (product.attributes || []).map((a) => ({

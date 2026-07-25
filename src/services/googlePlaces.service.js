@@ -20,8 +20,23 @@ const TIMEOUT_MS = 6000;
  * Real nearby businesses matching `queryText`, biased toward [lat, lng]
  * within `radiusKm`. Best-effort: returns null on any failure rather than
  * throwing.
+ *
+ * `includedType` — an optional Places "Table A" type (e.g.
+ * "real_estate_agency") to restrict results to. Text Search's `textQuery`
+ * alone can't distinguish intent the way a buyer means it — "apartment
+ * rental" matches both actual letting agencies AND shortlet/serviced-
+ * apartment businesses (their own Google listings use the same wording,
+ * see retrieval.service.js's placesIncludedType for the found-live case).
+ * `includedType` filters by Places' own business classification instead of
+ * hoping the free-text query disambiguates it.
  */
-export async function searchNearbyBusinesses({ queryText, lat, lng, radiusKm = 10 }) {
+export async function searchNearbyBusinesses({
+  queryText,
+  lat,
+  lng,
+  radiusKm = 10,
+  includedType,
+}) {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) return null;
 
@@ -41,6 +56,7 @@ export async function searchNearbyBusinesses({ queryText, lat, lng, radiusKm = 1
             radius: Math.min(radiusKm * 1000, 50000), // API caps at 50km
           },
         },
+        ...(includedType ? { includedType } : {}),
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
