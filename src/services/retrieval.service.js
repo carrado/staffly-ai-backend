@@ -86,9 +86,9 @@ const RAW_SCORE_FLOOR = 0.75;
 // the buyer asked for at all."
 const WEAK_MATCH_MARGIN = 0.05;
 
-// Buyer-facing ask: show a couple of not-that-close alternatives, clearly
+// Buyer-facing ask: show a handful of not-that-close alternatives, clearly
 // labeled as such. Capped small on purpose.
-const WEAK_MATCH_LIMIT = 2;
+const WEAK_MATCH_LIMIT = 5;
 
 // Exposure-based rotation ("equal share of visibility").
 // EXPOSURE_WINDOW_DAYS: how far back "recently shown" looks.
