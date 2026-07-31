@@ -74,15 +74,19 @@ export async function searchStores(req, res, next) {
       );
     }
 
-    const { results, matchTier, externalSuggestions } = await findStores({
-      queryText,
-      lat: hasLat ? lat : undefined,
-      lng: hasLng ? lng : undefined,
-      radiusKm: typeof radiusKm === "number" ? radiusKm : undefined,
-      limit: typeof limit === "number" ? limit : undefined,
-    });
+    const { results, matchTier, matchQuality, externalSuggestions } =
+      await findStores({
+        queryText,
+        lat: hasLat ? lat : undefined,
+        lng: hasLng ? lng : undefined,
+        radiusKm: typeof radiusKm === "number" ? radiusKm : undefined,
+        limit: typeof limit === "number" ? limit : undefined,
+      });
 
-    res.json({ success: true, data: { results, matchTier, externalSuggestions } });
+    res.json({
+      success: true,
+      data: { results, matchTier, matchQuality, externalSuggestions },
+    });
   } catch (err) {
     next(err);
   }

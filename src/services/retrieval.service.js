@@ -39,6 +39,7 @@ import { embed, embedImage, rerank } from "./voyage.service.js";
 import { reverseGeocodeState } from "./nominatim.service.js";
 import { searchNearbyBusinesses } from "./googlePlaces.service.js";
 import { notifyUser } from "./pushNotification.service.js";
+import { sectorKeywordsForLabels } from "../utils/sectorKeywords.js";
 
 const VECTOR_INDEX_NAME = "product_vector_index";
 const STORE_VECTOR_INDEX_NAME = "store_vector_index";
@@ -85,9 +86,9 @@ const RAW_SCORE_FLOOR = 0.75;
 // the buyer asked for at all."
 const WEAK_MATCH_MARGIN = 0.05;
 
-// Buyer-facing ask: show a couple of not-that-close alternatives, clearly
+// Buyer-facing ask: show a handful of not-that-close alternatives, clearly
 // labeled as such. Capped small on purpose.
-const WEAK_MATCH_LIMIT = 2;
+const WEAK_MATCH_LIMIT = 5;
 
 // Exposure-based rotation ("equal share of visibility").
 // EXPOSURE_WINDOW_DAYS: how far back "recently shown" looks.
@@ -182,9 +183,11 @@ const STORE_RERANK_FLOOR = 0.58;
 const STORE_RAW_SCORE_FLOOR = 0.7;
 
 // How much above the base relevance floor a candidate must score to count
-// as a "direct" match rather than merely "similar" — only used for
-// image-derived product searches.
-const IMAGE_MATCH_MARGIN = 0.08;
+// as a "direct" match rather than merely "similar" — applies to every
+// product search, text or image (semanticScore already folds in visualScore
+// only when one exists, so a plain-text query's semanticScore is just its
+// rerank textScore, same space this margin was originally calibrated on).
+const MATCH_QUALITY_MARGIN = 0.08;
 
 // How much a product's own visual similarity counts versus its text-derived
 // semantic score, for image-derived searches only.
@@ -217,7 +220,18 @@ function productEmbeddingText(product) {
 }
 
 function storeEmbeddingText(store) {
-  return [store.name, (store.sectors || []).join(" "), store.description]
+  // Folds in each sector's buyer-facing keyword list (sectorKeywords.js) —
+  // this is the QUERY-TIME rerank text (rankCandidates recomputes it fresh
+  // on every search, never uses the stored vector), so this alone already
+  // improves matching for existing vendors without needing a re-embed. See
+  // embedding.service.js's identical change in velte-backend for the
+  // write-time ($vectorSearch candidate pool) half of this fix.
+  return [
+    store.name,
+    (store.sectors || []).join(" "),
+    sectorKeywordsForLabels(store.sectors),
+    store.description,
+  ]
     .filter(Boolean)
     .join(". ");
 }
@@ -235,6 +249,25 @@ function haversineKm([lng1, lat1], [lng2, lat2]) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Places' free-text search has no facet for "long-term lease" vs. "shortlet"
+// — a query like "apartment rental" matches both a real letting agency AND a
+// shortlet/serviced-apartment business, since the latter's own Google listing
+// often uses that exact wording too (found live: an Enugu buyer asking for
+// "an apartment to rent" got back The Mastadon Apartments and BOX 55, both
+// nightly-rate shortlets, not the long-term lease they meant). Biasing the
+// request to Places' own "real_estate_agency" type steers away from the
+// lodging/hotel-typed shortlet businesses without needing query-text tricks
+// Text Search doesn't support. Only applied when the query is clearly about
+// renting/leasing AND doesn't itself name a shortlet — a buyer who actually
+// wants a shortlet should still get one.
+const RENTAL_INTENT = /\b(rent|rental|renting|lease|leasing|letting)\b/i;
+const SHORTLET_INTENT = /\b(shortlet|short.let|airbnb|nightly|per.night|per.day)\b/i;
+function placesIncludedType(queryText) {
+  if (SHORTLET_INTENT.test(queryText)) return undefined;
+  if (RENTAL_INTENT.test(queryText)) return "real_estate_agency";
+  return undefined;
+}
+
 /**
  * Shared Tier 5 for both searchProducts and searchStores once every real
  * Velte-vendor geo tier has come up empty (or been fully wallet-filtered
@@ -242,7 +275,13 @@ function haversineKm([lng1, lat1], [lng2, lat2]) {
  * failure or nothing within radius.
  */
 async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
-  const places = await searchNearbyBusinesses({ queryText, lat, lng, radiusKm });
+  const places = await searchNearbyBusinesses({
+    queryText,
+    lat,
+    lng,
+    radiusKm,
+    includedType: placesIncludedType(queryText),
+  });
   const externalSuggestions = places
     ?.map((p) => ({
       placeId: p.placeId,
@@ -470,12 +509,14 @@ async function rankCandidates({
   };
 }
 
-// Splits a tier's already-ranked candidates into "direct" vs. "similar".
-function applyMatchQuality(tierCandidates, relevanceFloor, tieredQuery) {
-  if (!tieredQuery || !tierCandidates.length) {
+// Splits a tier's already-ranked candidates into "direct" vs. "similar" —
+// applied to every product search so a buyer gets an honest "no exact match,
+// but here's something similar" whether they searched by text or photo.
+function applyMatchQuality(tierCandidates, relevanceFloor) {
+  if (!tierCandidates.length) {
     return { candidates: tierCandidates, matchQuality: undefined };
   }
-  const directFloor = relevanceFloor + IMAGE_MATCH_MARGIN;
+  const directFloor = relevanceFloor + MATCH_QUALITY_MARGIN;
   const direct = tierCandidates.filter((c) => c.semanticScore >= directFloor);
   return direct.length
     ? { candidates: direct, matchQuality: "direct" }
@@ -498,7 +539,6 @@ export async function searchProducts({
   imageUrl,
 }) {
   const deadlineAt = Date.now() + SEARCH_DEADLINE_MS;
-  const tieredQuery = isImageQuery;
 
   const queryVectors = await embed([queryText], "query", deadlineAt);
   const queryVector = queryVectors?.[0];
@@ -537,7 +577,9 @@ export async function searchProducts({
     VendorRead.find({ _id: { $in: vendorIds } }).select(
       "geo trustScore area state name phone company avatar",
     ),
-    Store.find({ vendorId: { $in: vendorIds } }).select("vendorId name whatsapp"),
+    Store.find({ vendorId: { $in: vendorIds } }).select(
+      "vendorId name whatsapp handle",
+    ),
   ]);
   const vendorById = new Map(vendors.map((v) => [String(v._id), v]));
   const storeByVendorId = new Map(stores.map((s) => [String(s.vendorId), s]));
@@ -553,6 +595,9 @@ export async function searchProducts({
       quoteOnRequest: product.quoteOnRequest === true,
       currency: product.currency,
       mainImageUrl: product.mainImageUrl,
+      thumbnailUrls: product.thumbnailUrls || [],
+      videoUrl: product.videoUrl ?? null,
+      storeHandle: store?.handle ?? null,
       description: product.description ?? null,
       attributes: (product.attributes || []).map((a) => ({
         name: a.name,
@@ -605,7 +650,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       relevanceFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     recordActiveExposure(active);
@@ -636,7 +680,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       local,
       localFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -666,7 +709,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nearby,
       nearbyFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -701,7 +743,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       stateWide,
       stateFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -726,7 +767,6 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       nationwideFloor,
-      tieredQuery,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -790,7 +830,7 @@ export async function searchStores({
     },
   ]);
   if (!candidates.length) {
-    return { results: [], matchTier: null, externalSuggestions: null };
+    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null };
   }
 
   const vendorIds = [...new Set(candidates.map((c) => String(c.vendorId)))];
@@ -827,49 +867,72 @@ export async function searchStores({
 
   const hasLocation = typeof lat === "number" && typeof lng === "number";
 
+  // Accumulates each tier's "weak" (near-miss) candidates, in cascade
+  // priority order, so that if NO tier anywhere finds a genuine match, the
+  // CLOSEST tier's near-miss candidates can still be shown as a last resort
+  // before falling all the way to Google Places — found live: a vendor whose
+  // sectors named exactly what the buyer wanted ("Ushering Services") scored
+  // just under the eligibility floor in every tier (their own store bio
+  // never mentioned it, only the sectors tag did) and was silently dropped
+  // straight to generic external suggestions, even though the closest real
+  // Velte vendor for the request existed. applyMatchQuality is generic (not
+  // product-specific) — reused here so a near-floor store result is honestly
+  // tagged "similar", same distinction searchProducts already makes.
+  const weakByTier = [];
+  const tryTier = (tierCandidates, weakCandidates, tierFloor, matchTier) => {
+    if (weakCandidates.length) weakByTier.push({ matchTier, weakCandidates });
+    if (!tierCandidates.length) return null;
+    const { candidates: tiered, matchQuality } = applyMatchQuality(
+      tierCandidates,
+      tierFloor,
+    );
+    return { results: tiered.map(mapResult), matchTier, matchQuality };
+  };
+
   if (!hasLocation) {
-    const { candidates: nationwide } = await rankCandidates({
-      ...rankArgs,
-      weights: NATIONWIDE_WEIGHTS,
-    });
-    return {
-      results: nationwide.map(mapResult),
-      matchTier: nationwide.length ? "nationwide" : null,
-      externalSuggestions: null,
-    };
+    const {
+      candidates: nationwide,
+      weakCandidates: nationwideWeak,
+      relevanceFloor,
+    } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
+    const found = tryTier(nationwide, nationwideWeak, relevanceFloor, "nationwide");
+    if (found) return { ...found, externalSuggestions: null };
+    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null };
   }
 
   const locatedArgs = { ...rankArgs, lat, lng };
 
-  const { candidates: local } = await rankCandidates({
+  const {
+    candidates: local,
+    weakCandidates: localWeak,
+    relevanceFloor: localFloor,
+  } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= radiusKm,
     proximityReferenceKm: radiusKm,
   });
-  if (local.length) {
-    return {
-      results: local.map(mapResult),
-      matchTier: "local",
-      externalSuggestions: null,
-    };
-  }
+  let found = tryTier(local, localWeak, localFloor, "local");
+  if (found) return { ...found, externalSuggestions: null };
 
   const nearbyRadiusKm = radiusKm * NEARBY_RADIUS_MULTIPLIER;
-  const { candidates: nearby } = await rankCandidates({
+  const {
+    candidates: nearby,
+    weakCandidates: nearbyWeak,
+    relevanceFloor: nearbyFloor,
+  } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= nearbyRadiusKm,
     proximityReferenceKm: nearbyRadiusKm,
   });
-  if (nearby.length) {
-    return {
-      results: nearby.map(mapResult),
-      matchTier: "nearby",
-      externalSuggestions: null,
-    };
-  }
+  found = tryTier(nearby, nearbyWeak, nearbyFloor, "nearby");
+  if (found) return { ...found, externalSuggestions: null };
 
   const buyerState = await reverseGeocodeState(lat, lng);
-  const { candidates: stateWide } = buyerState
+  const {
+    candidates: stateWide,
+    weakCandidates: stateWideWeak,
+    relevanceFloor: stateFloor,
+  } = buyerState
     ? await rankCandidates({
         ...locatedArgs,
         geoFilter: (vendor) =>
@@ -877,23 +940,26 @@ export async function searchStores({
           vendor.state.toLowerCase() === buyerState.toLowerCase(),
         proximityReferenceKm: STATE_PROXIMITY_REFERENCE_KM,
       })
-    : { candidates: [] };
-  if (stateWide.length) {
-    return {
-      results: stateWide.map(mapResult),
-      matchTier: "state",
-      externalSuggestions: null,
-    };
-  }
+    : { candidates: [], weakCandidates: [], relevanceFloor: null };
+  found = tryTier(stateWide, stateWideWeak, stateFloor, "state");
+  if (found) return { ...found, externalSuggestions: null };
 
-  const { candidates: nationwide } = await rankCandidates({
-    ...rankArgs,
-    weights: NATIONWIDE_WEIGHTS,
-  });
-  if (nationwide.length) {
+  const {
+    candidates: nationwide,
+    weakCandidates: nationwideWeak,
+    relevanceFloor: nationwideFloor,
+  } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
+  found = tryTier(nationwide, nationwideWeak, nationwideFloor, "nationwide");
+  if (found) return { ...found, externalSuggestions: null };
+
+  // No tier anywhere found a genuine match — fall back to the closest tier
+  // that at least had a near-miss, before giving up to Google Places.
+  const weakFallback = weakByTier.find((w) => w.weakCandidates.length);
+  if (weakFallback) {
     return {
-      results: nationwide.map(mapResult),
-      matchTier: "nationwide",
+      results: weakFallback.weakCandidates.map(mapResult),
+      matchTier: weakFallback.matchTier,
+      matchQuality: "similar",
       externalSuggestions: null,
     };
   }
@@ -903,6 +969,7 @@ export async function searchStores({
   return {
     results: [],
     matchTier: null,
+    matchQuality: undefined,
     externalSuggestions,
   };
 }
