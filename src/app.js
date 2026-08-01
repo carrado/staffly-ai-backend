@@ -9,6 +9,7 @@ import mongoSanitize from "express-mongo-sanitize";
 import hpp from "hpp";
 import searchRoutes from "./routes/search.routes.js";
 import { errorHandler, notFound } from "./middleware/errorHandler.js";
+import { startKeepAlive } from "./initializers/keepAlive.js";
 
 const app = express();
 
@@ -85,4 +86,5 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 7100;
 app.listen(PORT, () => {
   console.log(`🚀 staffly-ai-backend running on port ${PORT} (${env})`);
+  startKeepAlive();
 });
