@@ -26,6 +26,7 @@ const vendorReadSchema = new mongoose.Schema(
     company: {
       name: { type: String },
     },
+    hiddenFromSearch: { type: Boolean, default: false },
   },
   { collection: "users", strict: false },
 );
