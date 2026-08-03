@@ -624,6 +624,10 @@ export async function searchProducts({
         score: { $meta: "vectorSearchScore" },
       },
     },
+    // Same post-vector-search filter pattern as the vendor hiddenFromSearch
+    // check below — a suspended listing (super admin panel) must not surface
+    // via AI/WhatsApp search even if it ranks well.
+    { $match: { isSuspended: { $ne: true } } },
   ]);
   if (!candidates.length) {
     return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null };

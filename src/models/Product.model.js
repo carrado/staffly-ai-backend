@@ -80,6 +80,12 @@ const productSchema = new mongoose.Schema(
     externalId: { type: String, default: null },
     syncedAt: { type: Date, default: null },
 
+    // Mirrors velte-backend's Product.model.js — set from the super admin
+    // panel. Must stay filtered out of searchProducts (retrieval.service.js)
+    // so a suspended listing can't surface via WhatsApp/AI search.
+    isSuspended: { type: Boolean, default: false },
+    suspensionReason: { type: String, default: null },
+
     embedding: { type: [Number], default: undefined, select: false },
     imageEmbedding: { type: [Number], default: undefined, select: false },
   },
