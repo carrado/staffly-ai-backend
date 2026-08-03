@@ -73,6 +73,13 @@ const NEARBY_RADIUS_MULTIPLIER = 3;
 // the reference distance proximity is normalized against instead.
 const STATE_PROXIMITY_REFERENCE_KM = 300;
 
+// Same idea as STATE_PROXIMITY_REFERENCE_KM, but for the "also available
+// further out" bonus bucket's own country-wide candidate pool (see
+// attachFurther) — roughly Nigeria's own north-south/east-west span, so
+// proximity still contributes to ranking within that pool instead of being
+// dropped entirely the way the genuine final "nationwide" tier drops it.
+const FURTHER_PROXIMITY_REFERENCE_KM = 1200;
+
 // Minimum semantic score a candidate needs to count as a real match. Two
 // separate constants: rerank scores (a calibrated relevance probability) and
 // raw Atlas vectorSearchScore (cosine similarity rescaled to 0-1) are
@@ -162,6 +169,56 @@ function recordActiveExposure(active) {
       categoryId: c.product.categoryId ?? null,
     })),
   );
+}
+
+// Store counterpart, added for searchStores' "also available further out"
+// bucket only (see pickFurtherResults/computeFurtherCap below) — stores have
+// no categoryId of their own, so every store exposure key collapses to
+// "vendorId|" (per-vendor, not per-category), same convention finalize()
+// already uses for products when categoryId happens to be null.
+function recordActiveStoreExposure(active) {
+  if (!active.length) return;
+  recordExposure(
+    active.map((c) => ({
+      vendorId: c.vendor._id,
+      categoryId: c.store.categoryId ?? null,
+    })),
+  );
+}
+
+// "Near you" vs "also available further out" sizing: the further bucket is
+// a bonus, never the main event — 1 extra when near-you is thin (1-2
+// results, where a single alternative doesn't crowd the page), 2 when
+// near-you already has a healthy set (3+), and never more than 2 regardless
+// of how large near-you gets.
+function computeFurtherCap(nearCount) {
+  if (nearCount <= 0) return 0;
+  return nearCount > 2 ? 2 : 1;
+}
+
+// Picks the further-out bonus slots from a wider tier's own already-ranked,
+// already-wallet-eligible candidate pool (see rankCandidates — wallet
+// filtering already happened before this pool exists). When more candidates
+// are competing for the 1-2 bonus slots than there is room for, apply the
+// same recent-exposure decay idea rankCandidates' own rotation uses for
+// products (see EXPOSURE_DECAY/fetchRecentExposure above) — a vendor who's
+// been winning this bonus slot constantly shouldn't always win it again.
+async function pickFurtherResults(pool, cap) {
+  if (!pool.length || cap <= 0) return [];
+  if (pool.length <= cap) return pool;
+
+  const exposureCounts = await fetchRecentExposure(
+    pool.map((c) => ({
+      vendorId: c.vendor._id,
+      categoryId: c.store.categoryId ?? null,
+    })),
+  );
+  const weights = pool.map((c) => {
+    const shownCount =
+      exposureCounts.get(exposureKey(c.vendor._id, c.store.categoryId ?? null)) ?? 0;
+    return c.score * EXPOSURE_DECAY ** shownCount;
+  });
+  return weightedSampleWithoutReplacement(pool, weights, cap);
 }
 
 function weightedSampleWithoutReplacement(items, weights, k) {
@@ -574,9 +631,10 @@ export async function searchProducts({
 
   const vendorIds = [...new Set(candidates.map((c) => String(c.vendorId)))];
   const [vendors, stores] = await Promise.all([
-    VendorRead.find({ _id: { $in: vendorIds } }).select(
-      "geo trustScore area state name phone company avatar",
-    ),
+    VendorRead.find({
+      _id: { $in: vendorIds },
+      hiddenFromSearch: { $ne: true },
+    }).select("geo trustScore area state name phone company avatar"),
     Store.find({ vendorId: { $in: vendorIds } }).select(
       "vendorId name whatsapp handle",
     ),
@@ -830,13 +888,14 @@ export async function searchStores({
     },
   ]);
   if (!candidates.length) {
-    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null };
+    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null, furtherResults: [] };
   }
 
   const vendorIds = [...new Set(candidates.map((c) => String(c.vendorId)))];
-  const vendors = await VendorRead.find({ _id: { $in: vendorIds } }).select(
-    "geo trustScore area state phone",
-  );
+  const vendors = await VendorRead.find({
+    _id: { $in: vendorIds },
+    hiddenFromSearch: { $ne: true },
+  }).select("geo trustScore area state phone");
   const vendorById = new Map(vendors.map((v) => [String(v._id), v]));
 
   const mapResult = ({ store, vendor, distanceKm, score }) => ({
@@ -889,6 +948,25 @@ export async function searchStores({
     return { results: tiered.map(mapResult), matchTier, matchQuality };
   };
 
+  // Attaches the "also available further out" bonus bucket once a tier has
+  // already answered — ALWAYS sourced from the nationwide pool, never just
+  // "one tier wider": the nearby tier's own radius (radiusKm × 3) is often
+  // still too tight, and the state tier's geoFilter excludes a different-
+  // state vendor outright no matter how close they are — nationwide is the
+  // only tier guaranteed to include every real candidate regardless of
+  // distance or state. Deduped against what's already in `found`, sized by
+  // computeFurtherCap. Fires its own recordActiveStoreExposure so the
+  // "cooling period" it's chosen under actually accumulates history for next
+  // time, same as products already do for their own rotation.
+  const attachFurther = async (found, widerPool) => {
+    const nearIds = new Set(found.results.map((r) => String(r.storeId)));
+    const deduped = widerPool.filter((c) => !nearIds.has(String(c.store._id)));
+    const cap = computeFurtherCap(found.results.length);
+    const further = await pickFurtherResults(deduped, cap);
+    recordActiveStoreExposure(further);
+    return { ...found, furtherResults: further.map(mapResult), externalSuggestions: null };
+  };
+
   if (!hasLocation) {
     const {
       candidates: nationwide,
@@ -896,8 +974,10 @@ export async function searchStores({
       relevanceFloor,
     } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
     const found = tryTier(nationwide, nationwideWeak, relevanceFloor, "nationwide");
-    if (found) return { ...found, externalSuggestions: null };
-    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null };
+    // Nationwide is the widest tier that exists — nothing wider to source a
+    // "further" bucket from.
+    if (found) return { ...found, furtherResults: [], externalSuggestions: null };
+    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null, furtherResults: [] };
   }
 
   const locatedArgs = { ...rankArgs, lat, lng };
@@ -912,7 +992,23 @@ export async function searchStores({
     proximityReferenceKm: radiusKm,
   });
   let found = tryTier(local, localWeak, localFloor, "local");
-  if (found) return { ...found, externalSuggestions: null };
+
+  // Country-wide pool for the "further" bonus bucket specifically — unlike
+  // nationwideLookup below (the genuine last-resort tier, which deliberately
+  // has no lat/lng — see its own comment), this one keeps real coordinates
+  // so distanceKm and proximity scoring both still work within it.
+  const furtherPoolLookup = () =>
+    rankCandidates({
+      ...locatedArgs,
+      geoFilter: () => true,
+      proximityReferenceKm: FURTHER_PROXIMITY_REFERENCE_KM,
+    });
+  const nationwideLookup = () => rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
+
+  if (found) {
+    const { candidates: furtherPool } = await furtherPoolLookup();
+    return attachFurther(found, furtherPool);
+  }
 
   const nearbyRadiusKm = radiusKm * NEARBY_RADIUS_MULTIPLIER;
   const {
@@ -925,7 +1021,11 @@ export async function searchStores({
     proximityReferenceKm: nearbyRadiusKm,
   });
   found = tryTier(nearby, nearbyWeak, nearbyFloor, "nearby");
-  if (found) return { ...found, externalSuggestions: null };
+
+  if (found) {
+    const { candidates: furtherPool } = await furtherPoolLookup();
+    return attachFurther(found, furtherPool);
+  }
 
   const buyerState = await reverseGeocodeState(lat, lng);
   const {
@@ -942,15 +1042,21 @@ export async function searchStores({
       })
     : { candidates: [], weakCandidates: [], relevanceFloor: null };
   found = tryTier(stateWide, stateWideWeak, stateFloor, "state");
-  if (found) return { ...found, externalSuggestions: null };
+
+  if (found) {
+    const { candidates: furtherPool } = await furtherPoolLookup();
+    return attachFurther(found, furtherPool);
+  }
 
   const {
     candidates: nationwide,
     weakCandidates: nationwideWeak,
     relevanceFloor: nationwideFloor,
-  } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
+  } = await nationwideLookup();
   found = tryTier(nationwide, nationwideWeak, nationwideFloor, "nationwide");
-  if (found) return { ...found, externalSuggestions: null };
+  // Nationwide is itself the further-source for every other tier — nothing
+  // wider exists to source a "further" bucket for nationwide's own matches.
+  if (found) return { ...found, furtherResults: [], externalSuggestions: null };
 
   // No tier anywhere found a genuine match — fall back to the closest tier
   // that at least had a near-miss, before giving up to Google Places.
@@ -961,6 +1067,7 @@ export async function searchStores({
       matchTier: weakFallback.matchTier,
       matchQuality: "similar",
       externalSuggestions: null,
+      furtherResults: [],
     };
   }
 
@@ -971,5 +1078,6 @@ export async function searchStores({
     matchTier: null,
     matchQuality: undefined,
     externalSuggestions,
+    furtherResults: [],
   };
 }

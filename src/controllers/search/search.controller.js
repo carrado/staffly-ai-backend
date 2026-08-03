@@ -74,7 +74,7 @@ export async function searchStores(req, res, next) {
       );
     }
 
-    const { results, matchTier, matchQuality, externalSuggestions } =
+    const { results, furtherResults, matchTier, matchQuality, externalSuggestions } =
       await findStores({
         queryText,
         lat: hasLat ? lat : undefined,
@@ -85,7 +85,7 @@ export async function searchStores(req, res, next) {
 
     res.json({
       success: true,
-      data: { results, matchTier, matchQuality, externalSuggestions },
+      data: { results, furtherResults, matchTier, matchQuality, externalSuggestions },
     });
   } catch (err) {
     next(err);
