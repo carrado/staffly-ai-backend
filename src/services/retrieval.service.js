@@ -899,9 +899,16 @@ export async function searchStores({
   const vendors = await VendorRead.find({
     _id: { $in: vendorIds },
     hiddenFromSearch: { $ne: true },
-  }).select("geo trustScore area state phone");
+  }).select("geo trustScore area state phone avatar");
   const vendorById = new Map(vendors.map((v) => [String(v._id), v]));
 
+  // avatar comes off the vendor's own user doc (VendorRead — see that
+  // model's own comment), gallery off the Store doc itself (kept in the
+  // aggregation output by the $project above, which only strips
+  // `embedding`) — same two sources the marketplace's VendorCard already
+  // reads (getVendorsPreview/getVendorsBrowse in velte-backend), so a
+  // search result vendor card can render the identical avatar + sliding
+  // cover instead of always falling back to placeholders.
   const mapResult = ({ store, vendor, distanceKm, score }) => ({
     storeId: store._id,
     vendorId: vendor._id,
@@ -914,6 +921,8 @@ export async function searchStores({
     state: vendor.state,
     distanceKm: distanceKm != null ? Math.round(distanceKm * 10) / 10 : null,
     score: Math.round(score * 1000) / 1000,
+    avatar: vendor.avatar ?? null,
+    gallery: store.gallery ?? [],
   });
 
   const rankArgs = {
