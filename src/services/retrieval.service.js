@@ -44,9 +44,10 @@ import { sectorKeywordsForLabels } from "../utils/sectorKeywords.js";
 const VECTOR_INDEX_NAME = "product_vector_index";
 const STORE_VECTOR_INDEX_NAME = "store_vector_index";
 
-// ₦400 per WhatsApp click-through — MUST match velte-backend's
-// wallet.controller.js LEAD_COST_KOBO exactly (see file header note above).
-const LEAD_COST_KOBO = Number(process.env.LEAD_COST_KOBO) || 40_000;
+// ₦500 per WhatsApp click-through (raised from ₦400) — MUST match
+// velte-backend's wallet.controller.js LEAD_COST_KOBO exactly (see file
+// header note above).
+const LEAD_COST_KOBO = Number(process.env.LEAD_COST_KOBO) || 50_000;
 
 const WEIGHTS = {
   semantic: 0.5,
