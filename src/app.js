@@ -8,6 +8,7 @@ import rateLimit from "express-rate-limit";
 import mongoSanitize from "express-mongo-sanitize";
 import hpp from "hpp";
 import searchRoutes from "./routes/search.routes.js";
+import internalRoutes from "./routes/internal.routes.js";
 import { errorHandler, notFound } from "./middleware/errorHandler.js";
 import { startKeepAlive } from "./initializers/keepAlive.js";
 
@@ -69,6 +70,7 @@ mongoose
   .catch((err) => console.error("❌ MongoDB connection error:", err.message));
 
 app.use("/api/search", searchRoutes);
+app.use("/api/internal", internalRoutes);
 
 app.get("/health", (req, res) => {
   res.json({
