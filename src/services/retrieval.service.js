@@ -25,9 +25,10 @@
 //     history).
 //  2. LEAD_COST_KOBO is read from process.env here instead of imported from
 //     velte-backend's wallet.controller.js (impossible across repos) — MUST
-//     be kept equal to velte-backend's own LEAD_COST_KOBO constant, or this
-//     filter and actual lead billing will disagree. Set the same value in
-//     both repos' env.
+//     be kept equal to velte-backend's own MIN_LEAD_COST_KOBO (the top
+//     tier's own rate — pricing is tiered there now, see its own comment
+//     below), or this eligibility filter and actual lead billing will
+//     disagree. Set the same value in both repos' env.
 
 import Product from "../models/Product.model.js";
 import Store from "../models/Store.model.js";
@@ -44,10 +45,16 @@ import { sectorKeywordsForLabels } from "../utils/sectorKeywords.js";
 const VECTOR_INDEX_NAME = "product_vector_index";
 const STORE_VECTOR_INDEX_NAME = "store_vector_index";
 
-// ₦500 per WhatsApp click-through (raised from ₦400) — MUST match
-// velte-backend's wallet.controller.js LEAD_COST_KOBO exactly (see file
-// header note above).
-const LEAD_COST_KOBO = Number(process.env.LEAD_COST_KOBO) || 50_000;
+// Per-lead pricing is tiered now in velte-backend (₦500–₦1,000 depending
+// on the vendor's own wallet balance — see that repo's utils/leadPricing.js)
+// — this env var mirrors only MIN_LEAD_COST_KOBO, the top (most expensive)
+// tier's own rate, since that's the one flat number search-time
+// eligibility filtering actually needs: a balance that clears it can
+// always afford AT LEAST one more lead, whatever tier it lands in (every
+// OTHER tier's own balance floor comfortably covers its own, cheaper
+// rate). MUST match velte-backend's own MIN_LEAD_COST_KOBO exactly (see
+// file header note above) — currently ₦1,000.
+const LEAD_COST_KOBO = Number(process.env.LEAD_COST_KOBO) || 100_000;
 
 const WEIGHTS = {
   semantic: 0.5,
