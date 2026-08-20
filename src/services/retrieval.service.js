@@ -331,17 +331,50 @@ function placesIncludedType(queryText) {
  * Velte-vendor geo tier has come up empty (or been fully wallet-filtered
  * out): real nearby businesses via Google Places. Best-effort: null on any
  * failure or nothing within radius.
+ *
+ * `lat`/`lng` can genuinely be absent here (a buyer who declined device
+ * location and named no place in their query) — found live: this used to
+ * mean the caller never even reached this function (retrieval.service.js's
+ * own `!hasLocation` branches returned straight to a dead end), and this
+ * function itself would have filtered out every result anyway (the
+ * haversine distance from an undefined coordinate is NaN, and NaN <=
+ * radiusKm is always false). Neither is correct — Google Places (via a
+ * country-qualified text query, no geographic bias — see
+ * searchNearbyBusinesses' own comment) is still a real, useful fallback
+ * with no buyer coordinate at all; there's just no meaningful "distance
+ * from the buyer" to attach to each result, so that field is omitted
+ * (`null`) instead of filtered on.
  */
 async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
+  const hasCoords = typeof lat === "number" && typeof lng === "number";
   const places = await searchNearbyBusinesses({
-    queryText,
+    // This app operates in Nigeria only today — with no buyer coordinate
+    // to bias toward, qualifying the text itself is what keeps results
+    // Nigeria-relevant instead of Places' own global default. Only
+    // appended when genuinely locationless; a real coordinate already
+    // scopes the search geographically, so adding this on top would just
+    // be noise there.
+    queryText: hasCoords ? queryText : `${queryText} Nigeria`,
     lat,
     lng,
     radiusKm,
     includedType: placesIncludedType(queryText),
   });
+  if (!places?.length) return null;
+
+  if (!hasCoords) {
+    return places.map((p) => ({
+      placeId: p.placeId,
+      name: p.name,
+      address: p.address,
+      lat: p.lat,
+      lng: p.lng,
+      distanceKm: null,
+    }));
+  }
+
   const externalSuggestions = places
-    ?.map((p) => ({
+    .map((p) => ({
       placeId: p.placeId,
       name: p.name,
       address: p.address,
@@ -351,7 +384,7 @@ async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
     }))
     .filter((p) => p.distanceKm <= radiusKm);
 
-  return externalSuggestions?.length ? externalSuggestions : null;
+  return externalSuggestions.length ? externalSuggestions : null;
 }
 
 /**
@@ -702,12 +735,25 @@ export async function searchProducts({
       weights: NATIONWIDE_WEIGHTS,
     });
     if (!nationwide.length) {
+      // Found live: this used to return straight to a dead end — no
+      // Velte vendor anywhere AND no location signal at all used to mean
+      // Google Places never even got a chance to run (see
+      // googlePlacesFallback's own comment on why it's still useful with
+      // no coordinate). Nationwide is the widest DB tier that exists, so
+      // once even that's empty, Places is the last real thing left to try
+      // before this is a genuine dead end.
+      const externalSuggestions = await googlePlacesFallback(
+        queryText,
+        lat,
+        lng,
+        radiusKm,
+      );
       return {
         results: [],
         weakResults: [],
         matchTier: null,
         matchQuality: undefined,
-        externalSuggestions: null,
+        externalSuggestions,
       };
     }
     const { candidates: tiered, matchQuality } = applyMatchQuality(
@@ -715,14 +761,30 @@ export async function searchProducts({
       relevanceFloor,
     );
     const active = splitExpired(tiered, queryText);
+    if (!active.length) {
+      // Same reasoning as the `!nationwide.length` branch above — every
+      // nationwide candidate that existed turned out to be expired
+      // inventory, so this is just as much a real dead end otherwise.
+      const externalSuggestions = await googlePlacesFallback(
+        queryText,
+        lat,
+        lng,
+        radiusKm,
+      );
+      return {
+        results: [],
+        weakResults: [],
+        matchTier: null,
+        matchQuality: undefined,
+        externalSuggestions,
+      };
+    }
     recordActiveExposure(active);
     return {
       results: active.map(mapResult),
-      weakResults: active.length
-        ? splitExpired(nationwideWeak, queryText).map(mapResult)
-        : [],
-      matchTier: active.length ? "nationwide" : null,
-      matchQuality: active.length ? matchQuality : undefined,
+      weakResults: splitExpired(nationwideWeak, queryText).map(mapResult),
+      matchTier: "nationwide",
+      matchQuality,
       externalSuggestions: null,
     };
   }
@@ -991,7 +1053,29 @@ export async function searchStores({
     // Nationwide is the widest tier that exists — nothing wider to source a
     // "further" bucket from.
     if (found) return { ...found, furtherResults: [], externalSuggestions: null };
-    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions: null, furtherResults: [] };
+    // No genuine match anywhere — same closest-near-miss-before-Places
+    // cascade the located branch below uses, then Google Places itself.
+    // Found live: this used to return straight to a dead end without ever
+    // trying Places at all once there was no coordinate to search around
+    // (see googlePlacesFallback's own comment on why it's still useful
+    // with no coordinate).
+    const weakFallback = weakByTier.find((w) => w.weakCandidates.length);
+    if (weakFallback) {
+      return {
+        results: weakFallback.weakCandidates.map(mapResult),
+        matchTier: weakFallback.matchTier,
+        matchQuality: "similar",
+        externalSuggestions: null,
+        furtherResults: [],
+      };
+    }
+    const externalSuggestions = await googlePlacesFallback(
+      queryText,
+      lat,
+      lng,
+      radiusKm,
+    );
+    return { results: [], matchTier: null, matchQuality: undefined, externalSuggestions, furtherResults: [] };
   }
 
   const locatedArgs = { ...rankArgs, lat, lng };
