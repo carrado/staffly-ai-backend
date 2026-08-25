@@ -36,6 +36,12 @@ app.use(
   }),
 );
 
+// Registered BEFORE the global 10kb parser so it wins for this path (the
+// global one skips a body that's already parsed): a conversation-turn
+// snapshot carries the turn's full result arrays (products, stores,
+// galleries — see the frontend's StoredSearchTurn) and routinely exceeds
+// 10kb. Still bounded — a snapshot is result cards, not uploads.
+app.use("/api/search/conversations", express.json({ limit: "300kb" }));
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 app.use(mongoSanitize());

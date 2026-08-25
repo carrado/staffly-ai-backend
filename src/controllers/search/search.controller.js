@@ -19,8 +19,16 @@ import RecruitmentLead from "../../models/RecruitmentLead.model.js";
 
 export async function searchProducts(req, res, next) {
   try {
-    const { queryText, lat, lng, radiusKm, limit, isImageQuery, imageUrl } =
-      req.body ?? {};
+    const {
+      queryText,
+      lat,
+      lng,
+      radiusKm,
+      limit,
+      isImageQuery,
+      imageUrl,
+      maxBudgetNaira,
+    } = req.body ?? {};
 
     if (typeof queryText !== "string" || !queryText.trim()) {
       throw new AppError("queryText is required.", 400);
@@ -45,9 +53,35 @@ export async function searchProducts(req, res, next) {
         imageUrl: typeof imageUrl === "string" ? imageUrl : undefined,
       });
 
+    // The buyer's stated budget as a HARD price filter (the frontend's
+    // searchProducts tool extracts it structurally — see its schema). A
+    // post-retrieval filter on purpose: retrieval.service's tier cascade
+    // stays untouched, and a range-priced listing passes on its MINIMUM
+    // price (a ₦150k–₦250k range fits a ₦200k budget — the low end is
+    // negotiable reality here). Quote-on-request listings pass too: their
+    // stored price is a placeholder 0, not a real number to compare, and
+    // hiding a vendor who'd happily quote within budget helps nobody.
+    // matchTier/matchQuality describe the SEARCH that ran and are left
+    // as-is even when this narrows the list.
+    const withinBudget = (r) =>
+      r.quoteOnRequest || typeof r.price !== "number" || r.price <= maxBudgetNaira;
+    const budgeted =
+      typeof maxBudgetNaira === "number" && maxBudgetNaira > 0
+        ? {
+            results: results.filter(withinBudget),
+            weakResults: weakResults.filter(withinBudget),
+          }
+        : { results, weakResults };
+
     res.json({
       success: true,
-      data: { results, weakResults, matchTier, matchQuality, externalSuggestions },
+      data: {
+        results: budgeted.results,
+        weakResults: budgeted.weakResults,
+        matchTier,
+        matchQuality,
+        externalSuggestions,
+      },
     });
   } catch (err) {
     next(err);
