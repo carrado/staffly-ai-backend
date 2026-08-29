@@ -107,4 +107,12 @@ const searchConversationSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
+// The chat-history list's exact query (2026-08-26): every conversation for
+// one buyer, newest first — see listConversations. The single-field buyerId
+// index above can find the buyer's documents but leaves the sort to be done
+// in memory over all of them, which is the wrong shape for the one query
+// the sidebar runs on every page load. Compound, in sort order, so the
+// index itself returns them already ordered.
+searchConversationSchema.index({ buyerId: 1, lastActiveAt: -1 });
+
 export default mongoose.model("SearchConversation", searchConversationSchema);

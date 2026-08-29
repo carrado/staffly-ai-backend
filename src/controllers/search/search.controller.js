@@ -28,6 +28,7 @@ export async function searchProducts(req, res, next) {
       isImageQuery,
       imageUrl,
       maxBudgetNaira,
+      includeNearbyBusinesses,
     } = req.body ?? {};
 
     if (typeof queryText !== "string" || !queryText.trim()) {
@@ -51,6 +52,11 @@ export async function searchProducts(req, res, next) {
         limit: typeof limit === "number" ? limit : undefined,
         isImageQuery: Boolean(isImageQuery),
         imageUrl: typeof imageUrl === "string" ? imageUrl : undefined,
+        // Product searches opt OUT of Google Places (2026-08-26) — see
+        // searchProducts' own comment in retrieval.service.js. Only an
+        // explicit `false` disables it, so an older client that never
+        // sends the field keeps the previous behavior.
+        includeNearbyBusinesses: includeNearbyBusinesses !== false,
       });
 
     // The buyer's stated budget as a HARD price filter (the frontend's
@@ -94,7 +100,8 @@ export async function searchProducts(req, res, next) {
 
 export async function searchStores(req, res, next) {
   try {
-    const { queryText, lat, lng, radiusKm, limit } = req.body ?? {};
+    const { queryText, lat, lng, radiusKm, limit, includeNearbyBusinesses } =
+      req.body ?? {};
 
     if (typeof queryText !== "string" || !queryText.trim()) {
       throw new AppError("queryText is required.", 400);
@@ -115,6 +122,8 @@ export async function searchStores(req, res, next) {
         lng: hasLng ? lng : undefined,
         radiusKm: typeof radiusKm === "number" ? radiusKm : undefined,
         limit: typeof limit === "number" ? limit : undefined,
+        // See searchProducts above — same opt-out, same default.
+        includeNearbyBusinesses: includeNearbyBusinesses !== false,
       });
 
     res.json({

@@ -9,6 +9,8 @@ import {
   appendTurn,
   getConversation,
   markHandoff,
+  listConversations,
+  claimConversations,
 } from "../controllers/search/conversations.controller.js";
 import { listCategorySchemas } from "../controllers/search/categorySchemas.controller.js";
 
@@ -26,8 +28,20 @@ router.get("/category-schemas", listCategorySchemas);
 
 // Persisted conversations + shopping task (Phase 1 of the frontend's
 // docs/velte-ai-search-flow-plan.md) — same public trust model as the
-// search endpoints above; ownership is the caller's own deviceId.
+// search endpoints above.
+//
+// Ownership was the caller's own deviceId alone until buyer chat history
+// (2026-08-26) widened it to "this device OR this signed-in buyer" (see
+// ownershipFilter), so an account's threads open on any browser they sign
+// into. deviceId is still required on every call and is still the only
+// owner an anonymous buyer ever has.
+//
+// The two literal paths MUST be declared before "/conversations/:id":
+// Express matches in order, and "claim" would otherwise be swallowed by the
+// :id route and fail as an invalid ObjectId.
 router.post("/conversations/ensure", ensureConversation);
+router.post("/conversations/claim", claimConversations);
+router.get("/conversations", listConversations);
 router.post("/conversations/:id/turns", appendTurn);
 router.post("/conversations/:id/handoff", markHandoff);
 router.get("/conversations/:id", getConversation);

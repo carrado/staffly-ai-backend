@@ -635,7 +635,18 @@ export async function searchProducts({
   limit = 20,
   isImageQuery = false,
   imageUrl,
+  // Google Places is a SERVICE-only fallback as of 2026-08-26 (the caller
+  // decides — see the frontend's allowsNearbyBusinesses). A buyer asking
+  // for an ITEM got a wall of shop addresses that had never been checked
+  // for stock, price or even relevance, so product searches now opt out
+  // and the Places request is skipped outright rather than made and
+  // discarded — this is a paid API. Defaults to true so any caller that
+  // doesn't know about the flag behaves exactly as before.
+  includeNearbyBusinesses = true,
 }) {
+  const placesFallback = (...args) =>
+    includeNearbyBusinesses ? googlePlacesFallback(...args) : null;
+
   const deadlineAt = Date.now() + SEARCH_DEADLINE_MS;
 
   const queryVectors = await embed([queryText], "query", deadlineAt);
@@ -749,7 +760,7 @@ export async function searchProducts({
       // no coordinate). Nationwide is the widest DB tier that exists, so
       // once even that's empty, Places is the last real thing left to try
       // before this is a genuine dead end.
-      const externalSuggestions = await googlePlacesFallback(
+      const externalSuggestions = await placesFallback(
         queryText,
         lat,
         lng,
@@ -772,7 +783,7 @@ export async function searchProducts({
       // Same reasoning as the `!nationwide.length` branch above — every
       // nationwide candidate that existed turned out to be expired
       // inventory, so this is just as much a real dead end otherwise.
-      const externalSuggestions = await googlePlacesFallback(
+      const externalSuggestions = await placesFallback(
         queryText,
         lat,
         lng,
@@ -914,7 +925,7 @@ export async function searchProducts({
   }
 
   // Tier 5: no Velte vendor matched at all.
-  const externalSuggestions = await googlePlacesFallback(queryText, lat, lng, radiusKm);
+  const externalSuggestions = await placesFallback(queryText, lat, lng, radiusKm);
   return {
     results: [],
     weakResults: [],
@@ -935,7 +946,18 @@ export async function searchStores({
   lng,
   radiusKm = 10,
   limit = 20,
+  // Google Places is a SERVICE-only fallback as of 2026-08-26 (the caller
+  // decides — see the frontend's allowsNearbyBusinesses). A buyer asking
+  // for an ITEM got a wall of shop addresses that had never been checked
+  // for stock, price or even relevance, so product searches now opt out
+  // and the Places request is skipped outright rather than made and
+  // discarded — this is a paid API. Defaults to true so any caller that
+  // doesn't know about the flag behaves exactly as before.
+  includeNearbyBusinesses = true,
 }) {
+  const placesFallback = (...args) =>
+    includeNearbyBusinesses ? googlePlacesFallback(...args) : null;
+
   const deadlineAt = Date.now() + SEARCH_DEADLINE_MS;
 
   const queryVectors = await embed([queryText], "query", deadlineAt);
@@ -1076,7 +1098,7 @@ export async function searchStores({
         furtherResults: [],
       };
     }
-    const externalSuggestions = await googlePlacesFallback(
+    const externalSuggestions = await placesFallback(
       queryText,
       lat,
       lng,
@@ -1176,7 +1198,7 @@ export async function searchStores({
     };
   }
 
-  const externalSuggestions = await googlePlacesFallback(queryText, lat, lng, radiusKm);
+  const externalSuggestions = await placesFallback(queryText, lat, lng, radiusKm);
 
   return {
     results: [],

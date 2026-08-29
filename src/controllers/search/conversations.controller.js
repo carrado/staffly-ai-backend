@@ -10,10 +10,20 @@ import SearchConversation from "../../models/SearchConversation.model.js";
 // unguessable per-browser UUID, required on every call and matched against
 // the stored document, same trust model the public pay-link ids use.
 
-// A conversation idle longer than this is finished, not resumable — ensure
-// starts a fresh one instead of appending a new need onto a day-old thread
-// (whose task/history would mislead the model), and GET refuses to
-// rehydrate it (the frontend clears its stored id and starts clean).
+// How long before a conversation's SHOPPING TASK is treated as finished.
+//
+// Reworded 2026-08-26 along with what it does. It used to mean the whole
+// conversation was finished: ensure abandoned a stale thread and started a
+// fresh one. That stopped being right once buyers could pick an old thread
+// out of their history and type into it — see ensureConversation for the
+// full reasoning. Now the thread always survives and only the task (the
+// goal sheet: budget, item term, products already shown) is cleared, since
+// that is the part that actually misleads a search made a day later.
+//
+// GET still refuses to rehydrate a stale thread on the mount-time path —
+// coming back tomorrow starts clean — unless the caller explicitly asks for
+// it with includeStale, which is what opening one from the history list
+// does.
 const STALE_MS = 24 * 60 * 60 * 1000;
 
 // Hard cap on stored turns per conversation ($slice) — a bounded document,
@@ -185,13 +195,59 @@ function requireDeviceId(value) {
   return value.trim();
 }
 
+// The signed-in buyer, when the caller had one. Never required and never
+// trusted from a browser: the frontend reads it from its own verified
+// buyer_auth_token session before calling this service (see its
+// buyerGuards.ts), exactly as it already does for ensure/append — this
+// service is only ever reachable server-side.
+function optionalBuyerId(value) {
+  if (typeof value !== "string" || !value.trim() || value.length > 100) {
+    return null;
+  }
+  return value.trim();
+}
+
+function requireBuyerId(value) {
+  const buyerId = optionalBuyerId(value);
+  if (!buyerId) throw new AppError("buyerId is required.", 400);
+  return buyerId;
+}
+
+// Ownership, widened for accounts (2026-08-26). The deviceId is still the
+// anonymous owner and still the only one an unauthenticated buyer has — but
+// a signed-in buyer must be able to open their own conversation from a
+// DIFFERENT browser than the one that created it, which is the entire point
+// of having an account. Matching either the device that made it or the
+// buyer it belongs to is what makes the history real rather than
+// per-device.
+//
+// Note this can only ever WIDEN access to a conversation the caller already
+// proves a claim on: buyerId arrives from a verified session, and a
+// conversation only carries one once a verified buyer was present on it.
+function ownershipFilter(deviceId, buyerId) {
+  return buyerId ? { $or: [{ deviceId }, { buyerId }] } : { deviceId };
+}
+
+// The list's title for one conversation: the buyer's own first message,
+// which is what they'd recognise it by. Mirrors buildHistory's own
+// convention for a bare photo turn rather than inventing a second one.
+function conversationTitle(conversation) {
+  const first = conversation.turns?.[0];
+  if (!first) return "New search";
+  const query = (first.query || "").trim();
+  if (!query) return "[sent a photo]";
+  return query.length > 80 ? `${query.slice(0, 79).trimEnd()}…` : query;
+}
+
 // ── POST /api/search/conversations/ensure ─────────────────────────────────
 // Load-or-create, called by the frontend's /api/search route at the start
 // of every turn: returns the conversation to append into plus the
-// model-facing text history rebuilt from its stored turns. A missing,
-// foreign (deviceId mismatch), or stale conversationId is never an error —
-// a fresh conversation is created instead, and the frontend just adopts
-// the new id from the turn's final event.
+// model-facing text history rebuilt from its stored turns. A missing or
+// foreign conversationId (owned by neither this device nor this buyer) is
+// never an error — a fresh conversation is created instead, and the
+// frontend just adopts the new id from the turn's final event.
+//
+// A STALE one is no longer replaced, only reset: see the block below.
 export async function ensureConversation(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.body?.deviceId);
@@ -203,15 +259,43 @@ export async function ensureConversation(req, res, next) {
     ) {
       const existing = await SearchConversation.findOne({
         _id: conversationId,
-        deviceId,
+        ...ownershipFilter(deviceId, optionalBuyerId(buyerId)),
       });
-      if (existing && !isStale(existing)) {
-        // Stamp the buyer id opportunistically — a buyer who verified via
-        // OTP mid-conversation ties their earlier anonymous turns to the
+      if (existing) {
+        // ── Stale means the GOAL SHEET is dead, not the thread ───────────
+        //
+        // Until 2026-08-26 a stale conversation was abandoned here and a
+        // fresh one created in its place. That was right when the only way
+        // back into a thread was "the tab you left open", and it is wrong
+        // now that a buyer can deliberately pick a week-old conversation
+        // out of their history: they would type into the thread on screen
+        // and the reply would land in a different one, leaving the visible
+        // conversation frozen and the new turn apparently lost.
+        //
+        // What staleness actually protects against is narrower than
+        // dropping the thread — it's the TASK: a day-old ₦700k ceiling, a
+        // remembered item term, a shownProductIds list, all silently
+        // narrowing a search the buyer means freshly. So that is what gets
+        // cleared, and only that. The transcript survives, because the
+        // buyer is looking at it and a follow-up like "do you have it in
+        // red?" means the item in front of them.
+        //
+        // The history the model sees survives too, deliberately: route.ts's
+        // own requestRelation classifier already decides per turn whether
+        // earlier turns apply ("new" drops them outright), so a second,
+        // blunter time-based rule here would only fight it.
+        const stale = isStale(existing);
+        let dirty = false;
+        if (stale && existing.task) {
+          existing.task = null;
+          dirty = true;
+        }
+
+        // Stamp the buyer id opportunistically — a buyer who signs in
+        // mid-conversation ties their earlier anonymous turns to the
         // account from here on. Location merges the same way (see
         // mergeBuyerLocation) so a position resolved mid-session is stored
         // as soon as it's known, not only at the end of the turn.
-        let dirty = false;
         if (typeof buyerId === "string" && buyerId && !existing.buyerId) {
           existing.buyerId = buyerId;
           dirty = true;
@@ -222,6 +306,13 @@ export async function ensureConversation(req, res, next) {
         );
         if (mergedLocation !== existing.buyerLocation) {
           existing.buyerLocation = mergedLocation;
+          dirty = true;
+        }
+        // Reviving a stale thread makes it current again — without this it
+        // would still read as stale on the next turn, and getConversation
+        // would keep refusing to rehydrate it after a refresh.
+        if (stale) {
+          existing.lastActiveAt = new Date();
           dirty = true;
         }
         if (dirty) await existing.save();
@@ -285,7 +376,7 @@ export async function appendTurn(req, res, next) {
 
     const conversation = await SearchConversation.findOne({
       _id: id,
-      deviceId,
+      ...ownershipFilter(deviceId, optionalBuyerId(buyerId)),
     });
     if (!conversation) {
       throw new AppError("Conversation not found.", 404);
@@ -338,6 +429,13 @@ export async function appendTurn(req, res, next) {
 export async function getConversation(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.query?.deviceId);
+    const buyerId = optionalBuyerId(req.query?.buyerId);
+    // Opening a thread deliberately picked from the history list, as
+    // opposed to the mount-time rehydrate of whichever conversation this
+    // browser was last in. The distinction matters because of staleness
+    // below; default false keeps every existing caller's behaviour
+    // byte-for-byte.
+    const includeStale = req.query?.includeStale === "true";
     const { id } = req.params;
 
     if (!mongoose.isValidObjectId(id)) {
@@ -345,9 +443,14 @@ export async function getConversation(req, res, next) {
     }
     const conversation = await SearchConversation.findOne({
       _id: id,
-      deviceId,
+      ...ownershipFilter(deviceId, buyerId),
     });
-    if (!conversation || isStale(conversation)) {
+    // The staleness refusal exists for the REHYDRATE path: a day-old thread
+    // resumed silently would carry its own task/goal sheet into a new need,
+    // so the frontend is told 404, clears its stored id and starts clean.
+    // That is exactly wrong for a history list, where old threads are the
+    // whole point — hence the opt-in rather than dropping the rule.
+    if (!conversation || (isStale(conversation) && !includeStale)) {
       throw new AppError("Conversation not found.", 404);
     }
 
@@ -377,6 +480,7 @@ export async function getConversation(req, res, next) {
 export async function markHandoff(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.body?.deviceId);
+    const buyerId = optionalBuyerId(req.body?.buyerId);
     const { id } = req.params;
 
     if (!mongoose.isValidObjectId(id)) {
@@ -384,7 +488,7 @@ export async function markHandoff(req, res, next) {
     }
     const conversation = await SearchConversation.findOne({
       _id: id,
-      deviceId,
+      ...ownershipFilter(deviceId, buyerId),
     });
     if (!conversation) {
       throw new AppError("Conversation not found.", 404);
@@ -396,6 +500,110 @@ export async function markHandoff(req, res, next) {
       await conversation.save();
     }
     res.json({ success: true, data: { conversationId: id } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /api/search/conversations?buyerId=&limit=&before= ─────────────────
+// The chat-history list (2026-08-26): every conversation belonging to a
+// signed-in buyer, newest first, for the sidebar they pick from. Opening one
+// is still GET /conversations/:id — this only produces the row.
+//
+// Deliberately does NOT return turns. A stored turn carries the entire
+// denormalised result set it rendered (products, stores, services, images —
+// see the frontend's buildTurnSnapshot), so returning even a page of full
+// conversations would be megabytes to draw a list of titles. The projection
+// below pulls `turns.query` and nothing else: one short string per turn
+// instead of the whole snapshot, which is enough for both the title and the
+// count.
+//
+// Staleness is not applied here on purpose — a history that hides
+// everything older than a day is not a history. See getConversation's own
+// note on the two different jobs that rule does.
+export async function listConversations(req, res, next) {
+  try {
+    const buyerId = requireBuyerId(req.query?.buyerId);
+
+    const rawLimit = Number.parseInt(req.query?.limit ?? "", 10);
+    const limit =
+      Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 30;
+
+    // Keyset pagination on the same field the sort uses, rather than skip:
+    // a buyer scrolling their history while a new turn lands would silently
+    // skip or repeat a row under an offset, and there is no cheap fix for
+    // that with skip. `before` is the previous page's last lastActiveAt.
+    const filter = {
+      buyerId,
+      // A conversation with no completed turn is one `ensure` created for a
+      // turn that never finished — a real row in the database, but nothing a
+      // buyer would recognise as a conversation.
+      "turns.0": { $exists: true },
+    };
+    const before = req.query?.before ? new Date(req.query.before) : null;
+    if (before && !Number.isNaN(before.getTime())) {
+      filter.lastActiveAt = { $lt: before };
+    }
+
+    const conversations = await SearchConversation.find(filter)
+      .select("turns.query task.status lastActiveAt createdAt")
+      .sort({ lastActiveAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      data: {
+        conversations: conversations.map((c) => ({
+          conversationId: c._id.toString(),
+          title: conversationTitle(c),
+          turnCount: c.turns?.length ?? 0,
+          status: c.task?.status ?? null,
+          lastActiveAt: c.lastActiveAt.toISOString(),
+          createdAt: c.createdAt ? c.createdAt.toISOString() : null,
+        })),
+        // Null when this page didn't fill, so the client knows to stop
+        // rather than issuing one more request that returns nothing.
+        nextBefore:
+          conversations.length === limit
+            ? conversations[conversations.length - 1].lastActiveAt.toISOString()
+            : null,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/search/conversations/claim ──────────────────────────────────
+// Called once, right after a buyer signs in: attaches every conversation
+// this browser already had to the account.
+//
+// Why it's needed even though ensure/append already stamp buyerId: those
+// stamp only the conversation being actively worked on, and only from that
+// moment forward. A buyer who searched anonymously three times and THEN
+// signed in would see an empty history and quite reasonably conclude the
+// feature is broken — their threads exist, they just carry no buyerId yet.
+//
+// Only claims conversations that have no buyerId at all. One that already
+// belongs to a different account is never reassigned: shared or handed-down
+// devices are ordinary in this market, and silently moving someone else's
+// conversation history into whoever signed in next would be the worst
+// possible failure here.
+export async function claimConversations(req, res, next) {
+  try {
+    const deviceId = requireDeviceId(req.body?.deviceId);
+    const buyerId = requireBuyerId(req.body?.buyerId);
+
+    const result = await SearchConversation.updateMany(
+      { deviceId, $or: [{ buyerId: null }, { buyerId: { $exists: false } }] },
+      { $set: { buyerId } },
+    );
+
+    res.json({
+      success: true,
+      data: { claimed: result.modifiedCount ?? 0 },
+    });
   } catch (err) {
     next(err);
   }
