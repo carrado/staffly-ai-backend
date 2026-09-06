@@ -4,16 +4,22 @@
 // ever called by this repo's retrieval.service.js.
 //
 // FieldMask requests places.id, places.displayName, places.formattedAddress,
-// places.location and nothing else. displayName/formattedAddress/location
-// together stay in the Text Search "Pro" SKU ($32/1,000 requests). `id` is
-// free to add alongside them: it lives in the cheapest "IDs Only" SKU, and a
-// request bills at the highest tier any of its requested fields belongs to.
-// It's needed as a stable dedupe key for recruitment-lead logging. Adding
-// any Enterprise-tier field (ratings, reviews, photos, phone number) would
-// push the cost into a pricier tier — deliberately not requested.
+// places.location, places.businessStatus and nothing else.
+// displayName/formattedAddress/location already put the request in the Text
+// Search "Pro" SKU ($32/1,000 requests) — `id` is free alongside them (the
+// cheapest "IDs Only" SKU), and so is `businessStatus` (2026-09-06): it's
+// also Pro-tier for Text Search, and billing is at the HIGHEST tier any
+// requested field belongs to, not per field — so adding it costs nothing on
+// top of what Pro already costs. `id` is needed as a stable dedupe key for
+// recruitment-lead logging; `businessStatus` is what makes a "real, current"
+// result actually current — without it, a business Google itself has marked
+// permanently closed was surfaced exactly like a live one. Adding any
+// Enterprise-tier field (ratings, reviews, photos, phone number) would push
+// the cost into a pricier tier — deliberately still not requested.
 
 const PLACES_SEARCH_TEXT_URL = "https://places.googleapis.com/v1/places:searchText";
-const FIELD_MASK = "places.id,places.displayName,places.formattedAddress,places.location";
+const FIELD_MASK =
+  "places.id,places.displayName,places.formattedAddress,places.location,places.businessStatus";
 const TIMEOUT_MS = 6000;
 
 /**
@@ -94,6 +100,7 @@ export async function searchNearbyBusinesses({
         address: place.formattedAddress || null,
         lat: place.location?.latitude,
         lng: place.location?.longitude,
+        businessStatus: place.businessStatus || null,
       }))
       .filter(
         (p) =>
@@ -101,8 +108,16 @@ export async function searchNearbyBusinesses({
           p.name &&
           p.address &&
           typeof p.lat === "number" &&
-          typeof p.lng === "number",
-      );
+          typeof p.lng === "number" &&
+          // Drop only what Google itself has explicitly flagged closed.
+          // Fail OPEN on a missing/unrecognised status — Google doesn't
+          // guarantee this field is populated for every place, and an
+          // absent status is not evidence of anything, let alone evidence
+          // strong enough to hide a real business from a buyer.
+          p.businessStatus !== "CLOSED_PERMANENTLY" &&
+          p.businessStatus !== "CLOSED_TEMPORARILY",
+      )
+      .map(({ businessStatus, ...rest }) => rest);
   } catch (err) {
     console.error("[googlePlaces] searchNearbyBusinesses failed:", err.message);
     return null;
