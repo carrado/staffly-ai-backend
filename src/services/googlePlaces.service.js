@@ -4,22 +4,30 @@
 // ever called by this repo's retrieval.service.js.
 //
 // FieldMask requests places.id, places.displayName, places.formattedAddress,
-// places.location, places.businessStatus and nothing else.
-// displayName/formattedAddress/location already put the request in the Text
-// Search "Pro" SKU ($32/1,000 requests) — `id` is free alongside them (the
-// cheapest "IDs Only" SKU), and so is `businessStatus` (2026-09-06): it's
-// also Pro-tier for Text Search, and billing is at the HIGHEST tier any
-// requested field belongs to, not per field — so adding it costs nothing on
-// top of what Pro already costs. `id` is needed as a stable dedupe key for
-// recruitment-lead logging; `businessStatus` is what makes a "real, current"
-// result actually current — without it, a business Google itself has marked
-// permanently closed was surfaced exactly like a live one. Adding any
-// Enterprise-tier field (ratings, reviews, photos, phone number) would push
-// the cost into a pricier tier — deliberately still not requested.
+// places.location, places.businessStatus, places.nationalPhoneNumber, and
+// places.websiteUri. displayName/formattedAddress/location/businessStatus
+// are Text Search "Pro" SKU ($32/1,000 requests); `id` is free alongside
+// them (the cheapest "IDs Only" SKU).
+//
+// nationalPhoneNumber and websiteUri (2026-09-17, explicit request) both
+// sit in the Enterprise SKU one tier up ($35/1,000 requests) — confirmed
+// against Google's own Place Data Fields table, not assumed from the
+// Contact/Atmosphere split older API versions used. Billing is at the
+// HIGHEST tier any requested field belongs to, not per field, so adding
+// BOTH together costs exactly the same as adding either alone: this is a
+// flat $32→$35/1,000 change, not $32→$35 twice. Still well short of the
+// pricier "Enterprise + Atmosphere" tier ($40/1,000), which is reviews/
+// photos/ratings — none of which are requested here. Only ever spent on a
+// genuine Velte dead end (Tier 5, the last resort), so real call volume is
+// a small fraction of total searches to begin with.
+//
+// Both are OPTIONAL on a real Google listing — many small businesses have
+// neither on file — so the mapping below keeps them `null` rather than
+// omitting the key, same convention as `distanceKm`.
 
 const PLACES_SEARCH_TEXT_URL = "https://places.googleapis.com/v1/places:searchText";
 const FIELD_MASK =
-  "places.id,places.displayName,places.formattedAddress,places.location,places.businessStatus";
+  "places.id,places.displayName,places.formattedAddress,places.location,places.businessStatus,places.nationalPhoneNumber,places.websiteUri";
 const TIMEOUT_MS = 6000;
 
 /**
@@ -101,6 +109,10 @@ export async function searchNearbyBusinesses({
         lat: place.location?.latitude,
         lng: place.location?.longitude,
         businessStatus: place.businessStatus || null,
+        // Optional on a real listing — null, never omitted, when Google
+        // has neither on file (see this file's own header comment).
+        phone: place.nationalPhoneNumber || null,
+        website: place.websiteUri || null,
       }))
       .filter(
         (p) =>

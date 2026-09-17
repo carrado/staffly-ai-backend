@@ -88,6 +88,16 @@ const STATE_PROXIMITY_REFERENCE_KM = 300;
 // dropped entirely the way the genuine final "nationwide" tier drops it.
 const FURTHER_PROXIMITY_REFERENCE_KM = 1200;
 
+// How much a matching stated attribute (2026-09-15) can nudge a candidate's
+// final score, additive on top of the semantic/proximity/trust weighted sum
+// — see rankCandidates' own comment on why additive, not a fourth weighted
+// factor. Small: attributeMatchScore tops out at 1.0 (every stated word
+// found), so the maximum possible nudge is a tenth of a point on a score
+// whose semantic component alone can swing by 0.5 — enough to break a tie
+// between two otherwise-similar real matches, never enough to seat a worse
+// match ahead of a better one.
+const ATTRIBUTE_BOOST_WEIGHT = 0.1;
+
 // Minimum semantic score a candidate needs to count as a real match. Two
 // separate constants: rerank scores (a calibrated relevance probability) and
 // raw Atlas vectorSearchScore (cosine similarity rescaled to 0-1) are
@@ -275,6 +285,43 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
+// A small, local, non-stemming tokenizer — same precedent as every other
+// independent tokenize copy in this codebase (the frontend's productTerm.ts
+// has its own; this isn't worth a shared package just for a ranking boost).
+// Strips bare intensifiers ("good", "nice") on top of ordinary stopwords —
+// they carry no filterable trait of their own (see searchProductsTool.ts's
+// own schema note on the same distinction), so counting them toward the
+// boost would reward a listing for matching a word that names nothing.
+const ATTRIBUTE_STOPWORDS = new Set([
+  "a", "an", "the", "for", "of", "and", "or", "to", "in", "on", "with",
+  "good", "nice", "great", "quality", "very",
+]);
+
+function attributeWords(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !ATTRIBUTE_STOPWORDS.has(w));
+}
+
+/**
+ * How much of a listing's own text (name + attributes + description, via
+ * the same embeddingTextFn rankCandidates already computes for rerank)
+ * overlaps the buyer's stated attributes — 0 (nothing found) to 1 (every
+ * stated word found). A ranking SIGNAL, never a filter: a listing that
+ * scores 0 here is still shown if it's a real match on the product itself,
+ * see rankCandidates' own comment on why this is additive, not a gate.
+ */
+function attributeMatchScore(attributesText, candidateText) {
+  if (!attributesText) return 0;
+  const words = attributeWords(attributesText);
+  if (!words.length) return 0;
+  const haystack = candidateText.toLowerCase();
+  const matched = words.filter((w) => haystack.includes(w)).length;
+  return matched / words.length;
+}
+
 function productEmbeddingText(product) {
   const attrs = (product.attributes || [])
     .map((a) => `${a.name}: ${a.value}`)
@@ -377,6 +424,10 @@ async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
       lat: p.lat,
       lng: p.lng,
       distanceKm: null,
+      // Optional on a real listing (2026-09-17) — see googlePlaces.service.js's
+      // own header for the pricing tier this adds.
+      phone: p.phone,
+      website: p.website,
     }));
   }
 
@@ -388,6 +439,8 @@ async function googlePlacesFallback(queryText, lat, lng, radiusKm) {
       lat: p.lat,
       lng: p.lng,
       distanceKm: Math.round(haversineKm([lng, lat], [p.lng, p.lat]) * 10) / 10,
+      phone: p.phone,
+      website: p.website,
     }))
     .filter((p) => p.distanceKm <= radiusKm);
 
@@ -486,6 +539,12 @@ async function rankCandidates({
   entityKey,
   embeddingTextFn,
   queryText,
+  // Buyer-stated qualities (2026-09-15) — deliberately NOT folded into
+  // `queryText` before this point (see searchProducts' own comment on
+  // why). `undefined` for every store search and for a product search
+  // with none stated — attributeMatchScore below is a no-op either way,
+  // so this needs no entityKey check of its own.
+  attributesText,
   lat,
   lng,
   geoFilter,
@@ -537,7 +596,14 @@ async function rankCandidates({
           ? cosineSimilarity(queryImageVector, imageEmbedding)
           : null;
       return { ...c, visualScore };
-    });
+    })
+    .map((c) => ({
+      ...c,
+      attributeBoost: attributeMatchScore(
+        attributesText,
+        embeddingTextFn(c[entityKey]),
+      ),
+    }));
 
   const isEligible = (c) =>
     c.textScore >= relevanceFloor ||
@@ -555,15 +621,27 @@ async function rankCandidates({
       })
       .map((c) => {
         const trustComponent = (c.vendor.trustScore ?? 0) / 100;
+        // Additive, not blended into the weighted sum below — a boost, not
+        // a fourth ranking factor competing for a share of semantic/
+        // proximity/trust's own weights. Small on purpose
+        // (ATTRIBUTE_BOOST_WEIGHT): this nudges an already-eligible
+        // candidate up or down among its peers, never enough to outrank a
+        // genuinely closer or more relevant one just because it happened
+        // to mention a color the buyer named.
+        const attributeBonus = ATTRIBUTE_BOOST_WEIGHT * c.attributeBoost;
         if (locationless) {
-          const score = weights.semantic * c.semanticScore + weights.trust * trustComponent;
+          const score =
+            weights.semantic * c.semanticScore +
+            weights.trust * trustComponent +
+            attributeBonus;
           return { ...c, score };
         }
         const proximityScore = Math.max(0, 1 - c.distanceKm / proximityReferenceKm);
         const score =
           weights.semantic * c.semanticScore +
           weights.proximity * proximityScore +
-          weights.trust * trustComponent;
+          weights.trust * trustComponent +
+          attributeBonus;
         return { ...c, score };
       })
       .sort((a, b) => b.score - a.score);
@@ -626,9 +704,17 @@ function applyMatchQuality(tierCandidates, relevanceFloor) {
  * — omit both for a "nationwide" search. Geo tiers cascade: local → nearby
  * → state → nationwide → Tier 5 (Google Places, only when a location IS
  * known and Tiers 1-4 are all empty).
+ *
+ * `attributesText` (2026-09-15) — qualities the buyer stated (a camera, a
+ * storage size, a color) as their own short comma-joined string, kept OUT
+ * of `queryText` on purpose. See rankCandidates' own comment on why: this
+ * only ever nudges ranking among listings that already qualify as a real
+ * match on `queryText` alone, never a reason to drop one that qualifies but
+ * doesn't happen to mention the stated attributes.
  */
 export async function searchProducts({
   queryText,
+  attributesText,
   lat,
   lng,
   radiusKm = 10,
@@ -733,6 +819,7 @@ export async function searchProducts({
     entityKey: "product",
     embeddingTextFn: productEmbeddingText,
     queryText,
+    attributesText,
     rerankFloor: RERANK_FLOOR,
     rawScoreFloor: RAW_SCORE_FLOOR,
     limit,

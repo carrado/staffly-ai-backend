@@ -3,6 +3,7 @@ import {
   searchProducts,
   searchStores,
   logSearch,
+  logInstagramReachOut,
 } from "../controllers/search/search.controller.js";
 import {
   ensureConversation,
@@ -11,6 +12,7 @@ import {
   markHandoff,
   listConversations,
   claimConversations,
+  deleteConversation,
 } from "../controllers/search/conversations.controller.js";
 import { listCategorySchemas } from "../controllers/search/categorySchemas.controller.js";
 
@@ -20,6 +22,8 @@ const router = express.Router();
 router.post("/products", searchProducts);
 router.post("/stores", searchStores);
 router.post("/log", logSearch);
+router.post("/log/instagram-reachout", logInstagramReachOut);
+router.post("/log/instagram-reachout", logInstagramReachOut);
 
 // Clarifying-question schema overrides (Phase 2 of the frontend's
 // docs/velte-ai-search-flow-plan.md) — read-only here; writes live behind
@@ -45,6 +49,7 @@ router.get("/conversations", listConversations);
 router.post("/conversations/:id/turns", appendTurn);
 router.post("/conversations/:id/handoff", markHandoff);
 router.get("/conversations/:id", getConversation);
+router.delete("/conversations/:id", deleteConversation);
 
 // Deliberately NOT here: POST /lead (wallet billing on "Chat on WhatsApp").
 // That stays mounted at velte-backend's /api/search/lead — the frontend

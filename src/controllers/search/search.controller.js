@@ -21,6 +21,7 @@ export async function searchProducts(req, res, next) {
   try {
     const {
       queryText,
+      attributesText,
       lat,
       lng,
       radiusKm,
@@ -46,6 +47,17 @@ export async function searchProducts(req, res, next) {
     const { results, weakResults, matchTier, matchQuality, externalSuggestions } =
       await findProducts({
         queryText,
+        // The buyer's stated qualities (2026-09-15, explicit request) — a
+        // SOFT ranking boost only, applied after a listing already
+        // qualifies as a real match on `queryText` alone. See
+        // retrieval.service.js's searchProducts/rankCandidates for the
+        // full reasoning: this used to be merged straight into queryText
+        // itself, which let a rerank pass mark down a genuinely good match
+        // whose own listing text just didn't happen to echo those words.
+        attributesText:
+          typeof attributesText === "string" && attributesText.trim()
+            ? attributesText
+            : undefined,
         lat: hasLat ? lat : undefined,
         lng: hasLng ? lng : undefined,
         radiusKm: typeof radiusKm === "number" ? radiusKm : undefined,
@@ -143,11 +155,33 @@ export async function searchStores(req, res, next) {
 // business nearby — that's a recruitment opportunity. A turn with nothing to
 // report writes nothing at all.
 
+// Instagram leads dedupe on a synthetic id in the same `placeId` slot — see
+// the model's own comment. Lower-cased: Instagram handles are
+// case-insensitive, and Google returns whichever casing the page uses.
+function instagramPlaceId(handle) {
+  return `instagram:${handle.trim().toLowerCase()}`;
+}
+
+function matchedQueryPush(matchedQuery) {
+  return matchedQuery
+    ? { $push: { matchedQueries: { $each: [matchedQuery], $slice: -20 } } }
+    : {};
+}
+
 export async function logSearch(req, res, next) {
   try {
-    const { rawQuery, parsedProduct, externalStoreSuggestions } = req.body ?? {};
+    const {
+      rawQuery,
+      parsedProduct,
+      externalStoreSuggestions,
+      instagramLeads,
+    } = req.body ?? {};
 
-    if (!Array.isArray(externalStoreSuggestions) || !externalStoreSuggestions.length) {
+    const places = Array.isArray(externalStoreSuggestions)
+      ? externalStoreSuggestions
+      : [];
+    const instagram = Array.isArray(instagramLeads) ? instagramLeads : [];
+    if (!places.length && !instagram.length) {
       res.json({ success: true });
       return;
     }
@@ -156,8 +190,40 @@ export async function logSearch(req, res, next) {
       (typeof parsedProduct === "string" && parsedProduct) ||
       (typeof rawQuery === "string" ? rawQuery : null);
 
+    // Instagram leads SURFACED this turn (velte frontend, 2026-09-16) — the
+    // same "shown to a buyer" signal Places rows get (hitCount), so the
+    // recruitment queue sees both tiers. A buyer actually tapping Message
+    // is logged separately, and more strongly, by logInstagramReachOut.
     await Promise.all(
-      externalStoreSuggestions.map((s) => {
+      instagram.map((lead) => {
+        if (
+          !lead ||
+          typeof lead.handle !== "string" ||
+          !lead.handle.trim() ||
+          typeof lead.title !== "string"
+        ) {
+          return null;
+        }
+        return RecruitmentLead.findOneAndUpdate(
+          { placeId: instagramPlaceId(lead.handle) },
+          {
+            $set: {
+              source: "instagram",
+              name: lead.title,
+              instagramHandle: lead.handle.trim(),
+              profileUrl: typeof lead.url === "string" ? lead.url : null,
+              lastSeenAt: new Date(),
+            },
+            $inc: { hitCount: 1 },
+            ...matchedQueryPush(matchedQuery),
+          },
+          { upsert: true },
+        );
+      }),
+    );
+
+    await Promise.all(
+      places.map((s) => {
         if (
           !s ||
           typeof s.placeId !== "string" ||
@@ -178,13 +244,69 @@ export async function logSearch(req, res, next) {
               lastSeenAt: new Date(),
             },
             $inc: { hitCount: 1 },
-            ...(matchedQuery
-              ? { $push: { matchedQueries: { $each: [matchedQuery], $slice: -20 } } }
-              : {}),
+            ...matchedQueryPush(matchedQuery),
           },
           { upsert: true },
         );
       }),
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/search/log/instagram-reachout ───────────────────────────────
+// Public — fired as a best-effort beacon from the frontend's Instagram lead
+// card the moment a buyer taps "Message on Instagram" (velte frontend,
+// 2026-09-16). This is the strongest recruitment signal in the collection:
+// the buyer was just handed a Velte intro (with the join link) to paste into
+// that business's DMs, so the business is about to hear about Velte from a
+// real customer. Upserts the same row logSearch would have (the lead may
+// never have been logged as surfaced — a rehydrated turn from before that
+// shipped, or a lost beacon), and bumps `buyerReachOuts` rather than
+// `hitCount`, so "shown N times" and "actually contacted N times" stay
+// distinct. Never fails the buyer — the card has already opened the DM
+// thread by the time this lands.
+export async function logInstagramReachOut(req, res, next) {
+  try {
+    const { handle, url, title, need, location } = req.body ?? {};
+    if (typeof handle !== "string" || !handle.trim()) {
+      res.status(400).json({ success: false, message: "handle is required." });
+      return;
+    }
+    const matchedQuery =
+      typeof need === "string" && need.trim()
+        ? typeof location === "string" && location.trim()
+          ? `${need.trim()} in ${location.trim()}`
+          : need.trim()
+        : null;
+
+    await RecruitmentLead.findOneAndUpdate(
+      { placeId: instagramPlaceId(handle) },
+      {
+        $set: {
+          source: "instagram",
+          instagramHandle: handle.trim(),
+          ...(typeof title === "string" && title.trim()
+            ? { name: title.trim() }
+            : {}),
+          ...(typeof url === "string" && url ? { profileUrl: url } : {}),
+          lastReachOutAt: new Date(),
+          lastSeenAt: new Date(),
+        },
+        // `name` is required on insert; a reach-out for a lead never logged
+        // as surfaced (and sent without a title) still needs SOMETHING.
+        $setOnInsert: {
+          ...(typeof title === "string" && title.trim()
+            ? {}
+            : { name: `@${handle.trim()}` }),
+        },
+        $inc: { buyerReachOuts: 1 },
+        ...matchedQueryPush(matchedQuery),
+      },
+      { upsert: true },
     );
 
     res.json({ success: true });

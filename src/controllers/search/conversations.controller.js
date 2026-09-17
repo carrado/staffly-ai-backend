@@ -55,6 +55,19 @@ function buildHistory(conversation) {
         : turn.reply,
       awaitingBuyerRequestReply: turn.awaitingBuyerRequestReply,
       buyerRequestMatchQuery: turn.buyerRequestMatchQuery,
+      awaitingComparisonPurchaseReply: turn.awaitingComparisonPurchaseReply,
+      comparisonPickItem: turn.comparisonPickItem,
+      comparisonOptions:
+        Array.isArray(turn.comparisonOptions) && turn.comparisonOptions.length
+          ? turn.comparisonOptions
+          : null,
+      awaitingVendorSearchOffer: turn.awaitingVendorSearchOffer,
+      vendorSearchMatchQuery: turn.vendorSearchMatchQuery,
+      isGuidanceReply: turn.isGuidanceReply,
+      awaitingShoppingPlanReply: turn.awaitingShoppingPlanReply,
+      askedLocation: turn.askedLocation,
+      askedBudget: turn.askedBudget,
+      askedShoppingListDetails: turn.askedShoppingListDetails,
     },
   ]);
 }
@@ -195,17 +208,19 @@ function requireDeviceId(value) {
   return value.trim();
 }
 
-// The signed-in buyer, when the caller had one. Never required and never
-// trusted from a browser: the frontend reads it from its own verified
-// buyer_auth_token session before calling this service (see its
-// buyerGuards.ts), exactly as it already does for ensure/append — this
-// service is only ever reachable server-side.
-function optionalBuyerId(value) {
+// The signed-in buyer (or vendor), when the caller had one. Never required
+// and never trusted from a browser: the frontend reads it from its own
+// verified session before calling this service (buyer_auth_token via
+// buyerGuards.ts, auth_token via guards.ts), exactly as it already does for
+// ensure/append — this service is only ever reachable server-side.
+function optionalId(value) {
   if (typeof value !== "string" || !value.trim() || value.length > 100) {
     return null;
   }
   return value.trim();
 }
+const optionalBuyerId = optionalId;
+const optionalVendorId = optionalId;
 
 function requireBuyerId(value) {
   const buyerId = optionalBuyerId(value);
@@ -213,19 +228,36 @@ function requireBuyerId(value) {
   return buyerId;
 }
 
-// Ownership, widened for accounts (2026-08-26). The deviceId is still the
-// anonymous owner and still the only one an unauthenticated buyer has — but
-// a signed-in buyer must be able to open their own conversation from a
-// DIFFERENT browser than the one that created it, which is the entire point
-// of having an account. Matching either the device that made it or the
-// buyer it belongs to is what makes the history real rather than
-// per-device.
+// Either identity works — a vendor's own history list/delete is exactly as
+// valid an owner as a buyer's (2026-09-17). The frontend only ever sends one
+// of the two (buyer wins whenever both cookies exist — see its /api/search
+// route's own actorType comment), so this never has to arbitrate between
+// them, only refuse a caller with neither.
+function requireOwnerId(buyerId, vendorId) {
+  const buyer = optionalBuyerId(buyerId);
+  if (buyer) return { buyerId: buyer, vendorId: null };
+  const vendor = optionalVendorId(vendorId);
+  if (vendor) return { buyerId: null, vendorId: vendor };
+  throw new AppError("buyerId or vendorId is required.", 400);
+}
+
+// Ownership, widened for accounts (2026-08-26, widened again 2026-09-17 for
+// vendorId). The deviceId is still the anonymous owner and still the only
+// one an unauthenticated buyer has — but a signed-in buyer (or vendor) must
+// be able to open their own conversation from a DIFFERENT browser than the
+// one that created it, which is the entire point of having an account.
+// Matching the device that made it, the buyer it belongs to, or the vendor
+// it belongs to is what makes the history real rather than per-device.
 //
 // Note this can only ever WIDEN access to a conversation the caller already
-// proves a claim on: buyerId arrives from a verified session, and a
-// conversation only carries one once a verified buyer was present on it.
-function ownershipFilter(deviceId, buyerId) {
-  return buyerId ? { $or: [{ deviceId }, { buyerId }] } : { deviceId };
+// proves a claim on: buyerId/vendorId arrive from a verified session, and a
+// conversation only carries one once a verified buyer or vendor was present
+// on it.
+function ownershipFilter(deviceId, buyerId, vendorId) {
+  const or = [{ deviceId }];
+  if (buyerId) or.push({ buyerId });
+  if (vendorId) or.push({ vendorId });
+  return or.length > 1 ? { $or: or } : { deviceId };
 }
 
 // The list's title for one conversation: the buyer's own first message,
@@ -251,7 +283,7 @@ function conversationTitle(conversation) {
 export async function ensureConversation(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.body?.deviceId);
-    const { conversationId, buyerId, buyerLocation } = req.body ?? {};
+    const { conversationId, buyerId, vendorId, buyerLocation } = req.body ?? {};
 
     if (
       typeof conversationId === "string" &&
@@ -259,7 +291,11 @@ export async function ensureConversation(req, res, next) {
     ) {
       const existing = await SearchConversation.findOne({
         _id: conversationId,
-        ...ownershipFilter(deviceId, optionalBuyerId(buyerId)),
+        ...ownershipFilter(
+          deviceId,
+          optionalBuyerId(buyerId),
+          optionalVendorId(vendorId),
+        ),
       });
       if (existing) {
         // ── Stale means the GOAL SHEET is dead, not the thread ───────────
@@ -291,13 +327,17 @@ export async function ensureConversation(req, res, next) {
           dirty = true;
         }
 
-        // Stamp the buyer id opportunistically — a buyer who signs in
-        // mid-conversation ties their earlier anonymous turns to the
-        // account from here on. Location merges the same way (see
+        // Stamp the buyer/vendor id opportunistically — an account that
+        // signs in mid-conversation ties their earlier anonymous turns to it
+        // from here on. Location merges the same way (see
         // mergeBuyerLocation) so a position resolved mid-session is stored
         // as soon as it's known, not only at the end of the turn.
         if (typeof buyerId === "string" && buyerId && !existing.buyerId) {
           existing.buyerId = buyerId;
+          dirty = true;
+        }
+        if (typeof vendorId === "string" && vendorId && !existing.vendorId) {
+          existing.vendorId = vendorId;
           dirty = true;
         }
         const mergedLocation = mergeBuyerLocation(
@@ -328,6 +368,11 @@ export async function ensureConversation(req, res, next) {
             // The goal sheet as it stands BEFORE this turn — the caller
             // applies its own two locks before using any of it.
             task: existing.task ?? null,
+            // The tool this conversation is still in the middle of, if any
+            // — see the model's own comment. The caller falls back to this
+            // whenever the message itself arrives without one, which is
+            // every follow-up after the first.
+            activeTool: existing.activeTool ?? null,
           },
         });
       }
@@ -336,6 +381,7 @@ export async function ensureConversation(req, res, next) {
     const created = await SearchConversation.create({
       deviceId,
       buyerId: typeof buyerId === "string" && buyerId ? buyerId : null,
+      vendorId: typeof vendorId === "string" && vendorId ? vendorId : null,
       buyerLocation: mergeBuyerLocation(null, buyerLocation),
     });
     res.json({
@@ -347,6 +393,9 @@ export async function ensureConversation(req, res, next) {
         recentStatuses: [],
         buyerLocation: serializeBuyerLocation(created.buyerLocation),
         task: null,
+        // A brand new chat starts with no tool in play, by construction —
+        // which is one of the two resets the product rule asks for.
+        activeTool: null,
       },
     });
   } catch (err) {
@@ -364,8 +413,15 @@ export async function appendTurn(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.body?.deviceId);
     const { id } = req.params;
-    const { turn, buyerId, recentStatuses, buyerLocation, goal } =
-      req.body ?? {};
+    const {
+      turn,
+      buyerId,
+      vendorId,
+      recentStatuses,
+      buyerLocation,
+      goal,
+      activeTool,
+    } = req.body ?? {};
 
     if (!mongoose.isValidObjectId(id)) {
       throw new AppError("Invalid conversation id.", 400);
@@ -374,15 +430,22 @@ export async function appendTurn(req, res, next) {
       throw new AppError("A turn snapshot is required.", 400);
     }
 
+    // Read-only — used to derive task/location/buyerId/vendorId below, never
+    // saved from directly (see the atomic findOneAndUpdate further down, and
+    // its own comment on why this used to be a read-modify-write race).
     const conversation = await SearchConversation.findOne({
       _id: id,
-      ...ownershipFilter(deviceId, optionalBuyerId(buyerId)),
+      ...ownershipFilter(
+        deviceId,
+        optionalBuyerId(buyerId),
+        optionalVendorId(vendorId),
+      ),
     });
     if (!conversation) {
       throw new AppError("Conversation not found.", 404);
     }
 
-    conversation.turns.push({
+    const turnDoc = {
       query: typeof turn.query === "string" ? turn.query : "",
       reply: turn.reply,
       contextNote: typeof turn.contextNote === "string" ? turn.contextNote : null,
@@ -391,30 +454,123 @@ export async function appendTurn(req, res, next) {
         typeof turn.buyerRequestMatchQuery === "string"
           ? turn.buyerRequestMatchQuery
           : null,
+      awaitingComparisonPurchaseReply: Boolean(
+        turn.awaitingComparisonPurchaseReply,
+      ),
+      comparisonPickItem:
+        typeof turn.comparisonPickItem === "string"
+          ? turn.comparisonPickItem
+          : null,
+      comparisonOptions:
+        Array.isArray(turn.comparisonOptions) &&
+        turn.comparisonOptions.length > 0
+          ? turn.comparisonOptions.filter((o) => typeof o === "string" && o)
+          : undefined,
+      awaitingVendorSearchOffer: Boolean(turn.awaitingVendorSearchOffer),
+      vendorSearchMatchQuery:
+        typeof turn.vendorSearchMatchQuery === "string"
+          ? turn.vendorSearchMatchQuery
+          : null,
+      isGuidanceReply: Boolean(turn.isGuidanceReply),
+      awaitingShoppingPlanReply: Boolean(turn.awaitingShoppingPlanReply),
+      // Derived from the turn's own clarification rather than carried as a
+      // separate field the frontend has to remember to set — see
+      // types/search.ts's own comment on the bug this fixes.
+      askedLocation: turn.clarification?.kind === "location",
+      // Widened 2026-09-17: `skippable` alone used to be enough (every
+      // bare-query gate turn unconditionally asked budget), but that gate
+      // now skips budget on purpose for a bounded service whose price is
+      // set by diagnosing the problem, not by what the buyer chooses to
+      // spend (a mechanic, a repair — see the frontend's bareQueryGate.ts).
+      // `budgetAsked` is that gate's own report of whether THIS specific
+      // question actually asked about budget; both must be true, or a
+      // non-budget bare-query ask would wrongly block a later, genuinely
+      // budget-relevant ask within the same request (route.ts's own
+      // alreadyAskedBudgetThisConversation).
+      askedBudget:
+        turn.clarification?.kind === "text" &&
+        turn.clarification?.skippable === true &&
+        turn.clarification?.budgetAsked === true,
+      askedShoppingListDetails:
+        turn.clarification?.kind === "text" &&
+        turn.clarification?.listDetails === true,
       snapshot: turn,
       createdAt: new Date(),
-    });
-    if (conversation.turns.length > MAX_TURNS) {
-      conversation.turns = conversation.turns.slice(-MAX_TURNS);
-    }
-    conversation.task = deriveTask(turn, conversation.task, goal ?? {});
-    // Replaced wholesale — the frontend's copy is already the merged,
-    // capped, most-recent-last list (route.ts seeds it from here plus its
-    // own turn's pushes). Bounded defensively regardless of what arrives.
-    if (Array.isArray(recentStatuses)) {
-      conversation.recentStatuses = recentStatuses
-        .filter((s) => typeof s === "string" && s.length <= 300)
-        .slice(-8);
-    }
-    conversation.buyerLocation = mergeBuyerLocation(
+    };
+
+    // ── Atomic append (2026-09-09) ──────────────────────────────────────
+    //
+    // This used to be findOne → mutate the in-memory `turns` array/task/
+    // location → save() — a read-modify-write. Two /api/search calls for
+    // the SAME conversation close together (the client's own stream reader
+    // dispatches the "final" event, and unlocks the composer for the next
+    // message, as soon as it parses that line — well before this server
+    // request's own persistence write and stream-close actually finish, so
+    // a fast reply genuinely can start a second request while the first is
+    // still saving) both read the same starting document, both pushed
+    // their own turn onto their own in-memory copy, and whichever save()
+    // landed second overwrote the first's turns array wholesale — the
+    // earlier turn wasn't corrupted, it just silently never made it to
+    // disk. Exactly the "there was a reply but it's gone after reload" bug
+    // this was found from.
+    //
+    // `$push`/`$slice` apply atomically at the document level regardless of
+    // concurrent writers — MongoDB serializes writes to one document, so
+    // two concurrent pushes both land, in whichever order their writes are
+    // applied, and the slice still correctly keeps only the last MAX_TURNS
+    // afterward. task/recentStatuses/buyerLocation/buyerId are still
+    // computed off the read above and can themselves lose a race between
+    // two concurrent appends (the LAST $set wins, same as before) — a much
+    // smaller failure than losing a whole reply, and one that self-corrects
+    // as soon as the next turn lands, so it's left as is rather than
+    // rebuilt around a retry loop for what the reported bug never actually
+    // was.
+    const newTask = deriveTask(turn, conversation.task, goal ?? {});
+    const mergedLocation = mergeBuyerLocation(
       conversation.buyerLocation,
       buyerLocation,
     );
-    conversation.lastActiveAt = new Date();
-    if (typeof buyerId === "string" && buyerId && !conversation.buyerId) {
-      conversation.buyerId = buyerId;
+    const setFields = {
+      task: newTask,
+      buyerLocation: mergedLocation,
+      lastActiveAt: new Date(),
+    };
+    if (Array.isArray(recentStatuses)) {
+      setFields.recentStatuses = recentStatuses
+        .filter((s) => typeof s === "string" && s.length <= 300)
+        .slice(-8);
     }
-    await conversation.save();
+    if (typeof buyerId === "string" && buyerId && !conversation.buyerId) {
+      setFields.buyerId = buyerId;
+    }
+    if (typeof vendorId === "string" && vendorId && !conversation.vendorId) {
+      setFields.vendorId = vendorId;
+    }
+    // The session's active tool, as the route decided it at the END of this
+    // turn — see the model's own comment. The caller always sends an explicit
+    // value (a string to keep, or null to drop it), so `undefined` means
+    // "this caller doesn't participate" (the BFF's client-resolved background
+    // turns) and leaves whatever is stored untouched.
+    if (typeof activeTool === "string" && activeTool.length <= 40) {
+      setFields.activeTool = activeTool;
+    } else if (activeTool === null) {
+      setFields.activeTool = null;
+    }
+
+    await SearchConversation.updateOne(
+      {
+        _id: id,
+        ...ownershipFilter(
+          deviceId,
+          optionalBuyerId(buyerId),
+          optionalVendorId(vendorId),
+        ),
+      },
+      {
+        $push: { turns: { $each: [turnDoc], $slice: -MAX_TURNS } },
+        $set: setFields,
+      },
+    );
 
     res.json({ success: true, data: { conversationId: id } });
   } catch (err) {
@@ -430,6 +586,7 @@ export async function getConversation(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.query?.deviceId);
     const buyerId = optionalBuyerId(req.query?.buyerId);
+    const vendorId = optionalVendorId(req.query?.vendorId);
     // Opening a thread deliberately picked from the history list, as
     // opposed to the mount-time rehydrate of whichever conversation this
     // browser was last in. The distinction matters because of staleness
@@ -443,7 +600,7 @@ export async function getConversation(req, res, next) {
     }
     const conversation = await SearchConversation.findOne({
       _id: id,
-      ...ownershipFilter(deviceId, buyerId),
+      ...ownershipFilter(deviceId, buyerId, vendorId),
     });
     // The staleness refusal exists for the REHYDRATE path: a day-old thread
     // resumed silently would carry its own task/goal sheet into a new need,
@@ -481,6 +638,7 @@ export async function markHandoff(req, res, next) {
   try {
     const deviceId = requireDeviceId(req.body?.deviceId);
     const buyerId = optionalBuyerId(req.body?.buyerId);
+    const vendorId = optionalVendorId(req.body?.vendorId);
     const { id } = req.params;
 
     if (!mongoose.isValidObjectId(id)) {
@@ -488,7 +646,7 @@ export async function markHandoff(req, res, next) {
     }
     const conversation = await SearchConversation.findOne({
       _id: id,
-      ...ownershipFilter(deviceId, buyerId),
+      ...ownershipFilter(deviceId, buyerId, vendorId),
     });
     if (!conversation) {
       throw new AppError("Conversation not found.", 404);
@@ -505,10 +663,11 @@ export async function markHandoff(req, res, next) {
   }
 }
 
-// ── GET /api/search/conversations?buyerId=&limit=&before= ─────────────────
-// The chat-history list (2026-08-26): every conversation belonging to a
-// signed-in buyer, newest first, for the sidebar they pick from. Opening one
-// is still GET /conversations/:id — this only produces the row.
+// ── GET /api/search/conversations?buyerId=&vendorId=&limit=&before= ───────
+// The chat-history list (2026-08-26, widened 2026-09-17 for a vendor's own
+// history): every conversation belonging to a signed-in buyer OR vendor,
+// newest first, for the sidebar they pick from. Opening one is still
+// GET /conversations/:id — this only produces the row.
 //
 // Deliberately does NOT return turns. A stored turn carries the entire
 // denormalised result set it rendered (products, stores, services, images —
@@ -523,21 +682,22 @@ export async function markHandoff(req, res, next) {
 // note on the two different jobs that rule does.
 export async function listConversations(req, res, next) {
   try {
-    const buyerId = requireBuyerId(req.query?.buyerId);
+    const owner = requireOwnerId(req.query?.buyerId, req.query?.vendorId);
 
     const rawLimit = Number.parseInt(req.query?.limit ?? "", 10);
     const limit =
       Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 100) : 30;
 
     // Keyset pagination on the same field the sort uses, rather than skip:
-    // a buyer scrolling their history while a new turn lands would silently
-    // skip or repeat a row under an offset, and there is no cheap fix for
-    // that with skip. `before` is the previous page's last lastActiveAt.
+    // an account scrolling their history while a new turn lands would
+    // silently skip or repeat a row under an offset, and there is no cheap
+    // fix for that with skip. `before` is the previous page's last
+    // lastActiveAt.
     const filter = {
-      buyerId,
+      ...(owner.buyerId ? { buyerId: owner.buyerId } : { vendorId: owner.vendorId }),
       // A conversation with no completed turn is one `ensure` created for a
-      // turn that never finished — a real row in the database, but nothing a
-      // buyer would recognise as a conversation.
+      // turn that never finished — a real row in the database, but nothing
+      // the account would recognise as a conversation.
       "turns.0": { $exists: true },
     };
     const before = req.query?.before ? new Date(req.query.before) : null;
@@ -604,6 +764,39 @@ export async function claimConversations(req, res, next) {
       success: true,
       data: { claimed: result.modifiedCount ?? 0 },
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── DELETE /api/search/conversations/:id?buyerId=|vendorId= ───────────────
+// Removes one row from the sidebar's history list, for good (2026-09-09,
+// widened 2026-09-17 for vendorId).
+//
+// buyerId/vendorId-only ownership, not the wider ownershipFilter every other
+// route here uses — deliberately: listConversations (what the sidebar is
+// actually deleting FROM) already requires one of the two itself, so a
+// conversation never reaches a "delete" click without one. Accepting
+// deviceId-only ownership here would let an anonymous browser delete a
+// thread it can't even see listed, for no real use case.
+export async function deleteConversation(req, res, next) {
+  try {
+    const owner = requireOwnerId(req.query?.buyerId, req.query?.vendorId);
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      throw new AppError("Invalid conversation id.", 400);
+    }
+
+    const result = await SearchConversation.deleteOne({
+      _id: id,
+      ...(owner.buyerId ? { buyerId: owner.buyerId } : { vendorId: owner.vendorId }),
+    });
+    if (result.deletedCount === 0) {
+      throw new AppError("Conversation not found.", 404);
+    }
+
+    res.json({ success: true, data: { conversationId: id } });
   } catch (err) {
     next(err);
   }
