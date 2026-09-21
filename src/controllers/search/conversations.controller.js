@@ -620,6 +620,15 @@ export async function getConversation(req, res, next) {
         recentStatuses: conversation.recentStatuses ?? [],
         buyerLocation: serializeBuyerLocation(conversation.buyerLocation),
         lastActiveAt: conversation.lastActiveAt.toISOString(),
+        // Internal only — the frontend's BFF route strips both before they
+        // ever reach a browser. Lets that route refuse a buyer- or vendor-
+        // owned conversation to a caller whose session has since ended
+        // (expired, or cleared some way other than its own logout button,
+        // which is the only client-side path that drops the local resume
+        // id) — see that route's own comment on why deviceId alone isn't
+        // enough once an account was ever attached.
+        buyerId: conversation.buyerId ?? null,
+        vendorId: conversation.vendorId ?? null,
       },
     });
   } catch (err) {

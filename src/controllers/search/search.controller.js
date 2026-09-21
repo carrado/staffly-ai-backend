@@ -1,9 +1,12 @@
+import mongoose from "mongoose";
+
 import {
   searchProducts as findProducts,
   searchStores as findStores,
 } from "../../services/retrieval.service.js";
 import { AppError } from "../../middleware/errorHandler.js";
 import RecruitmentLead from "../../models/RecruitmentLead.model.js";
+import Product from "../../models/Product.model.js";
 
 // Migrated from velte-backend/src/controllers/search/search.controller.js —
 // this repo owns searchProducts/searchStores/logSearch (the buyer-facing
@@ -310,6 +313,57 @@ export async function logInstagramReachOut(req, res, next) {
     );
 
     res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/search/products/verify ────────────────────────────────────
+// Shopping Plan (2026-09-19, "old ones shouldn't go provided they're still
+// available" fix) — a DIRECT existence/suspension check for products the
+// caller already knows about, as opposed to `searchProducts` above's
+// ranked-and-capped result list. shoppingPlan.job.js used to infer a known
+// candidate was gone purely from it not reappearing in that cycle's fresh
+// top-N search — but the search only ever returns a capped slice, so a
+// still-available product that merely ranked outside this cycle's window
+// looked identical to a genuinely suspended/deleted one. This answers the
+// narrower, provable question instead: does the document still exist, and
+// is it not suspended — the exact same condition `searchProducts`' own
+// `$match: { isSuspended: { $ne: true } }` filters on, so "still available"
+// here means precisely "would still be returned if searched for again",
+// never a looser or stricter definition than that.
+//
+// Public, same trust level as `searchProducts` above (no session, called
+// only by the frontend's internal shopping-plan route) — this reveals
+// nothing beyond "does this id, which the caller already holds, still
+// exist and isn't suspended".
+const MAX_VERIFY_IDS = 50;
+
+export async function verifyProducts(req, res, next) {
+  try {
+    const { productIds } = req.body ?? {};
+    if (!Array.isArray(productIds) || !productIds.length) {
+      return res.json({ success: true, data: { available: [] } });
+    }
+
+    const validIds = productIds
+      .filter((id) => typeof id === "string" && mongoose.isValidObjectId(id))
+      .slice(0, MAX_VERIFY_IDS);
+    if (!validIds.length) {
+      return res.json({ success: true, data: { available: [] } });
+    }
+
+    const found = await Product.find({
+      _id: { $in: validIds },
+      isSuspended: { $ne: true },
+    })
+      .select("_id")
+      .lean();
+
+    res.json({
+      success: true,
+      data: { available: found.map((p) => p._id.toString()) },
+    });
   } catch (err) {
     next(err);
   }

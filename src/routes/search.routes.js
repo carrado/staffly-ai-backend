@@ -4,6 +4,7 @@ import {
   searchStores,
   logSearch,
   logInstagramReachOut,
+  verifyProducts,
 } from "../controllers/search/search.controller.js";
 import {
   ensureConversation,
@@ -20,6 +21,9 @@ const router = express.Router();
 
 // Public — called by the frontend's /api/search route, no session required.
 router.post("/products", searchProducts);
+// Shopping Plan's own direct re-check (2026-09-19) — see the controller's
+// own comment for why this exists alongside the ranked search above.
+router.post("/products/verify", verifyProducts);
 router.post("/stores", searchStores);
 router.post("/log", logSearch);
 router.post("/log/instagram-reachout", logInstagramReachOut);
