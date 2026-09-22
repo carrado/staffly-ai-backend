@@ -40,7 +40,10 @@ import { embed, embedImage, rerank } from "./voyage.service.js";
 import { reverseGeocodeState } from "./nominatim.service.js";
 import { searchNearbyBusinesses } from "./googlePlaces.service.js";
 import { notifyUser } from "./pushNotification.service.js";
-import { sectorKeywordsForLabels } from "../utils/sectorKeywords.js";
+import {
+  sectorKeywordsForLabels,
+  SECTOR_KEYWORDS_BY_LABEL,
+} from "../utils/sectorKeywords.js";
 
 const VECTOR_INDEX_NAME = "product_vector_index";
 const STORE_VECTOR_INDEX_NAME = "store_vector_index";
@@ -109,7 +112,28 @@ const RAW_SCORE_FLOOR = 0.75;
 // How far below the main relevance floor a candidate can still land and
 // count as "not a close match, but worth mentioning" rather than "not what
 // the buyer asked for at all."
-const WEAK_MATCH_MARGIN = 0.05;
+//
+// Raised from 0.05 (2026-09-22, verified live against the real Voyage
+// rerank API, not guessed): a buyer searching "plot of land residential"
+// got "couldn't find a vendor" even though a real, verified vendor
+// (Crespon Foods) explicitly lists "sales of land and commercial
+// properties" in its own description and carries the "Real Estate &
+// Property Sales" sector — its own keyword list even contains the literal
+// phrase "plot of land". Reranked directly against that exact query, it
+// scored 0.5117 — a genuine, real relevance signal (the same store scored
+// 0.17-0.25 against completely unrelated stores on the same query, so this
+// is not noise), but 0.0083 BELOW the old weak floor (0.58 - 0.05 = 0.53),
+// so it was dropped entirely instead of shown as a "similar" match. The
+// exact wording matters more than it should here: the SAME request phrased
+// "buy a plot of land" scored 0.5977, clearing even the full eligibility
+// floor — so this is a genuine borderline case sensitive to how the
+// buyer-request flow's own term-building happens to phrase it, not a
+// fundamentally irrelevant vendor. Widening this margin costs nothing on
+// the confident-match floor above (RERANK_FLOOR/STORE_RERANK_FLOOR are
+// untouched) — it only widens the LAST-RESORT "closest near-miss, clearly
+// labeled, shown before falling all the way to Google Places" tier this
+// margin already exists to serve.
+const WEAK_MATCH_MARGIN = 0.08;
 
 // Buyer-facing ask: show a handful of not-that-close alternatives, clearly
 // labeled as such. Capped small on purpose.
@@ -346,6 +370,45 @@ function storeEmbeddingText(store) {
   ]
     .filter(Boolean)
     .join(". ");
+}
+
+/**
+ * WHICH of a store's own sectors this specific search actually turned up
+ * on, if any (2026-09-22, explicit request) — matching stayed embedding-
+ * based (rankCandidates ranks a WHOLE-profile vector, not a single sector),
+ * so this is a best-effort, separate, phrase-level explanation of that
+ * match, not a second scoring pass: does the query text contain one of this
+ * sector's own buyer-facing keyword phrases, or vice versa. Checked against
+ * each sector's keyword list (SECTOR_KEYWORDS_BY_LABEL), not the bare
+ * label, because a label alone rarely shares words with how a buyer
+ * actually phrases a request ("Real Estate & Property Sales" shares zero
+ * words with "plot of land residential" — its own keyword list's "plot of
+ * land" phrase is what actually explains the match). Longer phrase wins on
+ * a tie — more specific, so a stronger signal of which sector is the real
+ * reason. Returns null when nothing recognisably overlaps (a pure semantic/
+ * embedding-only match with no explainable keyword phrase) — the frontend
+ * falls back to its own default ordering in that case, never a guess.
+ */
+function bestMatchingSector(sectors, queryText) {
+  if (!queryText) return null;
+  const q = queryText.toLowerCase();
+  let best = null;
+  let bestPhraseLength = 0;
+  for (const label of sectors || []) {
+    const keywordList = SECTOR_KEYWORDS_BY_LABEL[label];
+    if (!keywordList) continue;
+    for (const raw of keywordList.split(",")) {
+      const phrase = raw.trim().toLowerCase();
+      if (!phrase) continue;
+      if (q.includes(phrase) || phrase.includes(q)) {
+        if (phrase.length > bestPhraseLength) {
+          bestPhraseLength = phrase.length;
+          best = label;
+        }
+      }
+    }
+  }
+  return best;
 }
 
 /** Great-circle distance in km between two [lng, lat] points. */
@@ -1095,6 +1158,13 @@ export async function searchStores({
     name: store.name,
     description: store.description,
     sectors: store.sectors,
+    // Which of `sectors` above this search actually turned up on, if any —
+    // see bestMatchingSector's own header. The frontend uses this to pin
+    // the actually-relevant sector into view rather than always showing a
+    // store's first 3 (found live: a vendor's own real-estate sector — the
+    // one reason it matched a "plot of land" search — sat 4th and never
+    // rendered at all).
+    matchedSector: bestMatchingSector(store.sectors, queryText),
     whatsapp: store.whatsapp || vendor.phone || null,
     area: vendor.area,
     state: vendor.state,
