@@ -229,16 +229,29 @@ function requireBuyerId(value) {
 }
 
 // Either identity works — a vendor's own history list/delete is exactly as
-// valid an owner as a buyer's (2026-09-17). The frontend only ever sends one
-// of the two (buyer wins whenever both cookies exist — see its /api/search
-// route's own actorType comment), so this never has to arbitrate between
-// them, only refuse a caller with neither.
+// valid an owner as a buyer's (2026-09-17). BOTH may arrive together
+// (2026-09-23): a linked account holds a buyer and a vendor session at
+// once, and its history is split across the two — threads from before the
+// vendor cookie was paired carry buyerId, later ones vendorId. Sending only
+// one hid the other half of the person's own history. Only refuses a caller
+// with neither.
 function requireOwnerId(buyerId, vendorId) {
-  const buyer = optionalBuyerId(buyerId);
-  if (buyer) return { buyerId: buyer, vendorId: null };
-  const vendor = optionalVendorId(vendorId);
-  if (vendor) return { buyerId: null, vendorId: vendor };
-  throw new AppError("buyerId or vendorId is required.", 400);
+  const owner = {
+    buyerId: optionalBuyerId(buyerId),
+    vendorId: optionalVendorId(vendorId),
+  };
+  if (!owner.buyerId && !owner.vendorId) {
+    throw new AppError("buyerId or vendorId is required.", 400);
+  }
+  return owner;
+}
+
+// A conversation belongs to the owner if EITHER identity it holds owns it.
+function ownerFilter(owner) {
+  const or = [];
+  if (owner.buyerId) or.push({ buyerId: owner.buyerId });
+  if (owner.vendorId) or.push({ vendorId: owner.vendorId });
+  return or.length > 1 ? { $or: or } : or[0];
 }
 
 // Ownership, widened for accounts (2026-08-26, widened again 2026-09-17 for
@@ -703,7 +716,7 @@ export async function listConversations(req, res, next) {
     // fix for that with skip. `before` is the previous page's last
     // lastActiveAt.
     const filter = {
-      ...(owner.buyerId ? { buyerId: owner.buyerId } : { vendorId: owner.vendorId }),
+      ...ownerFilter(owner),
       // A conversation with no completed turn is one `ensure` created for a
       // turn that never finished — a real row in the database, but nothing
       // the account would recognise as a conversation.
@@ -799,7 +812,7 @@ export async function deleteConversation(req, res, next) {
 
     const result = await SearchConversation.deleteOne({
       _id: id,
-      ...(owner.buyerId ? { buyerId: owner.buyerId } : { vendorId: owner.vendorId }),
+      ...ownerFilter(owner),
     });
     if (result.deletedCount === 0) {
       throw new AppError("Conversation not found.", 404);

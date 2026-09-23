@@ -411,6 +411,97 @@ function bestMatchingSector(sectors, queryText) {
   return best;
 }
 
+/**
+ * Whether the query literally names one of this store's own sectors, by a
+ * MULTI-WORD buyer-facing phrase from that sector's keyword list, at word
+ * boundaries (2026-09-23). Found live: "landed property agent" returned
+ * nothing at all, while a verified vendor (Crespon Foods) carries "Real
+ * Estate & Property Sales" — whose keyword list contains "property agent".
+ * A mostly-catering profile reranks low against a real-estate query, so
+ * the explicit sector tag lost to the blended profile score, the same
+ * borderline case WEAK_MATCH_MARGIN's own comment describes; widening the
+ * margin again would just move the line.
+ *
+ * Deliberately stricter than bestMatchingSector (which only LABELS a match
+ * and can afford to be loose): single-word phrases ("agent", "property")
+ * and the reverse direction (query inside a phrase) are skipped, or "travel
+ * agent" would rescue every real-estate store.
+ */
+function sectorPhraseHit(sectors, queryText) {
+  if (!queryText) return false;
+  const q = ` ${queryText.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
+  for (const label of sectors || []) {
+    const keywordList = SECTOR_KEYWORDS_BY_LABEL[label];
+    if (!keywordList) continue;
+    for (const raw of keywordList.split(",")) {
+      const phrase = raw.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      if (!phrase.includes(" ")) continue;
+      if (q.includes(` ${phrase} `)) return true;
+    }
+  }
+  return false;
+}
+
+// Semantic half of the store sector rescue (2026-09-23) — sectorPhraseHit
+// above only catches the exact phrases in each keyword list, so "someone to
+// sell me a plot" or "estate surveyor" still missed a real-estate vendor.
+// Every sector is embedded once per process (84 labels, one Voyage call) as
+// "<label>: <keywords>", and a query is compared against all of them.
+//
+// Calibrated live against voyage embeddings, not guessed. The query's
+// CLOSEST sector was the right one for every realistic request tried
+// (land/plot/surveyor → Real Estate, aso ebi → Tailoring, fridge →
+// Appliance Repair, car noise → Auto Repair, cake → Bakery), at cosine
+// 0.40–0.54. The absolute numbers bunch together, so the rule leans on
+// RANK: only the top sector (plus near-ties within SECTOR_TIE_MARGIN —
+// "wedding MC" is Event Planning 0.428 vs Ushering 0.415, both fair) and
+// only at SECTOR_SIMILARITY_FLOOR or above — "travel agent", which has no
+// sector of its own, peaks at Freight Forwarding 0.386 and stays out.
+// voyage rerank was tried for this first and rejected: it ranked Legal
+// Services top for both "my car is making noise" and "buy land in Awka".
+const SECTOR_SIMILARITY_FLOOR = 0.4;
+const SECTOR_TIE_MARGIN = 0.02;
+
+let sectorVectorsPromise = null;
+
+function sectorVectors(deadlineAt) {
+  if (!sectorVectorsPromise) {
+    const labels = Object.keys(SECTOR_KEYWORDS_BY_LABEL);
+    sectorVectorsPromise = embed(
+      labels.map((label) => `${label}: ${SECTOR_KEYWORDS_BY_LABEL[label]}`),
+      "document",
+      deadlineAt,
+    ).then((vectors) => {
+      // Not cached on failure — the next search tries again rather than
+      // running without the rescue for the rest of the process's life.
+      if (!vectors || vectors.length !== labels.length) {
+        sectorVectorsPromise = null;
+        return null;
+      }
+      return labels.map((label, i) => ({ label, vector: vectors[i] }));
+    });
+  }
+  return sectorVectorsPromise;
+}
+
+/** Labels of the sector(s) this query is semantically closest to — empty
+ *  when nothing clears the floor or the sector vectors are unavailable. */
+async function sectorsNearQuery(queryVector, deadlineAt) {
+  const sectors = await sectorVectors(deadlineAt).catch(() => null);
+  if (!sectors) return new Set();
+  const scored = sectors.map(({ label, vector }) => ({
+    label,
+    similarity: cosineSimilarity(queryVector, vector),
+  }));
+  const top = Math.max(...scored.map((s) => s.similarity));
+  if (top < SECTOR_SIMILARITY_FLOOR) return new Set();
+  return new Set(
+    scored
+      .filter((s) => s.similarity >= top - SECTOR_TIE_MARGIN)
+      .map((s) => s.label),
+  );
+}
+
 /** Great-circle distance in km between two [lng, lat] points. */
 function haversineKm([lng1, lat1], [lng2, lat2]) {
   const R = 6371;
@@ -619,6 +710,11 @@ async function rankCandidates({
   weights = WEIGHTS,
   deadlineAt,
   trackExposure = false,
+  // Optional (entity) => boolean — store search only (2026-09-23). A hit
+  // keeps a candidate that scored below the weak floor in the WEAK pool
+  // (shown only as a labelled "similar" last resort, never as a confident
+  // match). See sectorPhraseHit for why.
+  keywordRescueFn,
 }) {
   const locationless = lat == null || lng == null;
 
@@ -671,7 +767,9 @@ async function rankCandidates({
   const isEligible = (c) =>
     c.textScore >= relevanceFloor ||
     (c.visualScore != null && c.visualScore >= VISUAL_ELIGIBILITY_FLOOR);
-  const isWeak = (c) => !isEligible(c) && c.textScore >= weakFloor;
+  const isWeak = (c) =>
+    !isEligible(c) &&
+    (c.textScore >= weakFloor || Boolean(keywordRescueFn?.(c[entityKey])));
 
   const finalize = async (pool, poolLimit, useRotation) => {
     const withScore = pool
@@ -1115,6 +1213,7 @@ export async function searchStores({
   if (!queryVector) {
     throw new Error("Could not embed the search query (Voyage unavailable).");
   }
+  const nearSectors = await sectorsNearQuery(queryVector, deadlineAt);
 
   const candidates = await Store.aggregate([
     {
@@ -1164,7 +1263,14 @@ export async function searchStores({
     // store's first 3 (found live: a vendor's own real-estate sector — the
     // one reason it matched a "plot of land" search — sat 4th and never
     // rendered at all).
-    matchedSector: bestMatchingSector(store.sectors, queryText),
+    // Falls back to the semantic sector match (2026-09-23) — a store
+    // rescued by meaning ("someone to sell me a plot") shares no keyword
+    // phrase with the query, and without this its card led with whatever
+    // sector happened to be listed first (Catering, for a real-estate find).
+    matchedSector:
+      bestMatchingSector(store.sectors, queryText) ??
+      (store.sectors || []).find((label) => nearSectors.has(label)) ??
+      null,
     whatsapp: store.whatsapp || vendor.phone || null,
     area: vendor.area,
     state: vendor.state,
@@ -1184,6 +1290,9 @@ export async function searchStores({
     rawScoreFloor: STORE_RAW_SCORE_FLOOR,
     limit,
     deadlineAt,
+    keywordRescueFn: (store) =>
+      sectorPhraseHit(store.sectors, queryText) ||
+      (store.sectors || []).some((label) => nearSectors.has(label)),
   };
 
   const hasLocation = typeof lat === "number" && typeof lng === "number";
