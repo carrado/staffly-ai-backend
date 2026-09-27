@@ -94,11 +94,34 @@ export async function searchProducts(req, res, next) {
           }
         : { results, weakResults };
 
+    // The acting vendor's OWN storefront is never a result of their own
+    // search (2026-09-27). Found live: a vendor signed into /chat searched
+    // for sandals and was offered a reach-out to "a vendor whose store fits
+    // 'sandals' … based in Independence Layout Enugu" — their own shop.
+    // Nothing in the pipeline knew who was asking.
+    //
+    // Applied HERE, at the HTTP boundary, for the same reason the budget
+    // filter above lives here: one filter covers every caller — the model's
+    // own tool calls, the dead-end cascade's cross-checks, the sector scan,
+    // the similar-match check, the reach-out eligibility probe — instead of
+    // the frontend having to remember it at ~15 separate call sites, which
+    // is the exact per-site exemption this codebase keeps getting bitten by.
+    //
+    // Set only when the caller is a signed-in vendor. Absent (or blank), no
+    // row is dropped, so an anonymous or buyer-side search is untouched.
+    const excludeVendorId =
+      typeof req.body?.excludeVendorId === "string" &&
+      req.body.excludeVendorId.trim()
+        ? req.body.excludeVendorId.trim()
+        : null;
+    const notSelf = (r) =>
+      !excludeVendorId || String(r.vendorId) !== excludeVendorId;
+
     res.json({
       success: true,
       data: {
-        results: budgeted.results,
-        weakResults: budgeted.weakResults,
+        results: budgeted.results.filter(notSelf),
+        weakResults: budgeted.weakResults.filter(notSelf),
         matchTier,
         matchQuality,
         externalSuggestions,
@@ -141,9 +164,29 @@ export async function searchStores(req, res, next) {
         includeNearbyBusinesses: includeNearbyBusinesses !== false,
       });
 
+    // The acting vendor's own store is never a result of their own search —
+    // see searchProducts above for the live case and the full reasoning.
+    // Both lists: `furtherResults` is what the frontend shows as the wider
+    // set, and their own shop must not reappear there either. matchTier/
+    // matchQuality still describe the search that RAN, exactly as the
+    // budget filter above leaves them.
+    const excludeVendorId =
+      typeof req.body?.excludeVendorId === "string" &&
+      req.body.excludeVendorId.trim()
+        ? req.body.excludeVendorId.trim()
+        : null;
+    const notSelf = (r) =>
+      !excludeVendorId || String(r.vendorId) !== excludeVendorId;
+
     res.json({
       success: true,
-      data: { results, furtherResults, matchTier, matchQuality, externalSuggestions },
+      data: {
+        results: results.filter(notSelf),
+        furtherResults: furtherResults.filter(notSelf),
+        matchTier,
+        matchQuality,
+        externalSuggestions,
+      },
     });
   } catch (err) {
     next(err);

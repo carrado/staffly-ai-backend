@@ -23,7 +23,7 @@ import { AppError } from "../../middleware/errorHandler.js";
 // reject/under-match, preserve the demand."
 export async function matchBuyerRequest(req, res, next) {
   try {
-    const { queryText, lat, lng, imageUrl } = req.body ?? {};
+    const { queryText, lat, lng, imageUrl, excludeVendorId } = req.body ?? {};
     if (typeof queryText !== "string" || !queryText.trim()) {
       throw new AppError("queryText is required.", 400);
     }
@@ -51,9 +51,21 @@ export async function matchBuyerRequest(req, res, next) {
       }),
     ]);
 
+    // A vendor's own request is never referred back to them (2026-09-27).
+    // Their store is in exactly the corpus this matcher searches, so without
+    // this they match their own request — and get texted, pushed and listed
+    // as a responder to themselves. Filtered on the merged set rather than
+    // passed into findProducts/findStores because the exclusion is applied at
+    // the HTTP boundary for the buyer-facing search endpoints, not inside
+    // retrieval — this is the same rule, one layer in.
+    const excluded =
+      typeof excludeVendorId === "string" && excludeVendorId.trim()
+        ? excludeVendorId.trim()
+        : null;
     const vendorIds = new Set();
     for (const r of productMatch.results ?? []) vendorIds.add(String(r.vendorId));
     for (const r of storeMatch.results ?? []) vendorIds.add(String(r.vendorId));
+    if (excluded) vendorIds.delete(excluded);
 
     res.json({ success: true, data: { matchedVendorIds: [...vendorIds] } });
   } catch (err) {
