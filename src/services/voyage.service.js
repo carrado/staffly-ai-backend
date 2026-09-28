@@ -19,6 +19,13 @@ const TIMEOUT_MS = 15_000;
 const MAX_RETRIES = 1;
 const RETRY_DELAYS_MS = [250];
 
+// A single attempt may consume at most this much of the shared search budget.
+// Without it, one slow rerank can eat the whole 22s (15s timeout x2 attempts)
+// and starve every later geo-tier, which then skip with "search deadline
+// already spent" and silently degrade the turn to raw cosine scoring. A
+// quarter of the budget leaves room for the ~3 geo tiers plus a retry each.
+const ATTEMPT_CAP_MS = 5_500;
+
 function isRetryableStatus(status) {
   return status === 429 || status >= 500;
 }
@@ -27,28 +34,29 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchWithRetry(makeRequest, label, deadlineAt) {
+async function fetchWithRetry(makeRequest, label, deadlineAt, attemptCapMs) {
+  const cap = Math.min(attemptCapMs ?? TIMEOUT_MS, TIMEOUT_MS);
   let lastErr;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
     const remainingMs =
       deadlineAt == null ? TIMEOUT_MS : deadlineAt - Date.now();
     if (remainingMs <= 0) {
-      console.error(`[voyage] ${label} skipped — search deadline already spent`);
+      console.warn(`[voyage] ${label} skipped — search deadline already spent`);
       throw lastErr ?? new Error(`${label}: search deadline exceeded`);
     }
 
     try {
-      const res = await makeRequest(Math.min(TIMEOUT_MS, remainingMs));
+      const res = await makeRequest(Math.min(cap, remainingMs));
       if (res.ok || !isRetryableStatus(res.status) || attempt === MAX_RETRIES) {
         return res;
       }
-      console.error(
+      console.warn(
         `[voyage] ${label} got ${res.status}, retrying (attempt ${attempt + 1}/${MAX_RETRIES})…`,
       );
     } catch (err) {
       if (attempt === MAX_RETRIES) throw err;
       lastErr = err;
-      console.error(
+      console.warn(
         `[voyage] ${label} network error, retrying (attempt ${attempt + 1}/${MAX_RETRIES}):`,
         err.message,
       );
@@ -183,6 +191,7 @@ export async function rerank(query, documents, deadlineAt) {
         }),
       "rerank",
       deadlineAt,
+      ATTEMPT_CAP_MS,
     );
 
     if (!res.ok) {
@@ -207,7 +216,7 @@ export async function rerank(query, documents, deadlineAt) {
     }
     return scores;
   } catch (err) {
-    console.error("[voyage] rerank error:", err.message);
+    console.warn("[voyage] rerank error:", err.message);
     return null;
   }
 }
