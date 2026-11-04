@@ -27,6 +27,11 @@ const vendorReadSchema = new mongoose.Schema(
       name: { type: String },
     },
     hiddenFromSearch: { type: Boolean, default: false },
+    // Read-only: checkoutEligible needs to know a recipient exists. Never
+    // returned to buyers — retrieval only uses recipientCode as a boolean.
+    payout: {
+      recipientCode: { type: String },
+    },
   },
   { collection: "users", strict: false },
 );

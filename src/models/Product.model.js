@@ -62,6 +62,9 @@ const productSchema = new mongoose.Schema(
     manufacturingDate: { type: Date, default: null },
     expirationDate: { type: Date, default: null },
     attributes: { type: [attributeSchema], default: [] },
+    // Mirrors velte-backend — cart checkout needs a real count. Null means
+    // the vendor hasn't set one, so the listing is not checkout-able.
+    quantity: { type: Number, default: null, min: 0 },
 
     estimatedPrepMins: { type: Number, default: null },
     isCurrentlyAvailable: { type: Boolean, default: true },

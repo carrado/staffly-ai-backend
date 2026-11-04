@@ -34,6 +34,7 @@ import Product from "../models/Product.model.js";
 import Store from "../models/Store.model.js";
 import VendorRead from "../models/VendorRead.model.js";
 import WalletRead from "../models/WalletRead.model.js";
+import PlatformSubscriptionRead from "../models/PlatformSubscriptionRead.model.js";
 import Notification from "../models/Notification.model.js";
 import VendorExposure from "../models/VendorExposure.model.js";
 import { embed, embedImage, rerank } from "./voyage.service.js";
@@ -319,6 +320,7 @@ function cosineSimilarity(a, b) {
 const ATTRIBUTE_STOPWORDS = new Set([
   "a", "an", "the", "for", "of", "and", "or", "to", "in", "on", "with",
   "good", "nice", "great", "quality", "very",
+  "size", "brand", "color", "colour", "type", "kind", "model",
 ]);
 
 function attributeWords(text) {
@@ -329,20 +331,442 @@ function attributeWords(text) {
     .filter((w) => w.length > 1 && !ATTRIBUTE_STOPWORDS.has(w));
 }
 
+function hasWord(haystack, word) {
+  return new RegExp(`(?:^|[^a-z0-9])${word}(?:[^a-z0-9]|$)`).test(haystack);
+}
+
+// Canonical colour → aliases a listing might actually use. A buyer who said
+// "black sneakers" matching a listing whose name is "UrbanFlex White
+// Sneakers" is a CONTRADICTION, not a miss to rank-nudge — found live as
+// every sneaker coming back under "Exact match".
+const COLOR_ALIASES = {
+  black: ["black", "ebony", "onyx"],
+  white: ["white", "ivory", "offwhite"],
+  cream: ["cream", "beige", "nude", "khaki", "tan"],
+  red: ["red", "burgundy", "maroon", "crimson"],
+  blue: ["blue", "navy", "indigo"],
+  green: ["green", "olive", "emerald"],
+  brown: ["brown", "tan", "chocolate", "cognac"],
+  grey: ["grey", "gray", "charcoal", "silver"],
+  gold: ["gold", "golden"],
+  pink: ["pink", "rose"],
+  purple: ["purple", "violet", "lilac"],
+  yellow: ["yellow", "mustard"],
+  orange: ["orange"],
+};
+
+const KNOWN_BRANDS = [
+  "nike",
+  "adidas",
+  "puma",
+  "gucci",
+  "reebok",
+  "converse",
+  "vans",
+  "fila",
+  "asics",
+  "skechers",
+  "timberland",
+  "crocs",
+  "samsung",
+  "apple",
+  "iphone",
+  "tecno",
+  "infinix",
+  "oraimo",
+  "xiaomi",
+  "huawei",
+  "hp",
+  "dell",
+  "lenovo",
+  "asus",
+  "lg",
+  "sony",
+  "canon",
+  "nikon",
+  "hisense",
+  "thermocool",
+  "binatone",
+  "itel",
+  "nokia",
+  "tcl",
+  "haier",
+  "midea",
+  "syinix",
+  "lontor",
+  "scanfrost",
+  "polystar",
+];
+
+// Compounds that contain a colour word but are NOT a colour ("black-tie"
+// catering is not a request for black). Stripped before colour detection.
+const COLOR_COMPOUND_RE =
+  /\b(?:black[\s-]?tie|blackout|blacklist|whiteboard|white[\s-]?collar|whitelist)\b/gi;
+
+function colorHaystack(text) {
+  return ` ${text
+    .toLowerCase()
+    .replace(COLOR_COMPOUND_RE, " ")
+    .replace(/[^a-z0-9]+/g, " ")} `;
+}
+
+function colorsIn(text) {
+  const hay = colorHaystack(text);
+  const found = new Set();
+  for (const [canon, aliases] of Object.entries(COLOR_ALIASES)) {
+    if (aliases.some((a) => hay.includes(` ${a} `))) found.add(canon);
+  }
+  return found;
+}
+
+function brandsIn(text) {
+  const hay = ` ${text.toLowerCase().replace(/[^a-z0-9]+/g, " ")} `;
+  return new Set(KNOWN_BRANDS.filter((b) => hay.includes(` ${b} `)));
+}
+
+const MATERIAL_ALIASES = {
+  leather: ["leather", "suede", "nubuck"],
+  canvas: ["canvas"],
+  mesh: ["mesh"],
+  cotton: ["cotton"],
+  polyester: ["polyester"],
+  silk: ["silk"],
+  wool: ["wool"],
+  denim: ["denim", "jean"],
+  linen: ["linen"],
+  satin: ["satin"],
+  nylon: ["nylon"],
+  rubber: ["rubber"],
+  plastic: ["plastic"],
+  wood: ["wood", "wooden"],
+  metal: ["metal", "steel", "aluminium", "aluminum"],
+  ankara: ["ankara"],
+  lace: ["lace"],
+  chiffon: ["chiffon"],
+  velvet: ["velvet"],
+  crepe: ["crepe"],
+  organza: ["organza"],
+  brocade: ["brocade"],
+};
+
+function materialsIn(text) {
+  const hay = ` ${text.toLowerCase().replace(/[^a-z0-9]+/g, " ")} `;
+  const found = new Set();
+  for (const [canon, aliases] of Object.entries(MATERIAL_ALIASES)) {
+    if (aliases.some((a) => hay.includes(` ${a} `))) found.add(canon);
+  }
+  return found;
+}
+
+const CONDITION_ALIASES = {
+  new: ["new", "brandnew", "sealed"],
+  used: ["used", "secondhand", "preowned", "tokunbo"],
+  refurbished: ["refurbished", "refurb"],
+};
+
+function conditionsIn(text) {
+  const hay = ` ${text.toLowerCase().replace(/[^a-z0-9]+/g, " ")} `;
+  const found = new Set();
+  for (const [canon, aliases] of Object.entries(CONDITION_ALIASES)) {
+    if (aliases.some((a) => hay.includes(` ${a} `))) found.add(canon);
+  }
+  return found;
+}
+
+// Only explicit size labels — a bare "40" from ₦40,000 or "iPhone 16"
+// is not a size. UK/US/EU and "size N" cover footwear; XL / size M cover
+// clothing. No bare S/M/L — those are ordinary English letters.
+const SIZE_TOKEN =
+  /(?:uk|us|eu)\s*(\d{1,2}(?:\.\d)?)|\bsize\s+(\d{1,2}(?:\.\d)?)|\bsize\s+(xxs|xs|s|m|l|xl|xxl|xxxl|2xl|3xl|4xl)\b|\b(xxs|xxl|xxxl|2xl|3xl|4xl|xs|xl)\b/gi;
+
+function sizesIn(text) {
+  const found = new Set();
+  const re = new RegExp(SIZE_TOKEN.source, "gi");
+  for (const match of String(text).toLowerCase().matchAll(re)) {
+    const n = (match[1] || match[2] || match[3] || match[4] || "").trim();
+    if (n) found.add(n);
+  }
+  return found;
+}
+
+// Numbered specs on ANY listing (phones, TVs, generators, fridges, …) —
+// 256GB vs 128GB, 32-inch vs 43-inch, 5kVA vs 3.5kVA. Same Exact/Similar
+// split as colour on a dress or brand on a laptop; not shoe-specific.
+const SPEC_UNIT_CANON = {
+  gb: "gb",
+  gigabyte: "gb",
+  gigabytes: "gb",
+  tb: "tb",
+  mb: "mb",
+  inch: "inch",
+  inches: "inch",
+  in: "inch",
+  kg: "kg",
+  kgs: "kg",
+  kilo: "kg",
+  kilos: "kg",
+  kilogram: "kg",
+  kilograms: "kg",
+  l: "l",
+  litre: "l",
+  liter: "l",
+  litres: "l",
+  liters: "l",
+  w: "w",
+  watt: "w",
+  watts: "w",
+  mah: "mah",
+  mp: "mp",
+  megapixel: "mp",
+  megapixels: "mp",
+  hz: "hz",
+  kva: "kva",
+  kw: "kw",
+  kwh: "kwh",
+  cm: "cm",
+  mm: "mm",
+  hp: "hp",
+  '"': "inch",
+};
+
+// `inch(?:es)?` — `inches?` is "inche"/"inches" and never matches "32 inch".
+const SPEC_TOKEN =
+  /(\d+(?:\.\d+)?)[\s-]*(gb|gigabytes?|tb|mb|inch(?:es)?|"|\bin\b|kgs?|kilos?|kilograms?|litres?|liters?|\bl\b|watts?|\bw\b|mah|megapixels?|\bmp\b|hz|kva|kwh|\bkw\b|cm|mm|\bhp\b)/gi;
+
+const SPEC_UNIT_WORD =
+  /^(gb|gigabyte|gigabytes|tb|mb|inch|inches|in|kg|kgs|kilo|kilos|kilogram|kilograms|l|litre|liter|litres|liters|watt|watts|w|mah|mp|megapixel|megapixels|hz|kva|kw|kwh|cm|mm|hp)$/;
+
+function specsIn(text) {
+  const found = new Map();
+  const re = new RegExp(SPEC_TOKEN.source, "gi");
+  for (const match of String(text).toLowerCase().matchAll(re)) {
+    const num = match[1];
+    const unit = (match[2] || "").toLowerCase();
+    const canon = SPEC_UNIT_CANON[unit];
+    if (!num || !canon) continue;
+    if (!found.has(canon)) found.set(canon, new Set());
+    found.get(canon).add(num);
+  }
+  return found;
+}
+
+function listingAttrEntries(entity) {
+  if (!entity) return [];
+  const rows = [];
+  for (const a of entity.attributes || []) {
+    if (!a?.name || a.value == null || a.value === "") continue;
+    rows.push({
+      name: String(a.name).toLowerCase().trim(),
+      value: String(a.value).toLowerCase().trim(),
+    });
+  }
+  if (entity.colorClass) {
+    rows.push({ name: "color", value: String(entity.colorClass).toLowerCase() });
+  }
+  return rows;
+}
+
+const EXCLUSIVE_ATTR_NAME =
+  /^(colou?r|brand|make|size|material|fabric|storage|ram|rom|model|variant|style|type|kind|pattern|fuel|transmission|gender|scent|flavour|flavor|capacity|screen|display|condition|processor|os)$/;
+
+function leftoverPhrases(attributesText) {
+  if (!attributesText) return [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of String(attributesText).split(/[,;]/)) {
+    const p = raw.trim().toLowerCase();
+    if (p.length < 3 || seen.has(p)) continue;
+    if (ATTRIBUTE_STOPWORDS.has(p)) continue;
+    const words = attributeWords(p);
+    if (!words.length) continue;
+    const onlyFamily = words.every(
+      (w) =>
+        colorsIn(w).size ||
+        brandsIn(w).size ||
+        materialsIn(w).size ||
+        conditionsIn(w).size ||
+        sizesIn(w).size > 0 ||
+        /^(uk|us|eu)$/.test(w) ||
+        /^\d+(?:\.\d+)?$/.test(w) ||
+        SPEC_UNIT_WORD.test(w) ||
+        specsIn(w).size > 0,
+    );
+    if (onlyFamily) continue;
+    seen.add(p);
+    out.push(p);
+  }
+  return out;
+}
+
+function leftoverContradicts(phrases, candidateText, entity) {
+  if (!phrases.length) return { miss: false, hit: false };
+  const hay = candidateText.toLowerCase();
+  const rows = listingAttrEntries(entity).filter((r) =>
+    EXCLUSIVE_ATTR_NAME.test(r.name),
+  );
+  let hit = false;
+  for (const p of phrases) {
+    if (hay.includes(p)) {
+      hit = true;
+      continue;
+    }
+    let contradicted = false;
+    for (const r of rows) {
+      const values = r.value.split(/[,/|]/).map((v) => v.trim()).filter(Boolean);
+      if (!values.length) continue;
+      if (values.some((v) => v.includes(p) || p.includes(v))) {
+        hit = true;
+        contradicted = false;
+        break;
+      }
+      if (
+        /fabric|material|pattern|fuel|transmission|variant|model|scent|flavour|flavor/.test(
+          r.name,
+        )
+      ) {
+        contradicted = true;
+      }
+    }
+    if (contradicted) return { miss: true, hit: false };
+  }
+  return { miss: false, hit };
+}
+
+/**
+ * Hard-attribute fit of a listing against what the buyer actually named.
+ * Colour, brand, size, material, condition, numbered specs (GB, inches,
+ * kVA, mAh), leftover stated phrases, and the listing's own filled-in
+ * attributes. Applies to every product and service listing, not one
+ * category. "hit" / "miss" / "unknown"; a miss still shows as Similar.
+ */
+function hardAttributeFit(statedText, candidateText, entity, attributesText) {
+  if (!statedText) return "unknown";
+  const wantedColors = colorsIn(statedText);
+  const wantedBrands = brandsIn(statedText);
+  const wantedSizes = sizesIn(statedText);
+  const wantedMaterials = materialsIn(statedText);
+  const wantedConditions = conditionsIn(statedText);
+  const wantedSpecs = specsIn(statedText);
+  const leftovers = leftoverPhrases(attributesText);
+  if (
+    !wantedColors.size &&
+    !wantedBrands.size &&
+    !wantedSizes.size &&
+    !wantedMaterials.size &&
+    !wantedConditions.size &&
+    !wantedSpecs.size &&
+    !leftovers.length
+  ) {
+    return "unknown";
+  }
+
+  const nameText = entity?.name || "";
+  const nameColors = colorsIn(nameText);
+  if (
+    wantedColors.size &&
+    nameColors.size &&
+    ![...wantedColors].some((c) => nameColors.has(c))
+  ) {
+    return "miss";
+  }
+  const nameBrands = brandsIn(nameText);
+  if (
+    wantedBrands.size &&
+    nameBrands.size &&
+    ![...wantedBrands].some((b) => nameBrands.has(b))
+  ) {
+    return "miss";
+  }
+
+  const gotColors = colorsIn(candidateText);
+  const gotBrands = brandsIn(candidateText);
+  const gotSizes = sizesIn(candidateText);
+  const gotMaterials = materialsIn(candidateText);
+  const gotConditions = conditionsIn(candidateText);
+  const gotSpecs = specsIn(candidateText);
+
+  let anyHit = false;
+  const checkFamily = (wanted, got) => {
+    if (!wanted.size) return true;
+    if (!got.size) return true;
+    if (![...wanted].some((v) => got.has(v))) return false;
+    anyHit = true;
+    return true;
+  };
+  if (!checkFamily(wantedColors, gotColors)) return "miss";
+  if (!checkFamily(wantedBrands, gotBrands)) return "miss";
+  if (!checkFamily(wantedSizes, gotSizes)) return "miss";
+  if (!checkFamily(wantedMaterials, gotMaterials)) return "miss";
+  if (!checkFamily(wantedConditions, gotConditions)) return "miss";
+
+  for (const [unit, nums] of wantedSpecs) {
+    const got = gotSpecs.get(unit);
+    if (!got || !got.size) continue;
+    if (![...nums].some((n) => got.has(n))) return "miss";
+    anyHit = true;
+  }
+
+  const leftover = leftoverContradicts(leftovers, candidateText, entity);
+  if (leftover.miss) return "miss";
+  if (leftover.hit) anyHit = true;
+
+  if (wantedColors.size && !gotColors.size) return "unknown";
+  if (wantedBrands.size && !gotBrands.size && !anyHit) return "unknown";
+  if (wantedMaterials.size && !gotMaterials.size && !anyHit) return "unknown";
+  if (wantedConditions.size && !gotConditions.size && !anyHit) return "unknown";
+  if (
+    wantedSpecs.size &&
+    !anyHit &&
+    ![...wantedSpecs.keys()].some((u) => gotSpecs.get(u)?.size)
+  ) {
+    return "unknown";
+  }
+  return anyHit ? "hit" : "unknown";
+}
+
+function hasHardAttributes(statedText, attributesText) {
+  if (!statedText && !attributesText) return false;
+  const stated = statedText || "";
+  return (
+    colorsIn(stated).size > 0 ||
+    brandsIn(stated).size > 0 ||
+    sizesIn(stated).size > 0 ||
+    materialsIn(stated).size > 0 ||
+    conditionsIn(stated).size > 0 ||
+    specsIn(stated).size > 0 ||
+    leftoverPhrases(attributesText).length > 0
+  );
+}
+
+function entityId(candidate, entityKey) {
+  return String(candidate[entityKey]._id);
+}
+
+function dedupeCandidates(list, entityKey) {
+  const seen = new Set();
+  const out = [];
+  for (const c of list) {
+    const id = entityId(c, entityKey);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(c);
+  }
+  return out;
+}
+
 /**
  * How much of a listing's own text (name + attributes + description, via
  * the same embeddingTextFn rankCandidates already computes for rerank)
  * overlaps the buyer's stated attributes — 0 (nothing found) to 1 (every
- * stated word found). A ranking SIGNAL, never a filter: a listing that
- * scores 0 here is still shown if it's a real match on the product itself,
- * see rankCandidates' own comment on why this is additive, not a gate.
+ * stated word found). A ranking SIGNAL among already-split buckets, never
+ * the thing that decides Exact vs Similar (that's hardAttributeFit).
  */
 function attributeMatchScore(attributesText, candidateText) {
   if (!attributesText) return 0;
   const words = attributeWords(attributesText);
   if (!words.length) return 0;
   const haystack = candidateText.toLowerCase();
-  const matched = words.filter((w) => haystack.includes(w)).length;
+  const matched = words.filter((w) => hasWord(haystack, w)).length;
   return matched / words.length;
 }
 
@@ -350,7 +774,15 @@ function productEmbeddingText(product) {
   const attrs = (product.attributes || [])
     .map((a) => `${a.name}: ${a.value}`)
     .join(", ");
-  return [product.name, product.categoryId, attrs, product.description]
+  const tags = Array.isArray(product.tags) ? product.tags.join(" ") : "";
+  return [
+    product.name,
+    product.categoryId,
+    product.colorClass,
+    tags,
+    attrs,
+    product.description,
+  ]
     .filter(Boolean)
     .join(". ");
 }
@@ -611,14 +1043,26 @@ async function filterWalletEligible(rankedCandidates) {
   if (!rankedCandidates.length) return rankedCandidates;
 
   const vendorIds = [...new Set(rankedCandidates.map((c) => String(c.vendor._id)))];
-  const wallets = await WalletRead.find({ vendorId: { $in: vendorIds } }).select(
-    "vendorId balanceKobo",
-  );
+  const [wallets, exempt] = await Promise.all([
+    WalletRead.find({ vendorId: { $in: vendorIds } }).select(
+      "vendorId balanceKobo",
+    ),
+    PlatformSubscriptionRead.find({
+      ownerId: { $in: vendorIds },
+      ownerType: "vendor",
+      plan: "vendor_enterprise",
+      status: { $in: ["trialing", "active", "past_due", "cancelled"] },
+      currentPeriodEnd: { $gt: new Date() },
+    }).select("ownerId"),
+  ]);
   const balanceById = new Map(wallets.map((w) => [String(w.vendorId), w.balanceKobo]));
+  const exemptIds = new Set(exempt.map((s) => String(s.ownerId)));
 
-  return rankedCandidates.filter(
-    (c) => (balanceById.get(String(c.vendor._id)) ?? 0) >= LEAD_COST_KOBO,
-  );
+  return rankedCandidates.filter((c) => {
+    const id = String(c.vendor._id);
+    if (exemptIds.has(id)) return true;
+    return (balanceById.get(id) ?? 0) >= LEAD_COST_KOBO;
+  });
 }
 
 function isExpiredProduct(product) {
@@ -732,11 +1176,24 @@ async function rankCandidates({
     })
     .filter(Boolean);
   if (!withVendor.length) {
-    return { candidates: [], weakCandidates: [], relevanceFloor: null };
+    return {
+      candidates: [],
+      weakCandidates: [],
+      relevanceFloor: null,
+      forcedMatchQuality: null,
+    };
   }
 
+  // Rerank the BARE item, never the stated qualities. Folding attributes
+  // into the rerank query (found live: "sneakers black, nike, uk 8")
+  // pushed every listing that didn't echo those words below the
+  // relevance floor — so white sneakers vanished instead of showing as
+  // Similar. Eligibility is "is this a sneaker?"; Exact vs Similar is
+  // hardAttributeFit below; attributeMatchScore already nudges ranking
+  // among eligible peers.
+  const rerankQuery = queryText;
   const rerankScores = await rerank(
-    queryText,
+    rerankQuery,
     withVendor.map((c) => embeddingTextFn(c[entityKey])),
     deadlineAt,
   );
@@ -772,6 +1229,17 @@ async function rankCandidates({
     (c.textScore >= weakFloor || Boolean(keywordRescueFn?.(c[entityKey])));
 
   const finalize = async (pool, poolLimit, useRotation) => {
+    const enterpriseIds = new Set(
+      (
+        await PlatformSubscriptionRead.find({
+          ownerId: { $in: pool.map((c) => c.vendor._id) },
+          ownerType: "vendor",
+          plan: "vendor_enterprise",
+          status: { $in: ["trialing", "active", "past_due", "cancelled"] },
+          currentPeriodEnd: { $gt: new Date() },
+        }).select("ownerId")
+      ).map((row) => String(row.ownerId)),
+    );
     const withScore = pool
       .map((c) => {
         const semanticScore =
@@ -790,20 +1258,27 @@ async function rankCandidates({
         // genuinely closer or more relevant one just because it happened
         // to mention a color the buyer named.
         const attributeBonus = ATTRIBUTE_BOOST_WEIGHT * c.attributeBoost;
+        const promoted =
+          isEligible(c) && enterpriseIds.has(String(c.vendor._id));
+        // Capped nudge among vendors who already match. Payment never
+        // creates eligibility.
+        const enterpriseBonus = promoted ? 0.03 : 0;
         if (locationless) {
           const score =
             weights.semantic * c.semanticScore +
             weights.trust * trustComponent +
-            attributeBonus;
-          return { ...c, score };
+            attributeBonus +
+            enterpriseBonus;
+          return { ...c, score, promoted };
         }
         const proximityScore = Math.max(0, 1 - c.distanceKm / proximityReferenceKm);
         const score =
           weights.semantic * c.semanticScore +
           weights.proximity * proximityScore +
           weights.trust * trustComponent +
-          attributeBonus;
-        return { ...c, score };
+          attributeBonus +
+          enterpriseBonus;
+        return { ...c, score, promoted };
       })
       .sort((a, b) => b.score - a.score);
 
@@ -834,24 +1309,65 @@ async function rankCandidates({
     return winners.sort((a, b) => b.score - a.score);
   };
 
-  const [eligibleFinal, weakFinal] = await Promise.all([
+  const [eligiblePool, weakPool] = await Promise.all([
     finalize(scored.filter(isEligible), limit, trackExposure),
     finalize(scored.filter(isWeak), WEAK_MATCH_LIMIT, false),
   ]);
+
+  // Stated details on ANY product or service — colour, brand, size,
+  // material, numbered spec, leftover phrase, or a vendor-filled attribute
+  // — split Exact vs Similar. A listing that is the right KIND of item
+  // but the wrong colour/spec (white sneakers for black, 128GB for 256GB)
+  // used to land in Exact match because attributes were only a ranking
+  // nudge. Hits stay Exact; misses/unknowns go to the similar lane (or
+  // the whole set is labelled similar when nothing confirms). Listings
+  // are never dropped for an attribute miss.
+  const stated = [attributesText, queryText].filter(Boolean).join(" ");
+  let eligibleFinal = eligiblePool;
+  let weakFinal = weakPool;
+  let forcedMatchQuality = null;
+  if (hasHardAttributes(stated, attributesText)) {
+    const fitOf = (c) =>
+      hardAttributeFit(
+        stated,
+        embeddingTextFn(c[entityKey]),
+        c[entityKey],
+        attributesText,
+      );
+    const hits = eligiblePool.filter((c) => fitOf(c) === "hit");
+    const rest = eligiblePool.filter((c) => fitOf(c) !== "hit");
+    if (hits.length) {
+      eligibleFinal = hits;
+      weakFinal = dedupeCandidates([...rest, ...weakPool], entityKey).slice(
+        0,
+        WEAK_MATCH_LIMIT,
+      );
+      forcedMatchQuality = "direct";
+    } else {
+      forcedMatchQuality = "similar";
+    }
+  }
 
   return {
     candidates: eligibleFinal,
     weakCandidates: weakFinal,
     relevanceFloor,
+    forcedMatchQuality,
   };
 }
 
 // Splits a tier's already-ranked candidates into "direct" vs. "similar" —
 // applied to every product search so a buyer gets an honest "no exact match,
 // but here's something similar" whether they searched by text or photo.
-function applyMatchQuality(tierCandidates, relevanceFloor) {
+function applyMatchQuality(tierCandidates, relevanceFloor, forcedMatchQuality) {
   if (!tierCandidates.length) {
     return { candidates: tierCandidates, matchQuality: undefined };
+  }
+  if (forcedMatchQuality === "similar") {
+    return { candidates: tierCandidates, matchQuality: "similar" };
+  }
+  if (forcedMatchQuality === "direct") {
+    return { candidates: tierCandidates, matchQuality: "direct" };
   }
   const directFloor = relevanceFloor + MATCH_QUALITY_MARGIN;
   const direct = tierCandidates.filter((c) => c.semanticScore >= directFloor);
@@ -866,12 +1382,12 @@ function applyMatchQuality(tierCandidates, relevanceFloor) {
  * → state → nationwide → Tier 5 (Google Places, only when a location IS
  * known and Tiers 1-4 are all empty).
  *
- * `attributesText` (2026-09-15) — qualities the buyer stated (a camera, a
- * storage size, a color) as their own short comma-joined string, kept OUT
- * of `queryText` on purpose. See rankCandidates' own comment on why: this
- * only ever nudges ranking among listings that already qualify as a real
- * match on `queryText` alone, never a reason to drop one that qualifies but
- * doesn't happen to mention the stated attributes.
+ * `attributesText` — qualities the buyer stated, for any product or
+ * service (colour, brand, size, storage, a fabric, a fuel type). Kept as
+ * their own field so the VECTOR candidate pool still searches the bare
+ * item. Rerank stays on the bare item; Exact-vs-Similar then uses these
+ * plus each listing's own filled-in attributes. A contradiction is
+ * Similar, never Exact.
  */
 export async function searchProducts({
   queryText,
@@ -937,7 +1453,7 @@ export async function searchProducts({
     VendorRead.find({
       _id: { $in: vendorIds },
       hiddenFromSearch: { $ne: true },
-    }).select("geo trustScore area state name phone company avatar"),
+    }).select("geo trustScore area state name phone company avatar payout"),
     Store.find({ vendorId: { $in: vendorIds } }).select(
       "vendorId name whatsapp handle",
     ),
@@ -945,7 +1461,7 @@ export async function searchProducts({
   const vendorById = new Map(vendors.map((v) => [String(v._id), v]));
   const storeByVendorId = new Map(stores.map((s) => [String(s.vendorId), s]));
 
-  const mapResult = ({ product, vendor, distanceKm, score }) => {
+  const mapResult = ({ product, vendor, distanceKm, score, promoted }) => {
     const store = storeByVendorId.get(String(vendor._id));
     return {
       productId: product._id,
@@ -971,6 +1487,17 @@ export async function searchProducts({
       whatsapp: store?.whatsapp || vendor.phone || null,
       distanceKm: distanceKm != null ? Math.round(distanceKm * 10) / 10 : null,
       score: Math.round(score * 1000) / 1000,
+      promoted: Boolean(promoted),
+      // True when this listing can be added to cart: physical, fixed Naira
+      // price, in stock, AND the vendor has a payout recipient. Payout
+      // details stay on the vendor doc; only this boolean ships to the client.
+      checkoutEligible:
+        product.kind !== "service" &&
+        product.quoteOnRequest !== true &&
+        (product.priceMax == null || product.priceMax <= product.price) &&
+        (product.currency ?? "NGN") === "NGN" &&
+        (product.quantity == null || Number(product.quantity) >= 1) &&
+        Boolean(vendor.payout?.recipientCode),
     };
   };
 
@@ -996,6 +1523,7 @@ export async function searchProducts({
       candidates: nationwide,
       weakCandidates: nationwideWeak,
       relevanceFloor,
+      forcedMatchQuality,
     } = await rankCandidates({
       ...rankArgs,
       weights: NATIONWIDE_WEIGHTS,
@@ -1025,6 +1553,7 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       relevanceFloor,
+      forcedMatchQuality,
     );
     const active = splitExpired(tiered, queryText);
     if (!active.length) {
@@ -1062,6 +1591,7 @@ export async function searchProducts({
     candidates: local,
     weakCandidates: localWeak,
     relevanceFloor: localFloor,
+    forcedMatchQuality: localForced,
   } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= radiusKm,
@@ -1071,6 +1601,7 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       local,
       localFloor,
+      localForced,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -1091,6 +1622,7 @@ export async function searchProducts({
     candidates: nearby,
     weakCandidates: nearbyWeak,
     relevanceFloor: nearbyFloor,
+    forcedMatchQuality: nearbyForced,
   } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= nearbyRadiusKm,
@@ -1100,6 +1632,7 @@ export async function searchProducts({
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nearby,
       nearbyFloor,
+      nearbyForced,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -1120,6 +1653,7 @@ export async function searchProducts({
     candidates: stateWide,
     weakCandidates: stateWideWeak,
     relevanceFloor: stateFloor,
+    forcedMatchQuality: stateForced,
   } = buyerState
     ? await rankCandidates({
         ...locatedArgs,
@@ -1128,12 +1662,18 @@ export async function searchProducts({
           vendor.state.toLowerCase() === buyerState.toLowerCase(),
         proximityReferenceKm: STATE_PROXIMITY_REFERENCE_KM,
       })
-    : { candidates: [], weakCandidates: [], relevanceFloor: null };
+    : {
+        candidates: [],
+        weakCandidates: [],
+        relevanceFloor: null,
+        forcedMatchQuality: null,
+      };
 
   if (stateWide.length) {
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       stateWide,
       stateFloor,
+      stateForced,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -1153,11 +1693,13 @@ export async function searchProducts({
     candidates: nationwide,
     weakCandidates: nationwideTier4Weak,
     relevanceFloor: nationwideFloor,
+    forcedMatchQuality: nationwideForced,
   } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
   if (nationwide.length) {
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       nationwide,
       nationwideFloor,
+      nationwideForced,
     );
     const active = splitExpired(tiered, queryText);
     if (active.length) {
@@ -1190,6 +1732,7 @@ export async function searchProducts({
  */
 export async function searchStores({
   queryText,
+  attributesText,
   lat,
   lng,
   radiusKm = 10,
@@ -1250,7 +1793,7 @@ export async function searchStores({
   // reads (getVendorsPreview/getVendorsBrowse in velte-backend), so a
   // search result vendor card can render the identical avatar + sliding
   // cover instead of always falling back to placeholders.
-  const mapResult = ({ store, vendor, distanceKm, score }) => ({
+  const mapResult = ({ store, vendor, distanceKm, score, promoted }) => ({
     storeId: store._id,
     vendorId: vendor._id,
     handle: store.handle,
@@ -1276,6 +1819,7 @@ export async function searchStores({
     state: vendor.state,
     distanceKm: distanceKm != null ? Math.round(distanceKm * 10) / 10 : null,
     score: Math.round(score * 1000) / 1000,
+    promoted: Boolean(promoted),
     avatar: vendor.avatar ?? null,
     gallery: store.gallery ?? [],
   });
@@ -1286,6 +1830,7 @@ export async function searchStores({
     entityKey: "store",
     embeddingTextFn: storeEmbeddingText,
     queryText,
+    attributesText,
     rerankFloor: STORE_RERANK_FLOOR,
     rawScoreFloor: STORE_RAW_SCORE_FLOOR,
     limit,
@@ -1309,12 +1854,19 @@ export async function searchStores({
   // product-specific) — reused here so a near-floor store result is honestly
   // tagged "similar", same distinction searchProducts already makes.
   const weakByTier = [];
-  const tryTier = (tierCandidates, weakCandidates, tierFloor, matchTier) => {
+  const tryTier = (
+    tierCandidates,
+    weakCandidates,
+    tierFloor,
+    matchTier,
+    forcedMatchQuality,
+  ) => {
     if (weakCandidates.length) weakByTier.push({ matchTier, weakCandidates });
     if (!tierCandidates.length) return null;
     const { candidates: tiered, matchQuality } = applyMatchQuality(
       tierCandidates,
       tierFloor,
+      forcedMatchQuality,
     );
     return { results: tiered.map(mapResult), matchTier, matchQuality };
   };
@@ -1343,8 +1895,15 @@ export async function searchStores({
       candidates: nationwide,
       weakCandidates: nationwideWeak,
       relevanceFloor,
+      forcedMatchQuality,
     } = await rankCandidates({ ...rankArgs, weights: NATIONWIDE_WEIGHTS });
-    const found = tryTier(nationwide, nationwideWeak, relevanceFloor, "nationwide");
+    const found = tryTier(
+      nationwide,
+      nationwideWeak,
+      relevanceFloor,
+      "nationwide",
+      forcedMatchQuality,
+    );
     // Nationwide is the widest tier that exists — nothing wider to source a
     // "further" bucket from.
     if (found) return { ...found, furtherResults: [], externalSuggestions: null };
@@ -1379,12 +1938,13 @@ export async function searchStores({
     candidates: local,
     weakCandidates: localWeak,
     relevanceFloor: localFloor,
+    forcedMatchQuality: localForced,
   } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= radiusKm,
     proximityReferenceKm: radiusKm,
   });
-  let found = tryTier(local, localWeak, localFloor, "local");
+  let found = tryTier(local, localWeak, localFloor, "local", localForced);
 
   // Country-wide pool for the "further" bonus bucket specifically — unlike
   // nationwideLookup below (the genuine last-resort tier, which deliberately
@@ -1408,12 +1968,13 @@ export async function searchStores({
     candidates: nearby,
     weakCandidates: nearbyWeak,
     relevanceFloor: nearbyFloor,
+    forcedMatchQuality: nearbyForced,
   } = await rankCandidates({
     ...locatedArgs,
     geoFilter: (_vendor, distanceKm) => distanceKm <= nearbyRadiusKm,
     proximityReferenceKm: nearbyRadiusKm,
   });
-  found = tryTier(nearby, nearbyWeak, nearbyFloor, "nearby");
+  found = tryTier(nearby, nearbyWeak, nearbyFloor, "nearby", nearbyForced);
 
   if (found) {
     const { candidates: furtherPool } = await furtherPoolLookup();
@@ -1425,6 +1986,7 @@ export async function searchStores({
     candidates: stateWide,
     weakCandidates: stateWideWeak,
     relevanceFloor: stateFloor,
+    forcedMatchQuality: stateForced,
   } = buyerState
     ? await rankCandidates({
         ...locatedArgs,
@@ -1433,8 +1995,19 @@ export async function searchStores({
           vendor.state.toLowerCase() === buyerState.toLowerCase(),
         proximityReferenceKm: STATE_PROXIMITY_REFERENCE_KM,
       })
-    : { candidates: [], weakCandidates: [], relevanceFloor: null };
-  found = tryTier(stateWide, stateWideWeak, stateFloor, "state");
+    : {
+        candidates: [],
+        weakCandidates: [],
+        relevanceFloor: null,
+        forcedMatchQuality: null,
+      };
+  found = tryTier(
+    stateWide,
+    stateWideWeak,
+    stateFloor,
+    "state",
+    stateForced,
+  );
 
   if (found) {
     const { candidates: furtherPool } = await furtherPoolLookup();
@@ -1445,8 +2018,15 @@ export async function searchStores({
     candidates: nationwide,
     weakCandidates: nationwideWeak,
     relevanceFloor: nationwideFloor,
+    forcedMatchQuality: nationwideForced,
   } = await nationwideLookup();
-  found = tryTier(nationwide, nationwideWeak, nationwideFloor, "nationwide");
+  found = tryTier(
+    nationwide,
+    nationwideWeak,
+    nationwideFloor,
+    "nationwide",
+    nationwideForced,
+  );
   // Nationwide is itself the further-source for every other tier — nothing
   // wider exists to source a "further" bucket for nationwide's own matches.
   if (found) return { ...found, furtherResults: [], externalSuggestions: null };

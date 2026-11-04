@@ -123,7 +123,53 @@ function deriveTask(snapshot, prevTask, goal = {}) {
       ...(Array.isArray(snapshot.products)
         ? snapshot.products.map((p) => p?.productId).filter(Boolean)
         : []),
+      ...(Array.isArray(snapshot.vendorProducts)
+        ? snapshot.vendorProducts.map((p) => p?.productId).filter(Boolean)
+        : []),
     ]),
+  ).slice(-40);
+
+  const compactShown = (p, vendorFallback) => {
+    if (!p?.productId) return null;
+    const attrs = Array.isArray(p.attributes)
+      ? p.attributes
+          .map((a) =>
+            typeof a === "string" ? a : a?.value ? String(a.value) : null,
+          )
+          .filter(Boolean)
+          .slice(0, 6)
+      : [];
+    return {
+      productId: String(p.productId),
+      name: String(p.name || "").slice(0, 120),
+      vendorId: p.vendorId ? String(p.vendorId) : String(vendorFallback?.vendorId || ""),
+      vendorName: String(
+        p.vendorName || vendorFallback?.vendorName || "",
+      ).slice(0, 80),
+      checkoutEligible: Boolean(p.checkoutEligible),
+      attributes: attrs,
+    };
+  };
+  const thisTurnCatalog = [
+    ...(Array.isArray(snapshot.products)
+      ? snapshot.products.map((p) => compactShown(p, null))
+      : []),
+    ...(Array.isArray(snapshot.vendorProducts)
+      ? snapshot.vendorProducts.map((p) =>
+          compactShown(p, {
+            vendorId: snapshot.vendorProductsStore?.vendorId,
+            vendorName: snapshot.vendorProductsStore?.name,
+          }),
+        )
+      : []),
+  ].filter(Boolean);
+  const shownCatalog = Array.from(
+    new Map(
+      [...(carried?.shownCatalog ?? []), ...thisTurnCatalog].map((row) => [
+        row.productId,
+        row,
+      ]),
+    ).values(),
   ).slice(-40);
 
   // Real, comparable prices only: a quote-on-request listing stores 0 as a
@@ -158,6 +204,7 @@ function deriveTask(snapshot, prevTask, goal = {}) {
         ).slice(0, 12)
       : (carried?.attributes ?? []),
     shownProductIds,
+    shownCatalog,
     cheapestSeenNaira: cheapestCandidates.length
       ? Math.min(...cheapestCandidates)
       : null,

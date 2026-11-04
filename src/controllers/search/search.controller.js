@@ -50,13 +50,11 @@ export async function searchProducts(req, res, next) {
     const { results, weakResults, matchTier, matchQuality, externalSuggestions } =
       await findProducts({
         queryText,
-        // The buyer's stated qualities (2026-09-15, explicit request) — a
-        // SOFT ranking boost only, applied after a listing already
-        // qualifies as a real match on `queryText` alone. See
-        // retrieval.service.js's searchProducts/rankCandidates for the
-        // full reasoning: this used to be merged straight into queryText
-        // itself, which let a rerank pass mark down a genuinely good match
-        // whose own listing text just didn't happen to echo those words.
+        // The buyer's stated qualities — rerank + Exact-vs-Similar use
+        // these. A listing that contradicts a stated colour/brand/size
+        // is Similar, never Exact. The vector pool still searches the
+        // bare item so a white sneaker can still be found for a black-
+        // sneakers query (and shown as similar).
         attributesText:
           typeof attributesText === "string" && attributesText.trim()
             ? attributesText
@@ -138,7 +136,15 @@ export async function searchProducts(req, res, next) {
 
 export async function searchStores(req, res, next) {
   try {
-    const { queryText, lat, lng, radiusKm, limit, includeNearbyBusinesses } =
+    const {
+      queryText,
+      attributesText,
+      lat,
+      lng,
+      radiusKm,
+      limit,
+      includeNearbyBusinesses,
+    } =
       req.body ?? {};
 
     if (typeof queryText !== "string" || !queryText.trim()) {
@@ -156,6 +162,10 @@ export async function searchStores(req, res, next) {
     const { results, furtherResults, matchTier, matchQuality, externalSuggestions } =
       await findStores({
         queryText,
+        attributesText:
+          typeof attributesText === "string" && attributesText.trim()
+            ? attributesText
+            : undefined,
         lat: hasLat ? lat : undefined,
         lng: hasLng ? lng : undefined,
         radiusKm: typeof radiusKm === "number" ? radiusKm : undefined,

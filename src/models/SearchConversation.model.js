@@ -107,6 +107,23 @@ const taskSchema = new mongoose.Schema(
     // the comparison can avoid re-crowning something they've seen, and so
     // "cheaper" knows what it has to beat.
     shownProductIds: { type: [String], default: [] },
+    // Compact catalog of those same listings (id + name + vendor + a few
+    // attributes, never a vendor-written description) so "the second one"
+    // / "the black one" resolve in CODE against what was actually shown,
+    // not from the model guessing at text.
+    shownCatalog: {
+      type: [
+        {
+          productId: { type: String, required: true },
+          name: { type: String, default: "" },
+          vendorId: { type: String, default: "" },
+          vendorName: { type: String, default: "" },
+          checkoutEligible: { type: Boolean, default: false },
+          attributes: { type: [String], default: [] },
+        },
+      ],
+      default: [],
+    },
     cheapestSeenNaira: { type: Number, default: null },
     updatedAt: { type: Date, default: Date.now },
   },
